@@ -1,0 +1,10 @@
+# Maborak Framework — robots.txt
+User-agent: *
+Allow: /
+Allow: /help
+Disallow: /account/
+Disallow: /management/
+Disallow: /login
+Disallow: /register
+Disallow: /forgot-password
+Disallow: /reset-password

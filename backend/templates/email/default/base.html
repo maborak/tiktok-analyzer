@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="color-scheme" content="light">
+    <meta name="supported-color-schemes" content="light">
+    <title>{% block title %}Phoveus{% endblock %}</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+            background-color: #f1f5f9;
+            color: #334155;
+            line-height: 1.6;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+
+        .container {
+            max-width: 600px;
+            margin: 48px auto;
+            background: #ffffff;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.1);
+            border: 1px solid #e2e8f0;
+        }
+
+        .header {
+            background-color: #0f172a;
+            padding: 40px 32px;
+            text-align: center;
+            border-bottom: 1px solid #1e293b;
+        }
+
+        .header h1 {
+            color: #f8fafc;
+            font-size: 22px;
+            margin: 0;
+            font-weight: 600;
+            letter-spacing: -0.02em;
+        }
+
+        .header-logo {
+            color: #38bdf8;
+            font-weight: 700;
+        }
+
+        .content {
+            padding: 40px 32px;
+        }
+
+        .footer {
+            padding: 24px 32px;
+            background: #f8fafc;
+            text-align: center;
+            border-top: 1px solid #e2e8f0;
+        }
+
+        .footer p {
+            font-size: 12px;
+            color: #64748b;
+            margin: 0;
+            line-height: 1.5;
+        }
+
+        .button {
+            display: inline-block;
+            padding: 14px 28px;
+            background-color: #0ea5e9;
+            color: #ffffff;
+            text-decoration: none;
+            border-radius: 8px;
+            font-weight: 600;
+            font-size: 15px;
+            transition: all 0.2s ease;
+            box-shadow: 0 1px 3px 0 rgba(14, 165, 233, 0.3);
+        }
+
+        .button:hover {
+            background-color: #0284c7;
+            box-shadow: 0 4px 6px -1px rgba(14, 165, 233, 0.4);
+        }
+
+        @media screen and (max-width: 600px) {
+            .container {
+                margin: 0;
+                border-radius: 0;
+                border-left: none;
+                border-right: none;
+            }
+
+            .content {
+                padding: 32px 24px;
+            }
+
+            .header {
+                padding: 32px 24px;
+            }
+        }
+    </style>
+</head>
+
+<body style="margin: 0; padding: 0;">
+    <div class="container">
+        {% block header %}
+        <div class="header">
+            <h1 style="color: #f8fafc; font-size: 22px; margin: 0; font-weight: 600;">
+                <span class="header-logo">Legal</span> AI
+            </h1>
+        </div>
+        {% endblock %}
+
+        <div class="content">
+            {% block content %}{% endblock %}
+        </div>
+
+        {% block footer %}
+        <div class="footer">
+            <p>&copy; {{ now.year if now else '2026' }} Phoveus Bolivia &bull; Tu asistente legal inteligente</p>
+            <p style="margin-top: 8px; color: #94a3b8;">Recibes este correo porque tienes una cuenta en Phoveus.</p>
+        </div>
+        {% endblock %}
+    </div>
+</body>
+
+</html>

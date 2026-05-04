@@ -1,0 +1,13 @@
+{
+    "api_url": "http://localhost:9001",
+    "username": "tester@mailrbp.com",
+    "password": "carajo123#",
+    "conda_env": "amazon",
+    "catch_all": {
+        "imap_user": "catchall@mailrbp.com",
+        "imap_password": "carajo123#",
+        "imap_server": "imap.maborak.com",
+        "imap_port": 993,
+        "imap_tls": true
+    }
+}

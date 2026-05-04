@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+
+{% block header_title %}Ticket de Soporte {{ action|title }}{% endblock %}
+
+{% block content %}
+<div style="margin-bottom: 32px;">
+    <div
+        style="display: inline-block; padding: 4px 12px; background-color: #fef3c7; color: #92400e; border-radius: 9999px; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 16px;">
+        Actualización de ticket
+    </div>
+    <h2 style="margin: 0 0 8px 0; font-size: 24px; color: #0f172a; font-weight: 700;">Ticket #{{ ticket_id[:8] }}</h2>
+    {% if action == "created" or action == "created via contact form" or action == "created via email" %}
+        {% if guest_access_token %}
+        <p style="margin: 0; color: #64748b; font-size: 16px;">Hola, hemos recibido tu solicitud de soporte. No necesitas una cuenta para dar seguimiento a tu ticket.</p>
+        {% else %}
+        <p style="margin: 0; color: #64748b; font-size: 16px;">Hola, hemos recibido tu solicitud de soporte. Puedes dar seguimiento a tu ticket usando el enlace de abajo.</p>
+        {% endif %}
+    {% else %}
+        {% if guest_access_token %}
+        <p style="margin: 0; color: #64748b; font-size: 16px;">Hola, tenemos una actualización sobre tu solicitud de soporte.</p>
+        {% else %}
+        <p style="margin: 0; color: #64748b; font-size: 16px;">Hola, tenemos una actualización sobre tu solicitud de soporte.</p>
+        {% endif %}
+    {% endif %}
+</div>
+
+<div
+    style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 24px; margin-bottom: 32px;">
+    <div style="display: flex; justify-content: space-between; margin-bottom: 16px;">
+        <span style="color: #64748b; font-size: 14px;">Estado: <strong style="color: #0d9488;">{{ status
+                }}</strong></span>
+    </div>
+    <div style="color: #334155; font-size: 16px; line-height: 1.6; white-space: pre-wrap;">
+        {{ message }}
+    </div>
+</div>
+
+<div style="text-align: center; margin-bottom: 32px;">
+    {% if action == "created" or action == "created via contact form" or action == "created via email" %}
+        {% if guest_access_token %}
+        <a href="{{ ticket_url }}" class="button">Ver mi ticket</a>
+        {% else %}
+        <a href="{{ ticket_url }}" class="button">Ver mi ticket</a>
+        {% endif %}
+    {% else %}
+        {% if guest_access_token %}
+        <a href="{{ ticket_url }}" class="button">Ver conversación</a>
+        {% else %}
+        <a href="{{ ticket_url }}" class="button">Ver conversación</a>
+        {% endif %}
+    {% endif %}
+</div>
+
+<p style="margin: 0; text-align: center; color: #94a3b8; font-size: 14px;">
+    También puedes responder directamente a este correo para actualizar el ticket.
+</p>
+{% endblock %}

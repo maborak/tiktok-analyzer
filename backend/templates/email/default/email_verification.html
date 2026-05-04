@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+
+{% block title %}Verifica tu correo electrónico - Phoveus{% endblock %}
+
+{% block content %}
+<!-- Badge -->
+<div style="margin-bottom: 24px;">
+    <span style="display: inline-block; background-color: #e0f2fe; color: #0369a1; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; padding: 6px 12px; border-radius: 6px;">
+        Verificación de correo
+    </span>
+</div>
+
+<!-- Welcome Message -->
+<h1 style="margin: 0 0 16px 0; color: #0f172a; font-size: 28px; font-weight: 700; line-height: 1.3; letter-spacing: -0.02em;">
+    Verifica tu correo electrónico
+</h1>
+
+<p style="margin: 0 0 24px 0; color: #475569; font-size: 16px; line-height: 1.6;">
+    Hola{% if first_name %} {{ first_name }}{% elif username %} {{ username }}{% endif %},<br><br>
+    Gracias por unirte a Phoveus. Para completar tu registro, por favor verifica tu correo electrónico haciendo clic en el botón de abajo.
+</p>
+
+<!-- CTA Button -->
+<div style="margin: 32px 0; text-align: center;">
+    <a href="{{ verification_url }}" class="button" style="display: inline-block; background-color: #0ea5e9; color: #ffffff; text-decoration: none; padding: 16px 32px; border-radius: 8px; font-weight: 600; font-size: 15px; box-shadow: 0 4px 6px -1px rgba(14, 165, 233, 0.2);">
+        Verificar correo electrónico
+    </a>
+</div>
+
+<!-- Verification Details Table -->
+<div style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 20px; margin: 24px 0;">
+    <table style="width: 100%; border-collapse: collapse;">
+        <tr>
+            <td style="padding: 8px 0; color: #64748b; font-size: 13px; font-weight: 500; width: 140px; vertical-align: top;">
+                Enlace de verificación
+            </td>
+            <td style="padding: 8px 0; color: #334155; font-size: 13px; word-break: break-all;">
+                <a href="{{ verification_url }}" style="color: #0ea5e9; text-decoration: none;">{{ verification_url }}</a>
+            </td>
+        </tr>
+        <tr>
+            <td style="padding: 8px 0; color: #64748b; font-size: 13px; font-weight: 500; vertical-align: top;">
+                Expira en
+            </td>
+            <td style="padding: 8px 0; color: #334155; font-size: 13px;">
+                {{ expires_in_days }} días
+            </td>
+        </tr>
+    </table>
+</div>
+
+<!-- Security Notice -->
+<div style="border-top: 1px solid #e2e8f0; padding-top: 20px; margin-top: 24px;">
+    <p style="margin: 0; color: #64748b; font-size: 13px; line-height: 1.5;">
+        <strong style="color: #475569;">Aviso de seguridad:</strong> Si no creaste una cuenta en Phoveus, puedes ignorar este correo. Es posible que alguien haya ingresado tu dirección de correo por error.
+    </p>
+</div>
+{% endblock %}

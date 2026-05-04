@@ -1,0 +1,192 @@
+@layer base {
+  /* Light theme — refined indigo + pure neutral grays */
+  :root[data-theme="light"] {
+    --color-primary-50:  #eef2ff;
+    --color-primary-100: #e0e7ff;
+    --color-primary-200: #c7d2fe;
+    --color-primary-300: #a5b4fc;
+    --color-primary-400: #818cf8;
+    --color-primary-500: #6366f1;
+    --color-primary-600: #4f46e5;
+    --color-primary-700: #4338ca;
+    --color-primary-800: #3730a3;
+    --color-primary-900: #312e81;
+
+    --color-gray-50:  #fafafa;
+    --color-gray-100: #f5f5f5;
+    --color-gray-200: #e5e5e5;
+    --color-gray-300: #d4d4d4;
+    --color-gray-400: #a3a3a3;
+    --color-gray-500: #737373;
+    --color-gray-600: #525252;
+    --color-gray-700: #404040;
+    --color-gray-800: #262626;
+    --color-gray-900: #171717;
+
+    --color-surface-primary:   #ffffff;
+    --color-surface-secondary: #fafafa;
+    --color-surface-elevated:  #ffffff;
+    --color-surface-sunken:    #f5f5f5;
+
+    --color-text-primary:   #171717;
+    --color-text-secondary: #525252;
+    --color-text-tertiary:  #a3a3a3;
+    --color-text-disabled:  #d4d4d4;
+
+    --color-border-primary:   #e5e5e5;
+    --color-border-secondary: #f5f5f5;
+    --color-border-focus:     #a5b4fc;
+
+    --color-success:     #10b981;
+    --color-success-50:  #ecfdf5;
+    --color-success-100: #d1fae5;
+    --color-success-200: #a7f3d0;
+    --color-success-300: #6ee7b7;
+    --color-success-400: #34d399;
+    --color-success-500: #10b981;
+    --color-success-600: #059669;
+    --color-success-700: #047857;
+    --color-success-800: #065f46;
+    --color-success-900: #064e3b;
+
+    --color-warning:     #f59e0b;
+    --color-warning-50:  #fffbeb;
+    --color-warning-100: #fef3c7;
+    --color-warning-200: #fde68a;
+    --color-warning-300: #fcd34d;
+    --color-warning-400: #fbbf24;
+    --color-warning-500: #f59e0b;
+    --color-warning-600: #d97706;
+    --color-warning-700: #b45309;
+    --color-warning-800: #92400e;
+    --color-warning-900: #78350f;
+
+    --color-error:       #ef4444;
+    --color-error-50:    #fef2f2;
+    --color-error-100:   #fee2e2;
+    --color-error-200:   #fecaca;
+    --color-error-300:   #fca5a5;
+    --color-error-400:   #f87171;
+    --color-error-500:   #ef4444;
+    --color-error-600:   #dc2626;
+    --color-error-700:   #b91c1c;
+    --color-error-800:   #991b1b;
+    --color-error-900:   #7f1d1d;
+
+    --color-info:        #6366f1;
+    --color-info-50:     #eef2ff;
+    --color-info-500:    #6366f1;
+    --color-info-700:    #4338ca;
+  }
+
+  /* ─── Dark Theme ─── */
+  :root[data-theme="dark"] {
+    /* Surfaces — secondary is the page bg (darkest), primary is cards (one step lighter) */
+    --color-surface-primary:   #111111;
+    --color-surface-secondary: #0a0a0a;
+    --color-surface-elevated:  #1a1a1a;
+    --color-surface-sunken:    #0a0a0a;
+
+    /* Text */
+    --color-text-primary:   #f5f5f5;
+    --color-text-secondary: #a3a3a3;
+    --color-text-tertiary:  #737373;
+    --color-text-disabled:  #404040;
+
+    /* Borders */
+    --color-border-primary:   #333333;
+    --color-border-secondary: #222222;
+    --color-border-focus:     #818cf8;
+
+    /* Sidebar (dark) — slightly elevated from page bg for definition */
+    --color-sidebar-bg:              #0f0f0f;
+    --color-sidebar-border:          #1a1a1a;
+    --color-sidebar-text:            #8a8a8a;
+    --color-sidebar-text-hover:      #e5e5e5;
+    --color-sidebar-text-active:     #a5b4fc;
+    --color-sidebar-icon:            #666666;
+    --color-sidebar-icon-active:     #a5b4fc;
+    --color-sidebar-active-bg:       rgba(99, 102, 241, 0.12);
+    --color-sidebar-active-border:   #6366f1;
+    --color-sidebar-section-label:   #f59e0b;
+    --color-sidebar-hover-bg:        rgba(255, 255, 255, 0.06);
+    --color-sidebar-logo-bg:         #6366f1;
+    --color-sidebar-logo-text:       #ffffff;
+    --color-sidebar-divider:         #1a1a1a;
+
+    /* Stat Cards (dark) */
+    --color-stat-bg:              #141414;
+    --color-stat-border:          #262626;
+    --color-stat-secondary-bg:    #111111;
+    --color-stat-secondary-border:#1f1f1f;
+    --color-stat-text-primary:    #ffffff;
+    --color-stat-text-secondary:  #a3a3a3;
+    --color-stat-text-label:      #737373;
+
+    /* Auth mesh gradient (dark) — deep indigo-black with subtle violet hue */
+    --color-mesh-1: #111122;  /* deepest indigo-black */
+    --color-mesh-2: #0a0a0a;  /* page bg */
+    --color-mesh-3: #1a1a2e;  /* indigo-tinged dark */
+    --color-mesh-4: #0f0f1a;  /* between page and mesh-3 */
+    --grain-alpha: 0.05;
+
+    /* Shadows — subtle glow ring to define edges on near-black bg */
+    --shadow-sm: 0 0 0 1px rgba(255, 255, 255, 0.02), 0 1px 3px 0 rgb(0 0 0 / 0.5);
+    --shadow-md: 0 0 0 1px rgba(255, 255, 255, 0.03), 0 4px 8px -2px rgb(0 0 0 / 0.6);
+    --shadow-lg: 0 0 0 1px rgba(255, 255, 255, 0.03), 0 10px 20px -4px rgb(0 0 0 / 0.7);
+
+    /* Primary scale — invert for dark bg readability */
+    --color-primary-50:  rgba(99, 102, 241, 0.1);
+    --color-primary-100: rgba(99, 102, 241, 0.15);
+    --color-primary-200: rgba(99, 102, 241, 0.25);
+    --color-primary-300: #a5b4fc;
+    --color-primary-400: #818cf8;
+    --color-primary-500: #6366f1;
+    --color-primary-600: #a5b4fc;
+    --color-primary-700: #c7d2fe;
+    --color-primary-800: #e0e7ff;
+    --color-primary-900: #eef2ff;
+
+    /* Success scale */
+    --color-success-50:  rgba(16, 185, 129, 0.1);
+    --color-success-100: rgba(16, 185, 129, 0.15);
+    --color-success-200: rgba(16, 185, 129, 0.25);
+    --color-success-600: #34d399;
+    --color-success-700: #6ee7b7;
+
+    /* Warning scale */
+    --color-warning-50:  rgba(245, 158, 11, 0.1);
+    --color-warning-100: rgba(245, 158, 11, 0.15);
+    --color-warning-200: rgba(245, 158, 11, 0.25);
+    --color-warning-600: #fbbf24;
+    --color-warning-700: #fcd34d;
+
+    /* Error scale */
+    --color-error-50:    rgba(239, 68, 68, 0.1);
+    --color-error-100:   rgba(239, 68, 68, 0.15);
+    --color-error-200:   rgba(239, 68, 68, 0.25);
+    --color-error-600:   #f87171;
+    --color-error-700:   #fca5a5;
+
+    /* Info */
+    --color-info-50:     rgba(99, 102, 241, 0.1);
+    --color-info-700:    #c7d2fe;
+
+    /* Full gray scale inversion for dark mode.
+     * Tailwind v4 @theme bridges these to utilities: bg-gray-*, text-gray-*, border-gray-*.
+     * gray-50 must be BELOW surface-primary (#111111) so bg-white items still pop
+     * from bg-gray-50 containers.
+     * Hierarchy: page(#0a0a0a) < gray-50(#0d0d0d) < cards/white(#111111)
+     *                         < gray-100(#1a1a1a) < elevated(#1a1a1a) */
+    --color-gray-50:  #0d0d0d;
+    --color-gray-100: #1a1a1a;
+    --color-gray-200: #333333;
+    --color-gray-300: #444444;
+    --color-gray-400: #737373;
+    --color-gray-500: #a3a3a3;
+    --color-gray-600: #d4d4d4;
+    --color-gray-700: #e5e5e5;
+    --color-gray-800: #f5f5f5;
+    --color-gray-900: #fafafa;
+  }
+}

@@ -1,0 +1,17 @@
+/* Palette 24 Theme */
+:root {
+  /* Primary Colors */
+  --color-primary-50: #dfe6da;
+  --color-primary-100: #cbd5c0;
+  --color-primary-200: #9caf88;
+  --color-primary-300: #819171;
+  --color-primary-400: #758467;
+  --color-primary-500: #819171;
+  --color-primary-600: #758467;
+  --color-primary-700: #758467;
+  --color-primary-800: #758467;
+  --color-primary-900: #758467;
+
+  /* Status Colors */
+  --color-info: #819171;
+}

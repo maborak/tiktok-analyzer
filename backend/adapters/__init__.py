@@ -1,0 +1,1 @@
+# Adapters layer - Implementations for external communication 

@@ -1,0 +1,901 @@
+@import "tailwindcss";
+@import "./styles/tokens.css";
+@import "./styles/themes.css";
+
+/* Map Tailwind's `dark:` variant to our data-theme attribute so utility
+   classes like `dark:bg-gray-900` still work while the theme is
+   controlled by [data-theme="dark"] on <html>. */
+@custom-variant dark (&:where([data-theme=dark], [data-theme=dark] *));
+
+/* ─── Theme transitions ─── */
+/* Animate color changes when toggling between light/dark. The
+   `no-transition` class is set by the FOUC script in index.html
+   and cleared by ThemeContext after first paint so the initial
+   load does not animate. */
+:root:not(.no-transition) * {
+  transition: background-color 200ms ease, color 200ms ease, border-color 200ms ease;
+}
+@media (prefers-reduced-motion: reduce) {
+  :root:not(.no-transition) * { transition: none; }
+}
+
+/* ─── Dark Mode: Minimal Overrides ─── */
+/* Gray, primary, success, warning, error, info are handled by the @theme
+   token bridge. This block covers Tailwind built-in colors (emerald, red,
+   amber, blue, green, yellow) that are NOT in the bridge, plus raw form
+   elements and backdrop utilities. Uses !important because Tailwind's
+   generated utilities are at the same specificity. */
+:root[data-theme="dark"] {
+  /* bg-white override — can't use @theme --color-white because that also
+     breaks text-white (buttons, badges etc. legitimately use white text). */
+  .bg-white { background-color: var(--color-surface-primary) !important; }
+  .border-white { border-color: var(--color-border-primary) !important; }
+
+  /* Built-in color light shades → translucent (not in @theme, Tailwind
+     defaults). Used for alert/info pill backgrounds throughout the app. */
+  .bg-emerald-50, .bg-green-50 { background-color: rgba(16, 185, 129, 0.1) !important; }
+  .bg-red-50 { background-color: rgba(239, 68, 68, 0.1) !important; }
+  .bg-amber-50, .bg-yellow-50 { background-color: rgba(245, 158, 11, 0.1) !important; }
+  .bg-blue-50 { background-color: rgba(59, 130, 246, 0.1) !important; }
+  .border-emerald-200, .border-green-200 { border-color: rgba(16, 185, 129, 0.25) !important; }
+  .border-red-200 { border-color: rgba(239, 68, 68, 0.25) !important; }
+  .border-amber-200, .border-yellow-200 { border-color: rgba(245, 158, 11, 0.25) !important; }
+  .border-blue-200 { border-color: rgba(59, 130, 246, 0.25) !important; }
+
+  /* Backdrop overlays */
+  .bg-white\/60 { background-color: rgb(10 10 10 / 0.6) !important; }
+  .bg-white\/80 { background-color: rgb(10 10 10 / 0.8) !important; }
+
+  /* Raw form elements that don't use Tailwind utility classes (native
+     dropdowns, plain inputs without className, textarea). Without these,
+     browser defaults render white inputs on near-black page bg. */
+  select, input[type="text"], input[type="email"], input[type="password"],
+  input[type="number"], input[type="search"], textarea {
+    background-color: var(--color-surface-primary);
+    color: var(--color-text-primary);
+    border-color: var(--color-border-primary);
+  }
+}
+
+/* ─── Inter Font ─── */
+@layer base {
+  @font-face {
+    font-family: "Inter";
+    font-style: normal;
+    font-weight: 100 900;
+    font-display: swap;
+    src: url("https://rsms.me/inter/font-files/InterVariable.woff2") format("woff2");
+    font-feature-settings: "liga" 1, "calt" 1, "cv11", "ss01";
+  }
+
+  @font-face {
+    font-family: "Inter";
+    font-style: italic;
+    font-weight: 100 900;
+    font-display: swap;
+    src: url("https://rsms.me/inter/font-files/InterVariable-Italic.woff2") format("woff2");
+    font-feature-settings: "liga" 1, "calt" 1, "cv11", "ss01";
+  }
+}
+
+/* ─── Base Resets ─── */
+@layer base {
+  html {
+    font-family: var(--font-sans);
+    font-feature-settings: var(--font-feature-settings);
+    font-variation-settings: var(--font-variation-settings);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    background-color: var(--color-surface-secondary);
+    color: var(--color-text-primary);
+    line-height: var(--line-height-body);
+    font-size: var(--text-sm);
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    font-family: var(--font-heading);
+    letter-spacing: -0.025em;
+  }
+}
+
+/* ─── Tailwind Theme Bridge ─── */
+@theme {
+  --color-primary-50: var(--color-primary-50);
+  --color-primary-100: var(--color-primary-100);
+  --color-primary-200: var(--color-primary-200);
+  --color-primary-300: var(--color-primary-300);
+  --color-primary-400: var(--color-primary-400);
+  --color-primary-500: var(--color-primary-500);
+  --color-primary-600: var(--color-primary-600);
+  --color-primary-700: var(--color-primary-700);
+  --color-primary-800: var(--color-primary-800);
+  --color-primary-900: var(--color-primary-900);
+
+  --color-gray-50: var(--color-gray-50);
+  --color-gray-100: var(--color-gray-100);
+  --color-gray-200: var(--color-gray-200);
+  --color-gray-300: var(--color-gray-300);
+  --color-gray-400: var(--color-gray-400);
+  --color-gray-500: var(--color-gray-500);
+  --color-gray-600: var(--color-gray-600);
+  --color-gray-700: var(--color-gray-700);
+  --color-gray-800: var(--color-gray-800);
+  --color-gray-900: var(--color-gray-900);
+
+  --color-success: var(--color-success);
+  --color-success-50: var(--color-success-50);
+  --color-success-100: var(--color-success-100);
+  --color-success-200: var(--color-success-200);
+  --color-success-300: var(--color-success-300);
+  --color-success-400: var(--color-success-400);
+  --color-success-500: var(--color-success-500);
+  --color-success-600: var(--color-success-600);
+  --color-success-700: var(--color-success-700);
+  --color-success-800: var(--color-success-800);
+  --color-success-900: var(--color-success-900);
+
+  --color-warning: var(--color-warning);
+  --color-warning-50: var(--color-warning-50);
+  --color-warning-100: var(--color-warning-100);
+  --color-warning-200: var(--color-warning-200);
+  --color-warning-300: var(--color-warning-300);
+  --color-warning-400: var(--color-warning-400);
+  --color-warning-500: var(--color-warning-500);
+  --color-warning-600: var(--color-warning-600);
+  --color-warning-700: var(--color-warning-700);
+  --color-warning-800: var(--color-warning-800);
+  --color-warning-900: var(--color-warning-900);
+
+  --color-error: var(--color-error);
+  --color-error-50: var(--color-error-50);
+  --color-error-100: var(--color-error-100);
+  --color-error-200: var(--color-error-200);
+  --color-error-300: var(--color-error-300);
+  --color-error-400: var(--color-error-400);
+  --color-error-500: var(--color-error-500);
+  --color-error-600: var(--color-error-600);
+  --color-error-700: var(--color-error-700);
+  --color-error-800: var(--color-error-800);
+  --color-error-900: var(--color-error-900);
+
+  --color-info: var(--color-info);
+  --color-info-50: var(--color-info-50);
+  --color-info-500: var(--color-info-500);
+  --color-info-700: var(--color-info-700);
+
+  --radius-sm: var(--radius-sm);
+  --radius-md: var(--radius-md);
+  --radius-lg: var(--radius-lg);
+  --radius-xl: var(--radius-xl);
+  --radius-2xl: var(--radius-2xl);
+
+  --shadow-xs: var(--shadow-xs);
+  --shadow-sm: var(--shadow-sm);
+  --shadow-md: var(--shadow-md);
+  --shadow-lg: var(--shadow-lg);
+  --shadow-xl: var(--shadow-xl);
+
+  --font-sans: var(--font-sans);
+  --font-heading: var(--font-heading);
+  --font-mono: var(--font-mono);
+}
+
+/* ═══════════════════════════════════════════
+   COMPONENT LAYER
+   ═══════════════════════════════════════════ */
+@layer components {
+
+  /* ─── Buttons ─── */
+  .btn-primary {
+    @apply inline-flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed text-white cursor-pointer;
+    background-color: var(--color-primary-600);
+    border: 1px solid var(--color-primary-600);
+  }
+  .btn-primary:hover:not(:disabled) {
+    background-color: var(--color-primary-700);
+    border-color: var(--color-primary-700);
+  }
+  .btn-primary:focus-visible {
+    outline: 2px solid var(--color-primary-500);
+    outline-offset: 2px;
+  }
+
+  .btn-secondary {
+    @apply inline-flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer;
+    background-color: var(--color-surface-primary);
+    color: var(--color-text-primary);
+    border: 1px solid var(--color-border-primary);
+  }
+  .btn-secondary:hover:not(:disabled) {
+    background-color: var(--color-gray-50);
+    border-color: var(--color-gray-300);
+  }
+  .btn-secondary:focus-visible {
+    outline: 2px solid var(--color-gray-400);
+    outline-offset: 2px;
+  }
+
+  .btn-danger {
+    @apply inline-flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed text-white cursor-pointer;
+    background-color: var(--color-error-500);
+    border: 1px solid var(--color-error-500);
+  }
+  .btn-danger:hover:not(:disabled) {
+    background-color: var(--color-error-700);
+    border-color: var(--color-error-700);
+  }
+  .btn-danger:focus-visible {
+    outline: 2px solid var(--color-error-500);
+    outline-offset: 2px;
+  }
+
+  .btn-success {
+    @apply inline-flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed text-white cursor-pointer;
+    background-color: var(--color-success-600);
+    border: 1px solid var(--color-success-600);
+  }
+  .btn-success:hover:not(:disabled) {
+    background-color: var(--color-success-700);
+    border-color: var(--color-success-700);
+  }
+  .btn-success:focus-visible {
+    outline: 2px solid var(--color-success-500);
+    outline-offset: 2px;
+  }
+
+  .btn-warning {
+    @apply inline-flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed text-white cursor-pointer;
+    background-color: var(--color-warning-600);
+    border: 1px solid var(--color-warning-600);
+  }
+  .btn-warning:hover:not(:disabled) {
+    background-color: var(--color-warning-700);
+    border-color: var(--color-warning-700);
+  }
+  .btn-warning:focus-visible {
+    outline: 2px solid var(--color-warning-500);
+    outline-offset: 2px;
+  }
+
+  /* Dark mode: buttons use saturated backgrounds + guaranteed white text.
+     In dark mode the token scales get inverted so var(--color-primary-600)
+     is actually a light lavender, which would render as light text on a
+     light-lavender button — unreadable. Force the same saturated colors
+     that light mode uses and force white text. */
+  :root[data-theme="dark"] .btn-primary,
+  :root[data-theme="dark"] .btn-success,
+  :root[data-theme="dark"] .btn-danger,
+  :root[data-theme="dark"] .btn-warning {
+    color: #ffffff !important;
+  }
+  :root[data-theme="dark"] .btn-primary {
+    background-color: #4f46e5;
+    border-color: #4f46e5;
+  }
+  :root[data-theme="dark"] .btn-primary:hover:not(:disabled) {
+    background-color: #4338ca;
+    border-color: #4338ca;
+  }
+  :root[data-theme="dark"] .btn-success {
+    background-color: #059669;
+    border-color: #059669;
+  }
+  :root[data-theme="dark"] .btn-success:hover:not(:disabled) {
+    background-color: #047857;
+    border-color: #047857;
+  }
+  :root[data-theme="dark"] .btn-danger {
+    background-color: #dc2626;
+    border-color: #dc2626;
+  }
+  :root[data-theme="dark"] .btn-danger:hover:not(:disabled) {
+    background-color: #b91c1c;
+    border-color: #b91c1c;
+  }
+  :root[data-theme="dark"] .btn-warning {
+    background-color: #d97706;
+    border-color: #d97706;
+  }
+  :root[data-theme="dark"] .btn-warning:hover:not(:disabled) {
+    background-color: #b45309;
+    border-color: #b45309;
+  }
+
+  .btn-ghost {
+    @apply inline-flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer;
+    background-color: transparent;
+    color: var(--color-text-secondary);
+    border: 1px solid transparent;
+  }
+  .btn-ghost:hover:not(:disabled) {
+    background-color: var(--color-gray-100);
+    color: var(--color-text-primary);
+  }
+
+  /* ─── Cards ─── */
+  .card {
+    background-color: var(--color-surface-primary);
+    border: 1px solid var(--color-border-primary);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-sm);
+    padding: var(--spacing-lg);
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  }
+  .card:hover {
+    border-color: var(--color-gray-300);
+  }
+
+  .card-elevated {
+    background-color: var(--color-surface-elevated);
+    border: 1px solid var(--color-border-secondary);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-sm);
+    padding: var(--spacing-lg);
+  }
+
+  /* ─── Inputs ─── */
+  .input {
+    @apply block w-full px-3 py-2 text-sm rounded-md transition-colors;
+    font-family: var(--font-mono-display);
+    font-feature-settings: "calt" 1, "ss01" 1;
+    background-color: var(--color-surface-primary);
+    border: 1px solid var(--color-border-primary);
+    color: var(--color-text-primary);
+  }
+  .input:focus {
+    outline: none;
+    border-color: var(--color-primary-500);
+    box-shadow: var(--shadow-ring);
+  }
+  .input::placeholder {
+    color: var(--color-text-tertiary);
+  }
+
+  .label {
+    @apply block text-sm font-medium mb-1.5;
+    font-family: var(--font-mono-display);
+    font-feature-settings: "calt" 1, "ss01" 1;
+    color: var(--color-text-primary);
+  }
+
+  /* ─── Badges ─── */
+  .badge {
+    @apply inline-flex items-center px-2 py-0.5 rounded text-xs font-medium;
+  }
+  .badge-success {
+    background-color: var(--color-success-50);
+    color: var(--color-success-700);
+    border: 1px solid var(--color-success-200);
+  }
+  .badge-error {
+    background-color: var(--color-error-50);
+    color: var(--color-error-700);
+    border: 1px solid var(--color-error-200);
+  }
+  .badge-warning {
+    background-color: var(--color-warning-50);
+    color: var(--color-warning-700);
+    border: 1px solid var(--color-warning-200);
+  }
+  .badge-info {
+    background-color: var(--color-info-50);
+    color: var(--color-info-700);
+    border: 1px solid var(--color-primary-200);
+  }
+  .badge-gray {
+    background-color: var(--color-gray-100);
+    color: var(--color-gray-600);
+    border: 1px solid var(--color-gray-200);
+  }
+
+  /* ─── Tables ─── */
+  .table {
+    @apply w-full text-sm text-left;
+    color: var(--color-text-primary);
+    font-variant-numeric: tabular-nums;
+  }
+  .table th {
+    @apply px-4 py-3 text-xs font-semibold uppercase;
+    font-family: var(--font-mono-display);
+    font-feature-settings: "calt" 1, "ss01" 1;
+    letter-spacing: var(--tracking-mono-wide);
+    background-color: var(--color-surface-sunken);
+    color: var(--color-text-secondary);
+    border-bottom: 1px solid var(--color-border-primary);
+    position: sticky;
+    top: 0;
+    z-index: 10;
+  }
+  .table td {
+    @apply px-4 py-3;
+    border-bottom: 1px solid var(--color-border-secondary);
+  }
+  .table tbody tr {
+    transition: background-color var(--transition-fast);
+  }
+  .table tbody tr:hover {
+    background-color: var(--color-surface-sunken);
+  }
+
+  /* ─── Navigation ─── */
+  .nav-link {
+    @apply flex items-center gap-3 px-3 text-sm font-medium rounded-md;
+    padding-top: 7px;
+    padding-bottom: 7px;
+    color: var(--color-sidebar-text);
+    position: relative;
+    transition: all var(--transition-fast);
+  }
+  .nav-link:hover {
+    background-color: var(--color-sidebar-hover-bg);
+    color: var(--color-sidebar-text-hover);
+  }
+  .nav-link.active {
+    background-color: var(--color-sidebar-active-bg);
+    color: var(--color-sidebar-text-active);
+    border-left: 3px solid var(--color-sidebar-active-border);
+    padding-left: 9px;
+  }
+
+  .nav-section-header {
+    @apply font-semibold uppercase mb-2 px-3;
+    font-size: 10px;
+    letter-spacing: var(--tracking-wide);
+    color: var(--color-sidebar-section-label);
+  }
+  :where([data-theme="dark"]) .nav-section-header {
+    text-shadow:
+      0 0 8px rgba(245, 158, 11, 0.35),
+      0 1px 0 rgba(0, 0, 0, 0.6);
+    letter-spacing: 0.08em;
+  }
+
+  /* ─── Sidebar ─── */
+  .sidebar {
+    background-color: var(--color-sidebar-bg);
+    border-right: 1px solid var(--color-sidebar-border);
+  }
+  .sidebar-header {
+    background-color: var(--color-sidebar-bg);
+    padding: var(--spacing-lg);
+    border-bottom: 1px solid var(--color-sidebar-divider);
+    color: var(--color-sidebar-logo-text);
+  }
+
+  /* ─── Page Layout ─── */
+  .main-header {
+    background-color: var(--color-surface-primary);
+    border-bottom: none;
+  }
+
+  .page-title {
+    @apply text-xl font-semibold;
+    font-family: var(--font-mono-display);
+    font-feature-settings: "calt" 1, "ss01" 1, "zero" 1;
+    color: var(--color-text-primary);
+    letter-spacing: var(--tracking-display-tight);
+  }
+
+  .page-subtitle {
+    @apply text-sm;
+    font-family: var(--font-mono-display);
+    font-weight: 400;
+    color: var(--color-text-secondary);
+  }
+
+  /* ─── Status Indicators ─── */
+  .status-indicator {
+    @apply inline-flex items-center;
+  }
+  .status-indicator::before {
+    content: '';
+    @apply w-2 h-2 rounded-full mr-2;
+  }
+  .status-available::before {
+    background-color: var(--color-success);
+  }
+  .status-unavailable::before {
+    background-color: var(--color-error);
+  }
+  .status-monitoring::before {
+    background-color: var(--color-warning);
+  }
+
+  /* ─── Loading ─── */
+  .loading-spinner {
+    @apply animate-spin rounded-full border-2;
+    border-color: var(--color-gray-200);
+    border-top-color: var(--color-primary-600);
+  }
+
+  /* ─── Color Aliases ─── */
+  .text-primary {
+    color: var(--color-primary-600);
+  }
+  .text-secondary {
+    color: var(--color-text-secondary);
+  }
+  .bg-primary {
+    background-color: var(--color-primary-600);
+  }
+
+  /* ─── Progress Indicator ─── */
+  .progress-indicator {
+    @apply flex items-center space-x-2 px-3 py-2 rounded-lg text-white text-sm font-medium shadow-md;
+    transition: all var(--transition-base);
+  }
+  .progress-indicator:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  }
+
+  .progress-details {
+    @apply absolute top-full right-0 mt-2 w-80 rounded-lg shadow-xl border z-50;
+    background-color: var(--color-surface-primary);
+    border-color: var(--color-border-primary);
+    color: var(--color-text-primary);
+    animation: slideDown 0.2s ease-out;
+  }
+
+  /* ─── Auth Pages ─── */
+  .auth-dots-pattern {
+    background-image: radial-gradient(circle, rgba(255, 255, 255, 0.1) 1px, transparent 1px);
+    background-size: 30px 30px;
+  }
+
+  /* ─── Form Utilities ─── */
+  .select-reset {
+    -webkit-appearance: none;
+    -moz-appearance: none;
+    appearance: none;
+    background: none;
+    background-image: none;
+  }
+
+  /* ─── Toast ─── */
+  .toaster-container {
+    bottom: 100px;
+    z-index: 10001 !important;
+  }
+  .toast-base {
+    background-color: var(--color-gray-900);
+    color: #ffffff;
+    padding: 12px 20px;
+    border-radius: var(--radius-md);
+    font-size: var(--text-sm);
+    max-width: 400px;
+    box-shadow: var(--shadow-lg);
+  }
+
+  /* ─── Modal ─── */
+  .modal-panel {
+    max-height: 90vh;
+  }
+  .modal-panel-compact {
+    max-height: 80vh;
+  }
+  .media-preview {
+    min-height: 60vh;
+    max-height: 70vh;
+  }
+
+  /* ─── Animations ─── */
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(8px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  .animate-fadeIn {
+    animation: fadeIn 0.25s ease-out;
+  }
+
+  @keyframes shake {
+    0%, 100% { transform: translateX(0); }
+    25%      { transform: translateX(-4px); }
+    75%      { transform: translateX(4px); }
+  }
+  .animate-shake {
+    animation: shake 0.2s ease-in-out 0s 2;
+  }
+
+  @keyframes slideDown {
+    from { opacity: 0; transform: translateY(-8px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  @keyframes fadeSlideUp {
+    from { opacity: 0; transform: translateY(12px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  @keyframes breathe {
+    0%, 100% { transform: scale(1); }
+    50% { transform: scale(1.02); }
+  }
+
+  @keyframes glowPulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(8, 145, 178, 0.1); }
+    50% { box-shadow: 0 0 12px 4px rgba(8, 145, 178, 0.3); }
+  }
+
+  @keyframes channelPulse {
+    0%, 100% { transform: scale(1); }
+    50% { transform: scale(1.05); }
+  }
+
+  @keyframes bellRing {
+    0%, 50%, 100% { transform: rotate(0deg); }
+    5% { transform: rotate(14deg); }
+    10% { transform: rotate(-12deg); }
+    15% { transform: rotate(10deg); }
+    20% { transform: rotate(-8deg); }
+    25% { transform: rotate(4deg); }
+  }
+
+  @keyframes loading-bar {
+    0%   { transform: translateX(-100%); }
+    50%  { transform: translateX(0); }
+    100% { transform: translateX(100%); }
+  }
+  .animate-loading-bar {
+    animation: loading-bar 1.5s infinite linear;
+    width: 50%;
+  }
+
+  @keyframes dotPulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+  }
+
+  @keyframes blink {
+    0%, 90%, 100% { transform: scaleY(1); }
+    95% { transform: scaleY(0.15); }
+  }
+
+  @keyframes nudgeRight {
+    0%, 100% { transform: translateX(0); }
+    50% { transform: translateX(3px); }
+  }
+
+  /* ─── Modal entrance animations ─── */
+  @keyframes modalScaleIn {
+    from {
+      opacity: 0;
+      transform: scale(0.96);
+    }
+    to {
+      opacity: 1;
+      transform: scale(1);
+    }
+  }
+
+  @keyframes modalBackdropFadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+
+  .animate-modal-panel {
+    animation: modalScaleIn 180ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  .animate-modal-backdrop {
+    animation: modalBackdropFadeIn 150ms ease-out;
+  }
+
+  /* ─── Auth page background mesh ─── */
+  /* Four radial-gradient stops drifted slowly via background-position
+     animation. The colors come from --color-mesh-{1..4} which flip in
+     dark mode. prefers-reduced-motion turns the drift off but keeps the
+     gradient. */
+  .bg-auth-mesh {
+    background-color: var(--color-surface-secondary);
+    background-image:
+      radial-gradient(circle at 20% 30%, var(--color-mesh-1) 0%, transparent 50%),
+      radial-gradient(circle at 80% 20%, var(--color-mesh-3) 0%, transparent 45%),
+      radial-gradient(circle at 70% 80%, var(--color-mesh-4) 0%, transparent 50%),
+      radial-gradient(circle at 10% 90%, var(--color-mesh-2) 0%, transparent 40%);
+    background-size: 200% 200%, 200% 200%, 200% 200%, 200% 200%;
+    animation: auth-mesh-drift 30s ease-in-out infinite alternate;
+  }
+  @keyframes auth-mesh-drift {
+    0%   { background-position: 0% 0%, 100% 0%, 100% 100%, 0% 100%; }
+    100% { background-position: 10% 5%, 95% 5%, 90% 95%, 5% 95%; }
+  }
+
+  /* ─── Grain overlay ─── */
+  /* Tiny SVG noise as a data-URI, mix-blended over content. Add to a
+     parent that has `position: relative`. The ::before is positioned
+     absolute and ignores pointer events. Opacity reads from --grain-alpha
+     so it stays subtle in light mode and a touch stronger in dark. */
+  .grain-overlay { position: relative; }
+  .grain-overlay::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    opacity: var(--grain-alpha);
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>");
+    mix-blend-mode: overlay;
+    z-index: 0;
+  }
+
+  /* ─── Auth typographic treatment ─── */
+  /* Mono display headline used on auth pages. Tight tracking, variable
+     font weight axis. Pair with --font-mono-display token. */
+  .auth-display {
+    font-family: var(--font-mono-display);
+    font-weight: 600;
+    letter-spacing: var(--tracking-display-tight);
+    font-feature-settings: "calt" 1, "ss01" 1, "zero" 1;
+    color: var(--color-text-primary);
+  }
+  .auth-mono-label {
+    font-family: var(--font-mono-display);
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: var(--tracking-mono-wide);
+    font-size: var(--text-2xs);
+    color: var(--color-text-tertiary);
+  }
+  .auth-mono-body {
+    font-family: var(--font-mono-display);
+    font-weight: 400;
+    font-feature-settings: "calt" 1, "ss01" 1, "zero" 1;
+    color: var(--color-text-secondary);
+  }
+
+  /* ─── Auth card — the floating form container ─── */
+  /* Slight inner glow + indigo halo at the bottom; entry animation;
+     deliberately uses 4px radius (NOT --radius-lg) to differ from sidebar
+     cards — variety is a human signal. */
+  .auth-card {
+    background-color: var(--color-surface-primary);
+    border: 1px solid var(--color-border-primary);
+    border-radius: 4px;
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.04),
+      0 16px 40px -16px rgba(99, 102, 241, 0.12);
+    animation: auth-card-enter 400ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
+  :root[data-theme="dark"] .auth-card {
+    box-shadow:
+      0 0 0 1px rgba(255, 255, 255, 0.04),
+      0 16px 40px -16px rgba(99, 102, 241, 0.25);
+  }
+  @keyframes auth-card-enter {
+    from { opacity: 0; transform: translateY(6px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  /* Right-rail content fades in after the form card (staggered) */
+  .auth-rail-enter {
+    animation: auth-rail-enter 400ms cubic-bezier(0.16, 1, 0.3, 1) 200ms both;
+  }
+  @keyframes auth-rail-enter {
+    from { opacity: 0; transform: translateX(8px); }
+    to   { opacity: 1; transform: translateX(0); }
+  }
+
+  /* Numbered marker fades in last */
+  .auth-marker-enter {
+    animation: auth-marker-enter 400ms cubic-bezier(0.16, 1, 0.3, 1) 400ms both;
+  }
+  @keyframes auth-marker-enter {
+    from { opacity: 0; }
+    to   { opacity: 1; }
+  }
+
+  /* Underline-on-focus input — replaces border-color change.
+     The wrapping label uses .input-underline; the actual <input> stays
+     borderless and focus draws the underline left to right. */
+  .input-underline {
+    position: relative;
+    display: block;
+  }
+  .input-underline::after {
+    content: '';
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 1px;
+    background-color: var(--color-text-primary);
+    transform: scaleX(0);
+    transform-origin: left center;
+    transition: transform 240ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  .input-underline:focus-within::after { transform: scaleX(1); }
+
+  /* Submit button micro-press */
+  .auth-submit {
+    transition: transform 120ms ease, background-color 200ms ease;
+  }
+  .auth-submit:active:not(:disabled) { transform: scale(0.985); }
+
+  /* Hover-underline-draw on secondary text links */
+  .auth-link {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    color: var(--color-text-secondary);
+    transition: color 150ms ease;
+  }
+  .auth-link::after {
+    content: '';
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: -2px;
+    height: 1px;
+    background-color: currentColor;
+    transform: scaleX(0);
+    transform-origin: left center;
+    transition: transform 200ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  .auth-link:hover {
+    color: var(--color-text-primary);
+  }
+  .auth-link:hover::after { transform: scaleX(1); }
+
+  /* Error shake — added briefly via React when an error toast fires */
+  .auth-shake { animation: auth-shake 180ms cubic-bezier(0.36, 0.07, 0.19, 0.97); }
+  @keyframes auth-shake {
+    0%, 100% { transform: translateX(0); }
+    25% { transform: translateX(-3px); }
+    75% { transform: translateX(3px); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .bg-auth-mesh { animation: none; }
+    .auth-card,
+    .auth-rail-enter,
+    .auth-marker-enter,
+    .auth-shake { animation: none; }
+    .input-underline::after,
+    .auth-link::after { transition: none; }
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ─── Turnstile Widget ─── */
+#turnstile-widget-container,
+#turnstile-widget-container > div,
+[data-cf-turnstile] {
+  background-color: #ffffff !important;
+}
+#turnstile-widget-container iframe,
+iframe[src*="challenges.cloudflare.com"] {
+  background-color: #ffffff !important;
+  border: none !important;
+}
+
+/* ─── reCAPTCHA Error Hiding ─── */
+.grecaptcha-badge[style*="error"],
+div[class*="recaptcha"][style*="error"],
+div[id*="recaptcha"][style*="error"] {
+  display: none !important;
+  visibility: hidden !important;
+}
+
+/* ─── Utilities ─── */
+@layer utilities {
+  .scrollbar-hide::-webkit-scrollbar {
+    display: none;
+  }
+  .scrollbar-hide {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
+  }
+}

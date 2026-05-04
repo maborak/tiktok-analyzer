@@ -1,0 +1,192 @@
+@layer base {
+  :root {
+    /* ─── Primary: Refined Indigo ─── */
+    --color-primary-50:  #eef2ff;
+    --color-primary-100: #e0e7ff;
+    --color-primary-200: #c7d2fe;
+    --color-primary-300: #a5b4fc;
+    --color-primary-400: #818cf8;
+    --color-primary-500: #6366f1;
+    --color-primary-600: #4f46e5;
+    --color-primary-700: #4338ca;
+    --color-primary-800: #3730a3;
+    --color-primary-900: #312e81;
+
+    /* ─── Neutral: Pure Gray (no warm/cool bias) ─── */
+    --color-gray-50:  #fafafa;
+    --color-gray-100: #f5f5f5;
+    --color-gray-200: #e5e5e5;
+    --color-gray-300: #d4d4d4;
+    --color-gray-400: #a3a3a3;
+    --color-gray-500: #737373;
+    --color-gray-600: #525252;
+    --color-gray-700: #404040;
+    --color-gray-800: #262626;
+    --color-gray-900: #171717;
+
+    /* ─── Surfaces ─── */
+    --color-surface-primary:   #ffffff;
+    --color-surface-secondary: #fafafa;
+    --color-surface-elevated:  #ffffff;
+    --color-surface-sunken:    #f5f5f5;
+
+    /* ─── Text ─── */
+    --color-text-primary:   #171717;
+    --color-text-secondary: #525252;
+    --color-text-tertiary:  #a3a3a3;
+    --color-text-disabled:  #d4d4d4;
+
+    /* ─── Borders ─── */
+    --color-border-primary:   #e5e5e5;
+    --color-border-secondary: #f5f5f5;
+    --color-border-focus:     #a5b4fc;
+
+    /* ─── Success (Green) ─── */
+    --color-success:     #10b981;
+    --color-success-50:  #ecfdf5;
+    --color-success-100: #d1fae5;
+    --color-success-200: #a7f3d0;
+    --color-success-300: #6ee7b7;
+    --color-success-400: #34d399;
+    --color-success-500: #10b981;
+    --color-success-600: #059669;
+    --color-success-700: #047857;
+    --color-success-800: #065f46;
+    --color-success-900: #064e3b;
+
+    /* ─── Warning (Amber) ─── */
+    --color-warning:     #f59e0b;
+    --color-warning-50:  #fffbeb;
+    --color-warning-100: #fef3c7;
+    --color-warning-200: #fde68a;
+    --color-warning-300: #fcd34d;
+    --color-warning-400: #fbbf24;
+    --color-warning-500: #f59e0b;
+    --color-warning-600: #d97706;
+    --color-warning-700: #b45309;
+    --color-warning-800: #92400e;
+    --color-warning-900: #78350f;
+
+    /* ─── Error (Red) ─── */
+    --color-error:       #ef4444;
+    --color-error-50:    #fef2f2;
+    --color-error-100:   #fee2e2;
+    --color-error-200:   #fecaca;
+    --color-error-300:   #fca5a5;
+    --color-error-400:   #f87171;
+    --color-error-500:   #ef4444;
+    --color-error-600:   #dc2626;
+    --color-error-700:   #b91c1c;
+    --color-error-800:   #991b1b;
+    --color-error-900:   #7f1d1d;
+
+    /* ─── Info (Primary alias) ─── */
+    --color-info:        #6366f1;
+    --color-info-50:     #eef2ff;
+    --color-info-500:    #6366f1;
+    --color-info-700:    #4338ca;
+
+    /* ─── Data Visualization ─── */
+    --color-chart-1: #6366f1;
+    --color-chart-2: #06b6d4;
+    --color-chart-3: #8b5cf6;
+    --color-chart-4: #f59e0b;
+    --color-chart-5: #10b981;
+    --color-chart-6: #ec4899;
+
+    /* ─── Sidebar ─── */
+    --color-sidebar-bg:              #ffffff;
+    --color-sidebar-border:          #e5e5e5;
+    --color-sidebar-text:            #525252;
+    --color-sidebar-text-hover:      #171717;
+    --color-sidebar-text-active:     #4338ca;
+    --color-sidebar-icon:            #a3a3a3;
+    --color-sidebar-icon-active:     #4f46e5;
+    --color-sidebar-active-bg:       #eef2ff;
+    --color-sidebar-active-border:   #6366f1;
+    --color-sidebar-section-label:   #a3a3a3;
+    --color-sidebar-hover-bg:        #f5f5f5;
+    --color-sidebar-logo-bg:         #6366f1;
+    --color-sidebar-logo-text:       #171717;
+    --color-sidebar-divider:         #f0f0f0;
+
+    /* ─── Dashboard Stat Cards ─── */
+    --color-stat-bg:              #ffffff;
+    --color-stat-border:          #e5e5e5;
+    --color-stat-secondary-bg:    #f5f5f5;
+    --color-stat-secondary-border:#e5e5e5;
+    --color-stat-text-primary:    #171717;
+    --color-stat-text-secondary:  #525252;
+    --color-stat-text-label:      #a3a3a3;
+
+    /* ─── Auth mesh gradient (light) ─── */
+    /* Four soft indigo-on-white stops, drifted slowly via .bg-auth-mesh */
+    --color-mesh-1: #f5f3ff;  /* soft indigo haze */
+    --color-mesh-2: #ffffff;  /* highlight */
+    --color-mesh-3: #eef2ff;  /* indigo-50 */
+    --color-mesh-4: #faf9ff;  /* near white */
+    /* Grain overlay alpha — 3% in light, kicked up in dark for visible texture */
+    --grain-alpha: 0.03;
+
+    /* ─── Shadows (subtle, refined) ─── */
+    --shadow-xs: 0 1px 2px 0 rgb(0 0 0 / 0.03);
+    --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+    --shadow-md: 0 4px 6px -1px rgb(0 0 0 / 0.07), 0 2px 4px -2px rgb(0 0 0 / 0.05);
+    --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.08), 0 4px 6px -4px rgb(0 0 0 / 0.04);
+    --shadow-xl: 0 20px 25px -5px rgb(0 0 0 / 0.08), 0 8px 10px -6px rgb(0 0 0 / 0.04);
+    --shadow-ring: 0 0 0 2px var(--color-primary-100);
+    --shadow-ring-error: 0 0 0 2px var(--color-error-50);
+
+    /* ─── Spacing (4px grid) ─── */
+    --spacing-xs:  0.25rem;  /*  4px */
+    --spacing-sm:  0.5rem;   /*  8px */
+    --spacing-md:  1rem;     /* 16px */
+    --spacing-lg:  1.5rem;   /* 24px */
+    --spacing-xl:  2rem;     /* 32px */
+    --spacing-2xl: 3rem;     /* 48px */
+
+    /* ─── Border Radius ─── */
+    --radius-sm:   0.25rem;  /*  4px — badges, tags */
+    --radius-md:   0.375rem; /*  6px — buttons, inputs */
+    --radius-lg:   0.5rem;   /*  8px — cards, dropdowns */
+    --radius-xl:   0.75rem;  /* 12px — modals, large cards */
+    --radius-2xl:  1rem;     /* 16px — hero elements */
+    --radius-full: 9999px;   /* pills, avatars */
+
+    /* ─── Typography ─── */
+    --font-sans: "Inter", "InterVariable", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --font-heading: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+    --font-mono: "JetBrains Mono Variable", "JetBrains Mono", "Fira Code", ui-monospace, monospace;
+    /* Display mono used on auth pages — distinct from the body --font-mono
+       so we can wire it independently if we ever swap face. */
+    --font-mono-display: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+    --font-feature-settings: "liga" 1, "calt" 1, "cv11", "ss01";
+    --font-variation-settings: "opsz" 32;
+    /* Mono-display tracking */
+    --tracking-display-tight: -0.03em;  /* large mono headlines */
+    --tracking-mono-wide:     0.08em;   /* uppercase mono labels */
+    --line-height-body: 1.5;
+    --line-height-tight: 1.25;
+
+    /* ─── Font Sizes ─── */
+    --text-2xs:  0.625rem;   /* 10px — tiny labels */
+    --text-xs:   0.75rem;    /* 12px */
+    --text-sm:   0.875rem;   /* 14px */
+    --text-base: 1rem;       /* 16px */
+    --text-lg:   1.125rem;   /* 18px */
+    --text-xl:   1.25rem;    /* 20px */
+    --text-2xl:  1.5rem;     /* 24px */
+    --text-3xl:  1.875rem;   /* 30px */
+
+    /* ─── Letter Spacing ─── */
+    --tracking-tight:  -0.025em;
+    --tracking-normal: 0;
+    --tracking-wide:   0.05em;
+    --tracking-wider:  0.1em;
+
+    /* ─── Transitions ─── */
+    --transition-fast: 150ms ease;
+    --transition-base: 200ms ease;
+    --transition-slow: 300ms ease;
+  }
+}

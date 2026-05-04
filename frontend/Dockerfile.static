@@ -1,0 +1,166 @@
+# check=skip=SecretsUsedInArgOrEnv
+# Reason: VITE_*_SITE_KEY are PUBLIC captcha site keys (not secret keys).
+# They are intentionally baked into the static JS bundle by Vite at build time
+# and will be visible in the browser. There is no alternative for static builds.
+
+# Build stage
+FROM node:24-alpine AS builder
+
+
+ARG BUILD_DATE
+ARG VCS_REF
+ARG GIT_COMMIT
+ARG BUILD_NUMBER
+ARG BUILD_URL
+ARG VERSION=latest
+ARG VITE_APP_VERSION
+ARG VITE_BUILD_DATE
+ARG VITE_DOCKER_TAG
+# Accept common VITE_* environment variables as build args
+ARG VITE_API_BASE_URL
+ARG VITE_API_TIMEOUT
+ARG VITE_API_CACHE_TTL
+ARG VITE_APP_NAME
+ARG VITE_LOADER_TYPE
+ARG VITE_DEFAULT_COUNTRY
+ARG VITE_DEFAULT_COUNTRY_DATA
+ARG VITE_DEBUG_MODE
+ARG VITE_LOG_LEVEL
+ARG VITE_PRICE_HISTORY_LIMIT
+ARG VITE_PRICE_HISTORY_PAGE_SIZE
+ARG VITE_CONNECTIVITY_CHECK_INTERVAL
+# Captcha
+ARG VITE_CAPTCHA_PROVIDER
+ARG VITE_RECAPTCHA_SITE_KEY
+ARG VITE_TURNSTILE_SITE_KEY
+# Access control
+ARG VITE_APP_MODE
+ARG VITE_ADMIN_ROUTE_PREFIX
+ARG VITE_USER_ROUTE_PREFIX
+
+# Set environment variables for Vite build
+ENV VITE_APP_VERSION=${VITE_APP_VERSION}
+ENV VITE_BUILD_DATE=${VITE_BUILD_DATE}
+ENV VITE_DOCKER_TAG=${VITE_DOCKER_TAG}
+# Set VITE_* environment variables for build
+ENV VITE_API_BASE_URL=${VITE_API_BASE_URL}
+ENV VITE_API_TIMEOUT=${VITE_API_TIMEOUT}
+ENV VITE_API_CACHE_TTL=${VITE_API_CACHE_TTL}
+ENV VITE_APP_NAME=${VITE_APP_NAME}
+ENV VITE_LOADER_TYPE=${VITE_LOADER_TYPE}
+ENV VITE_DEFAULT_COUNTRY=${VITE_DEFAULT_COUNTRY}
+ENV VITE_DEFAULT_COUNTRY_DATA=${VITE_DEFAULT_COUNTRY_DATA}
+ENV VITE_DEBUG_MODE=${VITE_DEBUG_MODE}
+ENV VITE_LOG_LEVEL=${VITE_LOG_LEVEL}
+ENV VITE_PRICE_HISTORY_LIMIT=${VITE_PRICE_HISTORY_LIMIT}
+ENV VITE_PRICE_HISTORY_PAGE_SIZE=${VITE_PRICE_HISTORY_PAGE_SIZE}
+ENV VITE_CONNECTIVITY_CHECK_INTERVAL=${VITE_CONNECTIVITY_CHECK_INTERVAL}
+# Captcha
+ENV VITE_CAPTCHA_PROVIDER=${VITE_CAPTCHA_PROVIDER}
+ENV VITE_RECAPTCHA_SITE_KEY=${VITE_RECAPTCHA_SITE_KEY}
+ENV VITE_TURNSTILE_SITE_KEY=${VITE_TURNSTILE_SITE_KEY}
+# Access control
+ENV VITE_APP_MODE=${VITE_APP_MODE}
+ENV VITE_ADMIN_ROUTE_PREFIX=${VITE_ADMIN_ROUTE_PREFIX}
+ENV VITE_USER_ROUTE_PREFIX=${VITE_USER_ROUTE_PREFIX}
+
+WORKDIR /app
+
+# Copy package.json only to avoid lockfile cross-platform issues with optional dependencies (rollup/musl)
+COPY package.json ./
+
+# Install dependencies with fresh resolution for Alpine
+RUN npm install
+
+# Copy source code
+COPY . .
+
+# Compute build info defaults and build in the same RUN command
+# This ensures computed values are available during the build
+RUN APP_VER="$VITE_APP_VERSION"; \
+  if [ -z "$APP_VER" ]; then \
+  if command -v node >/dev/null 2>&1; then \
+  APP_VER=$(node -p "require('./package.json').version" 2>/dev/null || echo "1.0.0"); \
+  else \
+  APP_VER=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]*"' package.json | sed 's/"version"[[:space:]]*:[[:space:]]*"\([^"]*\)"/\1/' | head -1 || echo "1.0.0"); \
+  fi; \
+  if [ "$APP_VER" = "0.0.0" ] || [ -z "$APP_VER" ]; then APP_VER="1.0.0"; fi; \
+  fi && \
+  BUILD_DATE="$VITE_BUILD_DATE"; \
+  if [ -z "$BUILD_DATE" ]; then \
+  BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ'); \
+  fi && \
+  DOCKER_TAG="$VITE_DOCKER_TAG"; \
+  if [ -z "$DOCKER_TAG" ]; then \
+  DOCKER_TAG="${VERSION:-latest}"; \
+  fi && \
+  export VITE_APP_VERSION="$APP_VER" && \
+  export VITE_BUILD_DATE="$BUILD_DATE" && \
+  export VITE_DOCKER_TAG="$DOCKER_TAG" && \
+  echo "Building with:" && \
+  echo "  VITE_APP_VERSION=$VITE_APP_VERSION" && \
+  echo "  VITE_BUILD_DATE=$VITE_BUILD_DATE" && \
+  echo "  VITE_DOCKER_TAG=$VITE_DOCKER_TAG" && \
+  npm run build
+
+# Production stage
+FROM nginx:alpine
+
+ARG BUILD_DATE
+ARG VCS_REF
+ARG GIT_COMMIT
+ARG BUILD_NUMBER
+ARG BUILD_URL
+ARG VERSION=latest
+
+LABEL org.opencontainers.image.title="Maborak Framework UI" \
+  org.opencontainers.image.description="Amazon product availability monitoring dashboard frontend" \
+  org.opencontainers.image.version="${VERSION}" \
+  org.opencontainers.image.created="${BUILD_DATE}" \
+  org.opencontainers.image.authors="maborak" \
+  org.opencontainers.image.url="https://maborak.com" \
+  org.opencontainers.image.documentation="https://github.com/maborak/framework-ui/blob/main/README.md" \
+  org.opencontainers.image.source="https://github.com/maborak/framework-ui" \
+  org.opencontainers.image.vendor="maborak" \
+  org.opencontainers.image.licenses="MIT" \
+  org.opencontainers.image.revision="${VCS_REF}" \
+  org.opencontainers.image.base.name="nginx:alpine" \
+  maintainer="maborak" \
+  docker.cmd="docker run -d -p 80:80 maborak/framework-ui:${VERSION}" \
+  docker.params="VERSION=${VERSION}" \
+  security.scan.enabled="true" \
+  security.policy.version="1.0" \
+  com.docker.security.scan.enabled="true" \
+  build.buildnumber="${BUILD_NUMBER}" \
+  build.url="${BUILD_URL}" \
+  build.timestamp="${BUILD_DATE}" \
+  app.version="${VERSION}" \
+  app.component="ui" \
+  app.node.version="20" \
+  io.kubernetes.pod.name="framework-ui" \
+  io.kubernetes.container.name="ui" \
+  io.kubernetes.container.image="maborak/framework-ui:${VERSION}" \
+  healthcheck.enabled="true" \
+  healthcheck.interval="30s" \
+  healthcheck.timeout="10s" \
+  healthcheck.retries="3" \
+  com.maborak.com.category="monitoring" \
+  com.maborak.com.team="devops" \
+  com.maborak.com.project="maborak-framework" \
+  com.maborak.com.cost-center="engineering"
+
+# Copy built assets from builder stage
+COPY --from=builder /app/dist /usr/share/nginx/html
+
+# Copy nginx configuration (with gzip, asset caching, SPA routing)
+COPY conf/nginx.conf /etc/nginx/nginx.conf
+
+# Expose port 80
+EXPOSE 80
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+  CMD wget --quiet --tries=1 --spider http://localhost/ || exit 1
+
+# Start nginx
+CMD ["nginx", "-g", "daemon off;"]
