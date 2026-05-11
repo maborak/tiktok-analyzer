@@ -431,6 +431,50 @@ _MISC = [
                  examples="redis://localhost:6379/0"),
 ]
 
+# ── TikTok ──────────────────────────────────────────────────────────────────
+#
+# The TikTok read pipeline (TikTokLive WebCast WS) needs a signed connect
+# URL. TikTok's signing is undocumented + rotating, so we delegate to one
+# of two providers:
+#
+#   - "euler"   — EulerStream sign-as-a-service. Free tier is heavily
+#                 rate-limited; an API key raises the budget.
+#   - "session" — pass a TikTok `sessionid` cookie through TikTokLive's
+#                 web client. TikTok signs for "logged-in" users without
+#                 going through EulerStream. Bound to one TikTok account.
+
+_TIKTOK = [
+    ConfigKeyDef("TIKTOK_SIGN_PROVIDER", "tiktok", "string", "euler",
+                 description="Which signer to use for TikTok WebCast WS connects: "
+                             "'euler' (EulerStream sign-as-a-service), "
+                             "'session' (session-authenticated EulerStream — better quotas), "
+                             "or 'local' (Electron-hosted broker — zero third-party).",
+                 examples="euler, session, local"),
+    ConfigKeyDef("TIKTOK_LOCAL_SIGN_URL", "tiktok", "string", "http://127.0.0.1:21214",
+                 description="When TIKTOK_SIGN_PROVIDER=local, the URL of the "
+                             "Electron-hosted sign broker. Default points at the "
+                             "loopback port the bundled client opens.",
+                 examples="http://127.0.0.1:21214"),
+    ConfigKeyDef("TIKTOK_EULER_API_KEY", "tiktok", "string", "",
+                 sensitive=True,
+                 description="EulerStream API key. Free tier works without one but is "
+                             "harshly rate-limited. Sign up at https://www.eulerstream.com.",
+                 examples="euler_..."),
+    ConfigKeyDef("TIKTOK_SESSION_ID", "tiktok", "string", "",
+                 sensitive=True,
+                 description="TikTok `sessionid` cookie value, used when "
+                             "TIKTOK_SIGN_PROVIDER=session. Get it from your logged-in "
+                             "browser's cookies for tiktok.com. Tied to your account; "
+                             "rotate on suspected ban risk.",
+                 examples="(64-char hex string from tiktok.com cookies)"),
+    ConfigKeyDef("TIKTOK_SESSION_TT_TARGET_IDC", "tiktok", "string", "",
+                 sensitive=True,
+                 description="Optional `tt-target-idc` cookie partner for TIKTOK_SESSION_ID. "
+                             "Required for some accounts (typically apps in the EU/UK pool). "
+                             "If unsure leave blank — TikTokLive defaults work for most.",
+                 examples="useast2a, useast1a, alisg"),
+]
+
 
 # ── Registry build ────────────────────────────────────────────────────────
 
@@ -451,6 +495,7 @@ CONFIG_REGISTRY: Dict[str, ConfigKeyDef] = _build_registry(
     _EVENTS,
     _STORAGE,
     _MISC,
+    _TIKTOK,
 )
 
 
@@ -584,6 +629,12 @@ ENV_MAP: Dict[str, str] = {
     "LIVECHAT_UPLOAD_STORAGE_PATH": "PHOVEU_BACKEND_LIVECHAT_UPLOAD_STORAGE_PATH",
     # Misc
     "REDIS_URL": "PHOVEU_REDIS_SERVER",
+    # TikTok
+    "TIKTOK_SIGN_PROVIDER": "PHOVEU_BACKEND_TIKTOK_SIGN_PROVIDER",
+    "TIKTOK_EULER_API_KEY": "PHOVEU_BACKEND_TIKTOK_EULER_API_KEY",
+    "TIKTOK_SESSION_ID": "PHOVEU_BACKEND_TIKTOK_SESSION_ID",
+    "TIKTOK_SESSION_TT_TARGET_IDC": "PHOVEU_BACKEND_TIKTOK_SESSION_TT_TARGET_IDC",
+    "TIKTOK_LOCAL_SIGN_URL": "PHOVEU_BACKEND_TIKTOK_LOCAL_SIGN_URL",
 }
 
 

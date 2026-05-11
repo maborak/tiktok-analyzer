@@ -355,6 +355,15 @@ CONFIG.update({
     # Data Source Configuration
     # Options: "scraping" (real HTTP requests), "dummy" (random generated data)
     "DATA_SOURCE": os.getenv("PHOVEU_BACKEND_DATA_SOURCE", "scraping").lower(),
+
+    # TikTok signing — see domain/entities/config_registry.py _TIKTOK group.
+    # The live-client adapter reads these on every connect so admin GUI
+    # edits take effect on the next reconnect.
+    "TIKTOK_SIGN_PROVIDER": os.getenv("PHOVEU_BACKEND_TIKTOK_SIGN_PROVIDER", "euler").strip().lower(),
+    "TIKTOK_EULER_API_KEY": os.getenv("PHOVEU_BACKEND_TIKTOK_EULER_API_KEY", "").strip(),
+    "TIKTOK_SESSION_ID": os.getenv("PHOVEU_BACKEND_TIKTOK_SESSION_ID", "").strip(),
+    "TIKTOK_SESSION_TT_TARGET_IDC": os.getenv("PHOVEU_BACKEND_TIKTOK_SESSION_TT_TARGET_IDC", "").strip(),
+    "TIKTOK_LOCAL_SIGN_URL": os.getenv("PHOVEU_BACKEND_TIKTOK_LOCAL_SIGN_URL", "http://127.0.0.1:21214").strip(),
     
     # Tier Limits Configuration
     "LIMIT_MAX_RECIPIENTS_CONFIRMED": int(os.getenv("PHOVEU_BACKEND_LIMIT_MAX_RECIPIENTS_CONFIRMED", "5")),

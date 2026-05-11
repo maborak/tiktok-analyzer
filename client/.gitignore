@@ -1,0 +1,21 @@
+# Electron client build + dependencies.
+node_modules/
+
+# Vite renderer output.
+dist/
+
+# electron-builder packaging output.
+build/
+
+# Pre-bundled Electron main/preload (built by `npm run build:electron`).
+dist-electron/
+
+# Native packaging output (.app / .exe / .dmg / etc.).
+release/
+
+# Logs
+*.log
+
+# OS / editor cruft already in the root .gitignore — pinned here too
+# for clarity when this directory is opened standalone.
+.DS_Store

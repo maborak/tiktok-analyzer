@@ -26,6 +26,7 @@ def setup_routes(
     app_config_adapter=None,
     oauth_service=None,
     config_service=None,
+    tiktok_service=None,
 ):
     """Setup routes with dependency injection"""
     # Set authentication dependencies
@@ -73,6 +74,7 @@ def setup_routes(
         notification_queue_adapter_instance=notification_queue,
         app_config_adapter_instance=app_config_adapter,
         config_service_instance=config_service,
+        tiktok_service_instance=tiktok_service,
     )
     if payment_service:
         webhooks.payment_service = payment_service

@@ -266,3 +266,21 @@ backend/*.log
 # Scrape debug traces
 scrape_traces/
 backend/go_client/scrape_traces/
+
+# dev.sh supervisor state
+.dev/
+
+# Legacy/backup checkout — old iteration of the project, not for git.
+oldi/
+
+# Claude per-user permission settings (paths + allow-list specific to
+# this machine; committable equivalents live in settings.json).
+.claude/settings.local.json
+
+# Generic node_modules — covers `client/`, future modules, etc.
+# `frontend/node_modules/` is already ignored above (belt-and-braces).
+**/node_modules/
+
+# Electron build output (client/dist-electron, dist-ssr, etc.).
+dist-electron/
+dist-ssr/

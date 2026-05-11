@@ -85,7 +85,17 @@ function createConfig(): AppConfig {
   // Try to get API URL from environment, with multiple fallback options
   let apiBaseUrl = import.meta.env.VITE_API_BASE_URL;
 
-  // If no environment variable, try to detect ngrok or local development
+  // In dev, dev.sh exports VITE_API_BACKEND_PORT instead of a full URL
+  // so the bundle can adapt to whatever hostname the browser used —
+  // localhost on the dev machine, LAN IP on a phone, ngrok tunnel,
+  // etc. A baked-in `//localhost:PORT` would break every device that
+  // isn't the dev box.
+  const devBackendPort = import.meta.env.VITE_API_BACKEND_PORT;
+  if (!apiBaseUrl && devBackendPort) {
+    apiBaseUrl = `${window.location.protocol}//${window.location.hostname}:${devBackendPort}`;
+  }
+
+  // If still nothing, fall back to ngrok detection / localhost default.
   if (!apiBaseUrl) {
     // Check if we're running on ngrok
     if (window.location.hostname.includes('ngrok')) {

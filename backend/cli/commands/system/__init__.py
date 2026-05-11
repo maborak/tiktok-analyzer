@@ -10,10 +10,14 @@ from .general import system, env, system_status
 from .network import network, ips
 from .http_engine import http_engine, test, status as http_status, set_engine, list as http_list
 from .db import db, config, status, optimize, analyze, init, clear
+from .tiktok import tiktok_group, run_listener
+
+# Wire the tiktok subgroup under `system`.
+system.add_command(tiktok_group)
 
 __all__ = [
     'system',
-    'env', 
+    'env',
     'system_status',
     'network',
     'ips',
@@ -24,9 +28,11 @@ __all__ = [
     'http_list',
     'db',
     'config',
-    'status', 
+    'status',
     'optimize',
     'analyze',
     'init',
-    'clear'
-] 
+    'clear',
+    'tiktok_group',
+    'run_listener',
+]

@@ -53,6 +53,9 @@ psutil>=7.2.1,<8.0.0
 colorama>=0.4.6,<1.0.0
 Jinja2>=3.1.0,<4.0.0  # For email templates
 
+# TikTok-bot module
+TikTokLive>=6.4,<7.0.0     # WebCast WebSocket listener for the read pipeline
+
 # Development dependencies (linting, type checking, etc.)
 ruff>=0.6.0,<1.0.0         # Fast Python linter and formatter
 mypy>=1.8.0,<2.0.0         # Static type checker for Python

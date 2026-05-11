@@ -40,6 +40,16 @@ from .billing.models import (
 # Recipients
 from .recipients.models import Recipient, RecipientVerification, RecipientType
 
+# TikTok-bot
+from .tiktok.models import (
+    SubscriptionModel as TikTokSubscriptionModel,
+    RoomModel as TikTokRoomModel,
+    TikTokViewerModel,
+    TikTokEventModel,
+    TikTokGiftModel,
+    TikTokMatchModel,
+)
+
 __all__ = [
     # Core
     'Base', 'create_database_engine', 'get_session_maker', 'create_tables',
@@ -67,4 +77,8 @@ __all__ = [
 
     # Recipients
     'Recipient', 'RecipientVerification', 'RecipientType',
+
+    # TikTok-bot
+    'TikTokSubscriptionModel', 'TikTokRoomModel', 'TikTokViewerModel', 'TikTokEventModel',
+    'TikTokGiftModel', 'TikTokMatchModel',
 ]

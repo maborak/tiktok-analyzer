@@ -308,8 +308,86 @@ What's a module (delete if not needed):
   PayPal adapters; the abstractions stay, the gateway adapters can be
   pruned per project
 - `livechat/` — chat widget + admin queue
+- `tiktok/` — TikTok-bot: subscribes to creator lives, persists events,
+  posts chat back via Electron client. See "TikTok module" below.
 - specific OAuth providers (Google/GitHub/Facebook) — keep the
   abstraction, drop unused providers
+
+## TikTok module (read + write to TikTok lives)
+
+This is the project's primary feature module. Architecturally it
+follows the framework conventions — but it has one unusual constraint:
+**posting to TikTok must happen on the user's machine** (their
+authenticated browser session + residential IP), so we ship a
+companion Electron client at `client/` that loads the framework's web
+UI and adds posting capabilities via a preload-injected `window.api`.
+
+Layout:
+- Backend module: `domain/services/tiktok_service.py`, ports in
+  `ports/tiktok_*.py`, adapters in `adapters/persistence/
+  tiktok_persistence.py` and `adapters/tiktok_live_client.py`,
+  database in `database/tiktok/`, routes in `routes/admin/tiktok.py`.
+  Wired through `initialize_services` + `setup_routes` +
+  `set_dependencies` like every other service.
+- Frontend module: `modules/admin/services/tiktok.ts`,
+  `modules/admin/pages/TikTokLives.tsx`, route at
+  `routes/_app/admin/tiktok/index.lazy.tsx`, sidebar entry "TikTok".
+  React detects `window.api?.sendComment` at runtime — posting UI is
+  conditionally rendered only when running inside the Electron client.
+- Electron client: `client/` at the repo root. Separate npm project.
+  Loads the framework's web UI (Vite dev server in dev, deployed URL
+  in prod) and uses a hidden BrowserWindow with `contextIsolation:false`
+  to run a bridge preload that calls TikTok's `webcast/room/chat/` API
+  via `fetch()`. CSP strip + CORS rewrite + CSRF preflight forge are
+  installed on the partition's `webRequest` hooks.
+
+The read pipeline (TikTokLive WebCast listener, multi-handle pool, DB
+persistence, WS fan-out) lives entirely in the framework backend —
+multi-tenant safe, can be deployed anywhere. The write pipeline lives
+in the Electron client only.
+
+`docs/tikfinity-analysis.md` contains the static-analysis research that
+informed this architecture. Refer to it when posting breaks — the
+list of webRequest header rewrites and bytedance:// protocol cancel is
+there.
+
+### Listener-pool deployment modes
+
+The TikTokLive listener pool can run in one of two shapes, gated by the
+env var `PHOVEU_BACKEND_TIKTOK_LISTENER_MODE` (default `in_process`):
+
+- **`in_process`** — listeners run inside uvicorn alongside the API.
+  Simplest, no extra processes, no Redis required. Catch: every uvicorn
+  restart (e.g. `--reload` on a code change) drops every TikTokLive
+  WebSocket and the in-memory `_active_match` battle state with it.
+- **`worker`** — listeners run in a separate process started via
+  `python cli.py system tiktok run-listener` (or `./build.sh worker`).
+  The API's `tiktok_service` is constructed in **passive mode**:
+  subscription CRUD endpoints still write to `tiktok_subscriptions`,
+  but session lifecycle (`_start_session` / `_stop_session` /
+  `start_all_enabled` / `stop_all`) is a no-op. The worker reconciles
+  its in-memory listener pool against the DB every N seconds (default
+  10s) — it picks up new handles, stops removed/disabled ones. Event
+  fan-out goes through Redis pub/sub on channel `tiktok:events`. The
+  WebSocket route at `/admin/tiktok/ws` detects worker mode and
+  subscribes to that channel instead of registering an in-process
+  listener.
+
+Worker mode requires Redis (already a framework dep). Trade-off vs
+in-process: API hot-reload no longer interrupts ingestion, listeners
+survive API redeploys, but you operate two processes.
+
+The split lives in:
+- `adapters/tiktok_event_bus.py` — `EventPublisher` (worker → Redis)
+  and `subscribe_events()` (API → Redis). Both no-op gracefully when
+  Redis is down (DB persistence still works; WS fan-out is degraded).
+- `cli/commands/system/tiktok.py` — the `run-listener` CLI command.
+  Boots Redis + DB + service, registers the publisher, runs
+  `start_all_enabled()`, then spins a reconcile loop until SIGINT.
+- `domain/services/tiktok_service.py` — `passive=True` flag wired by
+  `api_main.py` based on the env var.
+- `routes/admin/tiktok.py` — `_ws_pump_from_service` for in-process,
+  `_ws_pump_from_redis` for worker mode.
 
 When you delete a module, also clean up imports in `api_main.py:
 initialize_services`, `routes/main.py:setup_routes`,

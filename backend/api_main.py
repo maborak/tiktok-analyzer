@@ -327,6 +327,33 @@ def initialize_services():
     rbac_adapter = RBACAdapter(session_factory=get_db_session)
     logger.info("RBAC adapter initialized")
 
+    # Initialize TikTok-bot service (multi-live listener pool + DB persistence).
+    # In worker mode, the API's service is `passive`: subscription CRUD still
+    # writes to DB, but session lifecycle is owned by the worker process.
+    tiktok_service = None
+    try:
+        from adapters.persistence.tiktok_persistence import TikTokPersistenceAdapter
+        from adapters.tiktok_live_client import TikTokLiveSessionFactory
+        from domain.services.tiktok_service import TikTokService
+
+        _listener_mode = os.getenv(
+            "PHOVEU_BACKEND_TIKTOK_LISTENER_MODE", "in_process"
+        ).strip().lower()
+        tiktok_persistence = TikTokPersistenceAdapter(auto_init=True)
+        tiktok_session_factory = TikTokLiveSessionFactory()
+        tiktok_service = TikTokService(
+            persistence=tiktok_persistence,
+            session_factory=tiktok_session_factory,
+            passive=(_listener_mode == "worker"),
+        )
+        logger.info(
+            "✅ TikTok service initialized (mode=%s%s)",
+            _listener_mode,
+            " — passive" if _listener_mode == "worker" else "",
+        )
+    except Exception as e:
+        logger.warning(f"⚠️  TikTok service not available: {e}")
+
     _services = {
         "data_persistence_adapter": data_persistence_adapter,
         "auth_service": auth_service,
@@ -341,6 +368,7 @@ def initialize_services():
         "config_snapshot_adapter": config_snapshot_adapter,
         "config_service": config_service,
         "oauth_service": oauth_service,
+        "tiktok_service": tiktok_service,
     }
     
     _services_initialized = True
@@ -420,7 +448,25 @@ async def lifespan(app: FastAPI):
         app_config_adapter=services.get("app_config_adapter"),
         oauth_service=services.get("oauth_service"),
         config_service=services.get("config_service"),
+        tiktok_service=services.get("tiktok_service"),
     )
+
+    # Start TikTok subscription pool — UNLESS the listener pool is being
+    # run in a separate worker process. Set
+    #   PHOVEU_BACKEND_TIKTOK_LISTENER_MODE=worker
+    # to skip in-process startup; the WS endpoint will subscribe to the
+    # Redis fan-out instead. Default ("in_process") keeps current behavior.
+    listener_mode = os.getenv("PHOVEU_BACKEND_TIKTOK_LISTENER_MODE", "in_process").strip().lower()
+    if services.get("tiktok_service") and listener_mode == "in_process":
+        try:
+            await services["tiktok_service"].start_all_enabled()
+        except Exception as e:
+            logger.warning(f"TikTok service start_all_enabled failed (non-fatal): {e}")
+    elif listener_mode == "worker":
+        logger.info(
+            "TIKTOK_LISTENER_MODE=worker — listener pool runs in a separate worker process; "
+            "API will subscribe to Redis for WebSocket fan-out."
+        )
     
     logger.info("Services initialized and routes configured successfully")
 
@@ -453,6 +499,23 @@ async def lifespan(app: FastAPI):
             except Exception:
                 pass
 
+            # Auto-close orphan TikTok matches. ~3–5% of battles end
+            # without a `LinkMicBattlePunishFinishEvent` so the row
+            # stays `ended_at IS NULL` forever. The query is bounded
+            # by `ended_at IS NULL` so once the historic backlog is
+            # cleared this is effectively a no-op per tick.
+            try:
+                tiktok_svc = services.get("tiktok_service")
+                if tiktok_svc:
+                    n = tiktok_svc.close_orphan_matches()
+                    if n:
+                        logger.info(
+                            "Auto-closed %d orphan TikTok match%s.",
+                            n, "" if n == 1 else "es",
+                        )
+            except Exception as e:
+                logger.error(f"close_orphan_matches failed: {e}")
+
             await asyncio.sleep(interval)
 
     monitor_task = asyncio.create_task(run_background_maintenance())
@@ -465,7 +528,16 @@ async def lifespan(app: FastAPI):
         await monitor_task
     except asyncio.CancelledError:
         pass
-        
+
+    # Stop TikTok subscription pool (only when running in-process — in
+    # worker mode the worker handles its own shutdown).
+    listener_mode = os.getenv("PHOVEU_BACKEND_TIKTOK_LISTENER_MODE", "in_process").strip().lower()
+    if services.get("tiktok_service") and listener_mode == "in_process":
+        try:
+            await services["tiktok_service"].stop_all()
+        except Exception as e:
+            logger.warning(f"TikTok service stop_all failed (non-fatal): {e}")
+
     from ports.hooks import hook_manager
     hook_manager.shutdown()
     await close_redis()

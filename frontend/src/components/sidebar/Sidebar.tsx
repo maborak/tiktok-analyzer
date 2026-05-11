@@ -6,7 +6,7 @@ import {
   MessageSquare, FileText, Receipt, Settings, Settings2,
   Lock, KeyRound, UserPlus, History, Coins,
   Layers, LogIn,
-  Database, ShieldAlert,
+  Database, ShieldAlert, Radio, BarChart3, Gift, Key,
 } from 'lucide-react';
 import { cn } from '../../utils/cn';
 import { appConfig } from '../../config/env';
@@ -104,6 +104,20 @@ const adminSupportSection: NavigationSection = {
   items: [
     { name: 'Support Tickets', href: `/admin/tickets`, icon: Headset },
     { name: 'Live Chat Queue', href: `/admin/livechat`, icon: MessageSquare },
+  ],
+};
+
+const adminTikTokSection: NavigationSection = {
+  title: 'TikTok',
+  key: 'admin-tiktok',
+  collapsible: true,
+  defaultExpanded: true,
+  items: [
+    { name: 'Dashboard', href: `/admin/tiktok/dashboard`, icon: BarChart3 },
+    { name: 'Lives', href: `/admin/tiktok`, icon: Radio, end: true },
+    { name: 'History', href: `/admin/tiktok/history`, icon: History },
+    { name: 'Gifts', href: `/admin/tiktok/gifts`, icon: Gift },
+    { name: 'Sign Engine', href: `/admin/tiktok/sign-config`, icon: Key },
   ],
 };
 
@@ -324,6 +338,7 @@ export function Sidebar({
           {renderSection(adminRevenueSection)}
           {renderSection(adminSettingsSection)}
           {renderSection(adminSupportSection)}
+          {renderSection(adminTikTokSection)}
         </>
       )}
 

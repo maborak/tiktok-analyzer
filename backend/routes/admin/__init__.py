@@ -45,11 +45,15 @@ router.include_router(admin_configuration.router)
 from . import security as admin_security
 router.include_router(admin_security.router)
 
+from . import tiktok as admin_tiktok
+router.include_router(admin_tiktok.router, prefix="/tiktok")
+
 def set_dependencies(payment_service_instance=None, data_persistence_adapter_instance=None,
                      system_monitor_service_instance=None, event_config_service_instance=None,
                      notification_queue_adapter_instance=None,
                      app_config_adapter_instance=None, queue_config_service_instance=None,
-                     config_service_instance=None):
+                     config_service_instance=None,
+                     tiktok_service_instance=None):
     if payment_service_instance:
         billing.payment_service = payment_service_instance
         payment_gateways.payment_service = payment_service_instance
@@ -61,3 +65,7 @@ def set_dependencies(payment_service_instance=None, data_persistence_adapter_ins
         admin_app_config.app_config_adapter = app_config_adapter_instance
     if config_service_instance:
         admin_configuration.config_service = config_service_instance
+        # The TikTok module's sign-engine page also needs read/write access.
+        admin_tiktok.config_service = config_service_instance
+    if tiktok_service_instance:
+        admin_tiktok.tiktok_service = tiktok_service_instance
