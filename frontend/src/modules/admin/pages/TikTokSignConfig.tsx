@@ -41,7 +41,29 @@ import {
  * Values write to the typed-config DB table; on save they take effect on
  * the next listener reconnect — no process restart required.
  */
+/** Standalone route at `/admin/tiktok/sign-config`. Thin wrapper that
+ *  drops a `PageShell` + `PageHeader` around the shared body. Kept
+ *  around so existing bookmarks + the direct-URL flow still work,
+ *  but the surface the operator usually reaches is the Sign Engine
+ *  sub-tab inside `/admin/tiktok/settings` (which embeds the same
+ *  body component without the page shell). */
 export function TikTokSignConfig() {
+  return (
+    <PageShell>
+      <PageHeader
+        title="TikTok Sign Engine"
+        icon={<Key className="w-5 h-5" />}
+        description="How the listener pool obtains signed WebSocket URLs for TikTok live streams."
+      />
+      <TikTokSignConfigBody />
+    </PageShell>
+  );
+}
+
+/** Body of the Sign Engine config — no page shell, no header. Lets
+ *  the Settings page embed it as a sub-tab alongside General + Worker
+ *  without nested headers. */
+export function TikTokSignConfigBody() {
   const [cfg, setCfg] = useState<TikTokSignConfig | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -180,23 +202,15 @@ export function TikTokSignConfig() {
 
   if (loading) {
     return (
-      <PageShell>
-        <div className="py-16 text-center text-sm text-gray-500">
-          <Loader2 className="w-5 h-5 inline mr-2 animate-spin" />
-          Loading sign engine config…
-        </div>
-      </PageShell>
+      <div className="py-16 text-center text-sm text-gray-500">
+        <Loader2 className="w-5 h-5 inline mr-2 animate-spin" />
+        Loading sign engine config…
+      </div>
     );
   }
 
   return (
-    <PageShell>
-      <PageHeader
-        title="TikTok Sign Engine"
-        icon={<Key className="w-5 h-5" />}
-        description="How the listener pool obtains signed WebSocket URLs for TikTok live streams."
-      />
-
+    <>
       {/* Provider selector */}
       <section className="card">
         <h2 className="auth-mono-label mb-3">Engine</h2>
@@ -486,7 +500,7 @@ export function TikTokSignConfig() {
           To force an immediate switch, restart the worker (<code className="font-mono">./build.sh worker</code>) or the API process.
         </p>
       </section>
-    </PageShell>
+    </>
   );
 }
 

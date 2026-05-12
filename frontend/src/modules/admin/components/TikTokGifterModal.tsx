@@ -24,11 +24,11 @@ import { Button } from '@/components/ui/Button';
 import { Modal } from '@/components/ui/Modal';
 import { TikTokAddLiveModal } from '@admin/components/TikTokAddLiveModal';
 import {
-  tiktokApi,
   type TikTokCommonGifterDetail,
   type TikTokEvent,
   type TikTokUserMatchEntry,
 } from '@admin/services/tiktok';
+import { useTikTokApi } from '@admin/contexts/TikTokApiContext';
 import {
   useTikTokTimezone,
   fmtMonthDayTime,
@@ -80,6 +80,28 @@ interface GifterModalProps {
    *  the contextual header banner so the operator immediately sees
    *  which dataset the modal is rendering. */
   roomSetLabel?: string;
+  /** Set to `true` when the modal is opened from a public / read-only
+   *  context (e.g. the unauthenticated public lives page). Suppresses
+   *  every admin-write affordance — the favourite button, the "Add to
+   *  monitor" pill, and the underlying favourite-state + listLives
+   *  prefetches — so anonymous viewers don't see broken actions or
+   *  trigger 401 toasts. Data tabs (Gifts/Comments/Relationships/
+   *  Matches) and scope chips remain functional; the Close button
+   *  stays in the footer. Default `false` (admin context). */
+  readOnly?: boolean;
+  /** When `true`, render WITHOUT the outer `<Modal>` chrome, the
+   *  identity-row header (avatar / nickname / stats), the footer
+   *  action buttons (Favorites / Add-to-monitor / Close), AND the
+   *  Add-Live confirmation modal. Used by the unified
+   *  `TikTokGifterDetailModal` which provides its own shared header
+   *  + close affordance + tabs at the shell level. Parent is
+   *  responsible for only mounting this component when its tab is
+   *  active; `isOpen` is ignored in embedded mode (effects always
+   *  fire as if open).
+   *
+   *  Defaults to false → backwards-compatible with every existing
+   *  call site. */
+  embedded?: boolean;
 }
 
 interface GiftRow {
@@ -114,8 +136,17 @@ export function TikTokGifterModal({
   currentHandle,
   extraRoomIds,
   roomSetLabel,
+  readOnly = false,
+  embedded = false,
 }: GifterModalProps) {
+  const tiktokApi = useTikTokApi();
   const { tz } = useTikTokTimezone();
+  // In embedded mode the parent (the unified TikTokGifterDetailModal)
+  // only mounts us when its tab is active — so we should always
+  // treat the modal as "open" for the data-fetching effects below.
+  // We use a derived alias instead of mutating the prop so React's
+  // exhaustive-deps lint stays satisfied with a single named value.
+  const isOpenEff = embedded || isOpen;
   // Stable string key for the extras — array identity flips every
   // render. Used in dep arrays without re-running on no-op changes.
   const extraKey = (extraRoomIds ?? []).join(',');
@@ -189,7 +220,7 @@ export function TikTokGifterModal({
 
   // Reset on open / user change.
   useEffect(() => {
-    if (!isOpen) return;
+    if (!isOpenEff) return;
     setTab(defaultTab);
     setScope(hasWindow ? 'window' : roomId ? 'room' : 'all');
     setPage(0);
@@ -203,7 +234,7 @@ export function TikTokGifterModal({
     setMatchesData(null);
     setMatchesError(null);
     setMatchesPage(0);
-  }, [isOpen, userId, roomId, defaultTab, hasWindow]);
+  }, [isOpenEff, userId, roomId, defaultTab, hasWindow]);
 
   // Force matches refetch when scope or paging changes.
   useEffect(() => {
@@ -217,19 +248,30 @@ export function TikTokGifterModal({
   // refetches the next page when needed. Cancel flag guards stale
   // resolves on rapid scope changes.
   useEffect(() => {
-    if (!isOpen || !userId) return;
+    if (!isOpenEff || !userId) return;
     let cancelled = false;
     setMatchesLoading(true);
     setMatchesError(null);
     // Build the room-set + time window from the same scope semantics
     // the gifts/comments queries use, so the Matches tab respects the
     // operator's scope chip selection.
+    //
+    // `scope === 'all'` admin path: undefined room_ids → cross-host
+    // matches across every monitored room (works because the admin
+    // endpoint accepts that). Public path requires `room_ids` — fall
+    // back to the in-scope room set (roomId + extraRoomIds) so the
+    // request actually reaches the endpoint instead of 422-ing.
+    const fullRoomSet = roomId
+      ? Array.from(new Set([roomId, ...(extraRoomIds ?? [])]))
+      : (extraRoomIds && extraRoomIds.length > 0
+          ? Array.from(new Set(extraRoomIds))
+          : undefined);
     const roomIds: string[] | undefined =
       scope === 'all'
-        ? undefined
-        : roomId
-          ? Array.from(new Set([roomId, ...(extraRoomIds ?? [])]))
-          : undefined;
+        ? readOnly
+          ? fullRoomSet
+          : undefined
+        : fullRoomSet;
     const since = scope === 'window' ? (windowSince ?? undefined) : undefined;
     const until = scope === 'window' ? (windowUntil ?? undefined) : undefined;
     tiktokApi
@@ -253,7 +295,7 @@ export function TikTokGifterModal({
         if (!cancelled) setMatchesLoading(false);
       });
     return () => { cancelled = true; };
-  }, [isOpen, userId, scope, extraKey, roomId, windowSince, windowUntil, matchesPage]);
+  }, [isOpenEff, userId, scope, extraKey, roomId, windowSince, windowUntil, matchesPage]);
 
   // Reset to page 1 + force a count refetch whenever the active
   // filter set changes.
@@ -263,9 +305,15 @@ export function TikTokGifterModal({
   }, [tab, scope, debouncedQ, minDiamonds, pageSize]);
 
   // Pull the current favourite state once the modal opens — drives
-  // the star + label on the footer button.
+  // the star + label on the footer button. Skipped entirely in
+  // read-only mode (public viewers can't favourite, and the API call
+  // requires admin auth — would 401-toast for anonymous visitors).
   useEffect(() => {
-    if (!isOpen || !userId) {
+    if (readOnly) {
+      setIsFavorite(null);
+      return;
+    }
+    if (!isOpenEff || !userId) {
       setIsFavorite(null);
       return;
     }
@@ -275,13 +323,19 @@ export function TikTokGifterModal({
       .then((r) => { if (!cancelled) setIsFavorite(r.is_favorite); })
       .catch(() => { if (!cancelled) setIsFavorite(false); });
     return () => { cancelled = true; };
-  }, [isOpen, userId]);
+  }, [isOpenEff, userId, readOnly]);
 
   // Monitoring check — same pattern as match modal. Read from
   // listLives so a recently-added handle reflects without a hard
   // refresh. Resets to false when modal closes or user changes.
+  // Skipped in read-only mode — the monitor pill is hidden anyway,
+  // and listLives requires admin auth (would 401 for public viewers).
   useEffect(() => {
-    if (!isOpen || !uniqueId) {
+    if (readOnly) {
+      setIsMonitored(false);
+      return;
+    }
+    if (!isOpenEff || !uniqueId) {
       setIsMonitored(false);
       return;
     }
@@ -298,7 +352,7 @@ export function TikTokGifterModal({
         // against dupes anyway so a stale "not monitored" is harmless.
       });
     return () => { cancelled = true; };
-  }, [isOpen, uniqueId]);
+  }, [isOpenEff, uniqueId, readOnly]);
 
   const confirmAddMonitor = async () => {
     if (!uniqueId) return;
@@ -344,9 +398,17 @@ export function TikTokGifterModal({
   // user clicks into the tab, which made it look static. Cheap query
   // (one round-trip; backend reads from the summary table), and the
   // data is reused if/when the user does switch tabs.
+  //
+  // Skipped in read-only mode: `getCommonGifterDetail` is an
+  // admin-only endpoint (not mirrored on the public namespace), so
+  // the call would 404 and toast an error. The Relationships tab
+  // remains visible but renders its empty/error state — the more
+  // visceral Gifts / Comments / Matches tabs cover the public viewer's
+  // actual use case.
   useEffect(() => {
-    if (!isOpen || !userId) return;
+    if (!isOpenEff || !userId) return;
     if (relationships !== null) return;
+    if (readOnly) return;
     let cancelled = false;
     setRelationshipsLoading(true);
     setRelationshipsError(null);
@@ -366,12 +428,12 @@ export function TikTokGifterModal({
     return () => {
       cancelled = true;
     };
-  }, [isOpen, userId, relationships]);
+  }, [isOpenEff, userId, relationships, readOnly]);
 
   // Fetch the active tab's page of events whenever scope / tab /
   // user / filters / page change.
   useEffect(() => {
-    if (!isOpen || !userId) return;
+    if (!isOpenEff || !userId) return;
     let cancelled = false;
     const type = tab === 'gifts' ? 'gift' : 'comment';
     setLoading(true);
@@ -429,7 +491,7 @@ export function TikTokGifterModal({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
-    isOpen, userId, scope, roomId, extraKey, tab,
+    isOpenEff, userId, scope, roomId, extraKey, tab,
     windowSince, windowUntil, debouncedQ, minDiamonds, pageSize, page,
   ]);
 
@@ -484,100 +546,34 @@ export function TikTokGifterModal({
 
   const visibleDiamonds = giftRows.reduce((acc, r) => acc + r.totalDiamonds, 0);
 
-  return (
+  // The body content rendered inside the Modal in standalone mode AND
+  // returned directly in embedded mode (where the unified
+  // TikTokGifterDetailModal provides the surrounding chrome). The
+  // identity row inside is gated on `!embedded` so the unified
+  // shell's shared header isn't duplicated.
+  const bodyContent = (
     <>
-    {/* Add-to-monitor confirmation — reuses the canonical Add Live
-        modal so the operator sees identical preview data. Rendered
-        as a sibling so it stacks above the gifter modal cleanly. */}
-    {uniqueId && (
-      <TikTokAddLiveModal
-        isOpen={addMonitorOpen}
-        handle={uniqueId}
-        onCancel={() => setAddMonitorOpen(false)}
-        onConfirm={confirmAddMonitor}
-      />
-    )}
-    <Modal
-      isOpen={isOpen}
-      onClose={onClose}
-      title={nickname ? `${nickname}` : 'Viewer history'}
-      className="max-w-3xl"
-      footer={
-        <div className="flex items-center justify-between gap-2 w-full">
-          <span className="text-xs text-gray-500 font-mono">
-            {tab === 'gifts'
-              ? `${(total ?? giftRows.length).toLocaleString()} gift event${(total ?? giftRows.length) === 1 ? '' : 's'}`
-              : tab === 'comments'
-                ? `${(total ?? commentEvents.length).toLocaleString()} comment${(total ?? commentEvents.length) === 1 ? '' : 's'}`
-                : ''}
-          </span>
-          <div className="flex items-center gap-2">
-            <Button
-              variant={isFavorite ? 'primary' : 'ghost'}
-              onClick={onToggleFavorite}
-              disabled={favoriteBusy || !userId}
-              title={
-                isFavorite
-                  ? 'Remove from favourites — stops live alerts when they gift'
-                  : 'Add to favourites — fires a live alert whenever they gift in any tracked broadcast'
-              }
-            >
-              <Star
-                className={`w-4 h-4 mr-1.5 ${isFavorite ? 'fill-current' : ''}`}
-              />
-              {isFavorite ? 'Favourited' : 'Add to Favourites'}
-            </Button>
-            {/* Add-to-monitor — mirrors the affordance on the Match
-                Events modal opponent cells. Disabled for anonymous
-                gifters (no @handle) and rendered as a confirming
-                "Monitoring" pill once the handle is in subscriptions. */}
+      {/* Identity row — only in standalone mode. */}
+      {!embedded && (
+        <div className="flex items-center justify-between gap-3 mb-4">
+          <div>
+            <div className="text-base font-bold">{nickname || 'Unknown'}</div>
             {uniqueId && (
-              isMonitored ? (
-                <Link
-                  to="/admin/tiktok/$handle"
-                  params={{ handle: uniqueId }}
-                  onClick={onClose}
-                  className="inline-flex items-center gap-1 px-3 py-2 rounded text-xs font-mono uppercase tracking-wider bg-emerald-100 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-500/30 hover:bg-emerald-200 dark:hover:bg-emerald-500/25 transition-colors"
-                  title="Open this creator's live page"
-                >
-                  <Radio className="w-3.5 h-3.5" />
-                  ✓ Monitoring
-                </Link>
-              ) : (
-                <Button
-                  variant="ghost"
-                  onClick={() => setAddMonitorOpen(true)}
-                  title="Start monitoring this creator's lives"
-                >
-                  <Radio className="w-4 h-4 mr-1.5" />
-                  Add to monitor
-                </Button>
-              )
+              <div className="text-xs font-mono text-gray-500">@{uniqueId}</div>
             )}
-            <Button variant="ghost" onClick={onClose}>Close</Button>
+            {userId && (
+              <div className="text-[10px] font-mono text-gray-400">ID: {userId}</div>
+            )}
+          </div>
+          <div className="flex items-baseline gap-4">
+            <Stat label="Diamonds" value={diamondsTotal.toLocaleString()} accent="amber" />
+            <Stat label="Gifts" value={giftsCount.toLocaleString()} />
+            {commentsCount !== undefined && (
+              <Stat label="Comments" value={commentsCount.toLocaleString()} accent="sky" />
+            )}
           </div>
         </div>
-      }
-    >
-      {/* Identity row */}
-      <div className="flex items-center justify-between gap-3 mb-4">
-        <div>
-          <div className="text-base font-bold">{nickname || 'Unknown'}</div>
-          {uniqueId && (
-            <div className="text-xs font-mono text-gray-500">@{uniqueId}</div>
-          )}
-          {userId && (
-            <div className="text-[10px] font-mono text-gray-400">ID: {userId}</div>
-          )}
-        </div>
-        <div className="flex items-baseline gap-4">
-          <Stat label="Diamonds" value={diamondsTotal.toLocaleString()} accent="amber" />
-          <Stat label="Gifts" value={giftsCount.toLocaleString()} />
-          {commentsCount !== undefined && (
-            <Stat label="Comments" value={commentsCount.toLocaleString()} accent="sky" />
-          )}
-        </div>
-      </div>
+      )}
 
       {/* Contextual scope banner — tells the operator at a glance
           WHICH dataset is being summed below. Computed from the
@@ -737,6 +733,95 @@ export function TikTokGifterModal({
           onPage={setPage}
         />
       )}
+    </>
+  );
+
+  // Embedded mode: caller renders the wrapping Modal + close chrome.
+  // We return just the body so the unified shell can place it inside
+  // its own tab pane.
+  if (embedded) return bodyContent;
+
+  return (
+    <>
+    {/* Add-to-monitor confirmation — reuses the canonical Add Live
+        modal so the operator sees identical preview data. Rendered
+        as a sibling so it stacks above the gifter modal cleanly.
+        Suppressed in read-only mode so it never mounts in public
+        contexts where no admin actions exist to trigger it. */}
+    {!readOnly && uniqueId && (
+      <TikTokAddLiveModal
+        isOpen={addMonitorOpen}
+        handle={uniqueId}
+        onCancel={() => setAddMonitorOpen(false)}
+        onConfirm={confirmAddMonitor}
+      />
+    )}
+    <Modal
+      isOpen={isOpen}
+      onClose={onClose}
+      title={nickname ? `${nickname}` : 'Viewer history'}
+      className="max-w-3xl"
+      footer={
+        <div className="flex items-center justify-between gap-2 w-full">
+          <span className="text-xs text-gray-500 font-mono">
+            {tab === 'gifts'
+              ? `${(total ?? giftRows.length).toLocaleString()} gift event${(total ?? giftRows.length) === 1 ? '' : 's'}`
+              : tab === 'comments'
+                ? `${(total ?? commentEvents.length).toLocaleString()} comment${(total ?? commentEvents.length) === 1 ? '' : 's'}`
+                : ''}
+          </span>
+          <div className="flex items-center gap-2">
+            {!readOnly && (
+              <Button
+                variant={isFavorite ? 'primary' : 'ghost'}
+                onClick={onToggleFavorite}
+                disabled={favoriteBusy || !userId}
+                title={
+                  isFavorite
+                    ? 'Remove from favourites — stops live alerts when they gift'
+                    : 'Add to favourites — fires a live alert whenever they gift in any tracked broadcast'
+                }
+              >
+                <Star
+                  className={`w-4 h-4 mr-1.5 ${isFavorite ? 'fill-current' : ''}`}
+                />
+                {isFavorite ? 'Favourited' : 'Add to Favourites'}
+              </Button>
+            )}
+            {/* Add-to-monitor — mirrors the affordance on the Match
+                Events modal opponent cells. Disabled for anonymous
+                gifters (no @handle) and rendered as a confirming
+                "Monitoring" pill once the handle is in subscriptions.
+                Hidden entirely in read-only / public mode. */}
+            {!readOnly && uniqueId && (
+              isMonitored ? (
+                <Link
+                  to="/admin/tiktok/$handle"
+                  params={{ handle: uniqueId }}
+                  onClick={onClose}
+                  className="inline-flex items-center gap-1 px-3 py-2 rounded text-xs font-mono uppercase tracking-wider bg-emerald-100 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-500/30 hover:bg-emerald-200 dark:hover:bg-emerald-500/25 transition-colors"
+                  title="Open this creator's live page"
+                >
+                  <Radio className="w-3.5 h-3.5" />
+                  ✓ Monitoring
+                </Link>
+              ) : (
+                <Button
+                  variant="ghost"
+                  onClick={() => setAddMonitorOpen(true)}
+                  title="Start monitoring this creator's lives"
+                >
+                  <Radio className="w-4 h-4 mr-1.5" />
+                  Add to monitor
+                </Button>
+              )
+            )}
+            <Button variant="ghost" onClick={onClose}>Close</Button>
+          </div>
+        </div>
+      }
+    >
+      {bodyContent}
     </Modal>
     </>
   );
@@ -954,9 +1039,29 @@ function CommentsView({ loading, events, showRoomCol }: CommentsViewProps) {
   // Same scoping note as `GiftsView` — pull `tz` from the context
   // directly since this fn isn't lexically inside TikTokGifterModal.
   const { tz } = useTikTokTimezone();
+
+  if (loading) {
+    return (
+      <div className="py-8 text-center text-gray-500">
+        <Loader2 className="w-4 h-4 inline mr-2 animate-spin" />
+        Loading comments…
+      </div>
+    );
+  }
+  if (events.length === 0) {
+    return (
+      <div className="py-8 text-center text-gray-500">
+        <MessageSquare className="w-4 h-4 inline mr-2" />
+        This user hasn't commented in this scope.
+      </div>
+    );
+  }
+
   return (
-    <div className="overflow-x-auto">
-      <table className="w-full text-sm">
+    <>
+      {/* Desktop table (md+). Below md, the `When` + `Room` fixed-
+          width columns force horizontal scroll, so we render cards. */}
+      <table className="hidden md:table w-full text-sm">
         <thead>
           <tr className="border-b border-gray-200">
             <th className="text-left py-2 auth-mono-label" style={{ width: '12rem' }}>When</th>
@@ -967,44 +1072,53 @@ function CommentsView({ loading, events, showRoomCol }: CommentsViewProps) {
           </tr>
         </thead>
         <tbody>
-          {loading && (
-            <tr>
-              <td colSpan={showRoomCol ? 3 : 2} className="py-8 text-center text-gray-500">
-                <Loader2 className="w-4 h-4 inline mr-2 animate-spin" />
-                Loading comments…
-              </td>
-            </tr>
-          )}
-          {!loading && events.length === 0 && (
-            <tr>
-              <td colSpan={showRoomCol ? 3 : 2} className="py-8 text-center text-gray-500">
-                <MessageSquare className="w-4 h-4 inline mr-2" />
-                This user hasn't commented in this scope.
-              </td>
-            </tr>
-          )}
-          {!loading &&
-            events.map((e) => {
-              const text = String((e.payload || {}).text ?? '');
-              return (
-                <tr key={e.id} className="border-b border-gray-100 hover:bg-gray-50 transition-colors">
-                  <td className="py-2 font-mono text-xs text-gray-600 whitespace-nowrap align-top">
-                    {formatTs(e.ts, tz)}
+          {events.map((e) => {
+            const text = String((e.payload || {}).text ?? '');
+            return (
+              <tr key={e.id} className="border-b border-gray-100 hover:bg-gray-50 transition-colors">
+                <td className="py-2 font-mono text-xs text-gray-600 whitespace-nowrap align-top">
+                  {formatTs(e.ts, tz)}
+                </td>
+                <td className="py-2 text-sm break-words">
+                  {text || <span className="text-gray-400 italic">(empty)</span>}
+                </td>
+                {showRoomCol && (
+                  <td className="py-2 font-mono text-[10px] text-gray-500 align-top">
+                    {e.room_id}
                   </td>
-                  <td className="py-2 text-sm break-words">
-                    {text || <span className="text-gray-400 italic">(empty)</span>}
-                  </td>
-                  {showRoomCol && (
-                    <td className="py-2 font-mono text-[10px] text-gray-500 align-top">
-                      {e.room_id}
-                    </td>
-                  )}
-                </tr>
-              );
-            })}
+                )}
+              </tr>
+            );
+          })}
         </tbody>
       </table>
-    </div>
+
+      {/* Mobile cards (below md) — comment text dominates; timestamp
+          + optional room badge sit on a meta row underneath. */}
+      <ul className="md:hidden flex flex-col gap-1.5">
+        {events.map((e) => {
+          const text = String((e.payload || {}).text ?? '');
+          return (
+            <li
+              key={e.id}
+              className="rounded-md border border-gray-200 bg-white dark:bg-white/[0.03] px-3 py-2"
+            >
+              <div className="text-sm break-words mb-1">
+                {text || <span className="text-gray-400 italic">(empty)</span>}
+              </div>
+              <div className="flex items-center justify-between gap-2 text-[11px] font-mono text-gray-500">
+                <span className="tabular-nums">{formatTs(e.ts, tz)}</span>
+                {showRoomCol && (
+                  <span className="text-[10px] truncate" title={`Room ${e.room_id}`}>
+                    · {e.room_id}
+                  </span>
+                )}
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+    </>
   );
 }
 

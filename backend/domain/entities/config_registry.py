@@ -473,6 +473,35 @@ _TIKTOK = [
                              "Required for some accounts (typically apps in the EU/UK pool). "
                              "If unsure leave blank — TikTokLive defaults work for most.",
                  examples="useast2a, useast1a, alisg"),
+    ConfigKeyDef("TIKTOK_POLL_INTERVAL_MS", "tiktok", "int", "30000",
+                 description="How often the TikTok admin pages and public live "
+                             "pages re-poll their backend data (lives summary, "
+                             "totals, host detail, gifters, comments, matches). "
+                             "Lower = fresher UI + higher backend load. The "
+                             "service-layer cache TTL adapts to this (cache stays "
+                             "warm so steady-state polling hits warm cache). "
+                             "Frontend reads this via /public/tiktok/runtime-config; "
+                             "changes take effect on next page reload.",
+                 examples="5000, 10000, 30000, 60000"),
+    ConfigKeyDef("TIKTOK_ADMIN_REALTIME_MODE", "tiktok", "string", "both",
+                 description="How admin pages get TikTok updates. "
+                             "`poll` = REST polling only (no WS). "
+                             "`ws` = WebSocket events only (no REST polling — "
+                             "data may be stale on first paint until events arrive). "
+                             "`both` (default) = WS for the event tail + REST polling "
+                             "for aggregates / reconciliation. "
+                             "Set to `poll` to debug WS issues without disabling "
+                             "the backend WS endpoint.",
+                 examples="poll, ws, both"),
+    ConfigKeyDef("TIKTOK_PUBLIC_REALTIME_MODE", "tiktok", "string", "poll",
+                 description="How public `/lives/<handle>` pages get TikTok updates. "
+                             "`poll` (default) = REST polling only. "
+                             "`ws` / `both` = streaming via a public WebSocket. "
+                             "NOTE: the public WS endpoint is not yet implemented; "
+                             "`ws` and `both` currently behave the same as `poll`. "
+                             "The setting is wired through so flipping it later "
+                             "(when the public WS ships) requires no UI change.",
+                 examples="poll, ws, both"),
 ]
 
 
@@ -635,6 +664,9 @@ ENV_MAP: Dict[str, str] = {
     "TIKTOK_SESSION_ID": "PHOVEU_BACKEND_TIKTOK_SESSION_ID",
     "TIKTOK_SESSION_TT_TARGET_IDC": "PHOVEU_BACKEND_TIKTOK_SESSION_TT_TARGET_IDC",
     "TIKTOK_LOCAL_SIGN_URL": "PHOVEU_BACKEND_TIKTOK_LOCAL_SIGN_URL",
+    "TIKTOK_POLL_INTERVAL_MS": "PHOVEU_BACKEND_TIKTOK_POLL_INTERVAL_MS",
+    "TIKTOK_ADMIN_REALTIME_MODE": "PHOVEU_BACKEND_TIKTOK_ADMIN_REALTIME_MODE",
+    "TIKTOK_PUBLIC_REALTIME_MODE": "PHOVEU_BACKEND_TIKTOK_PUBLIC_REALTIME_MODE",
 }
 
 

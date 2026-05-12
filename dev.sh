@@ -305,18 +305,58 @@ build_start_cmd() {
   esac
 }
 
+# Best-effort detect this machine's LAN IPv4 address. Tries macOS
+# `ipconfig getifaddr` on the active interface, falls back to Linux
+# `hostname -I`, then a broad `ifconfig` parse for an RFC 1918 inet.
+# Prints nothing when no LAN IP is reachable (laptop on cellular,
+# no LAN interfaces up, etc.) — callers must handle that.
+detect_lan_ip() {
+  ip=""
+  if command -v ipconfig >/dev/null 2>&1; then
+    # macOS — probe likely-active interfaces in order.
+    for iface in en0 en1 en2 en3; do
+      ip="$(ipconfig getifaddr "$iface" 2>/dev/null || true)"
+      [ -n "$ip" ] && break
+    done
+  fi
+  if [ -z "$ip" ] && command -v hostname >/dev/null 2>&1; then
+    # Linux: hostname -I returns space-separated IPs.
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  fi
+  if [ -z "$ip" ] && command -v ifconfig >/dev/null 2>&1; then
+    # Generic fallback: grab the first non-loopback RFC 1918 address.
+    ip="$(ifconfig 2>/dev/null | awk '
+      /inet 192\.168\.|inet 10\.|inet 172\.(1[6-9]|2[0-9]|3[01])\./ {
+        print $2; exit
+      }
+    ')"
+  fi
+  echo "$ip"
+}
+
 # Per-service environment overrides exported into the child process.
-# Frontend gets VITE_API_BACKEND_PORT (just the port, not a full URL) so
-# the bundle can derive the API base from `window.location.hostname` at
-# runtime — that way the same Vite dev server works whether you open it
-# on the dev machine (localhost), a phone on the LAN (192.168.x.y), or
-# through an ngrok tunnel. A hardcoded "//localhost:PORT" only works
-# from the dev box itself.
+#
+# Frontend: we inject BOTH the backend port AND a freshly-detected
+# `VITE_API_BASE_URL=//<lan-ip>:<port>`. The full URL takes precedence
+# over the `.env` value (Vite layers process.env on top of .env files
+# at load time), so a stale baked-in IP in frontend/.env from a prior
+# network — like 192.168.0.15 when the laptop has since moved to
+# 192.168.0.2 — gets transparently overridden. The detection happens
+# every start/restart so re-running `./dev.sh restart frontend` after
+# the LAN IP changes is the one-command fix.
+#
+# If detection returns empty (no LAN IP — cellular only, etc.) we
+# only set the port and let the bundle fall back to its own
+# auto-detect logic in `frontend/src/config/env.ts`.
 build_start_env() {
   s="$1"
   case "$s" in
     frontend)
       back_port="$(get_port backend)"
+      lan_ip="$(detect_lan_ip)"
+      if [ -n "$lan_ip" ]; then
+        printf 'export VITE_API_BASE_URL="//%s:%d"\n' "$lan_ip" "$back_port"
+      fi
       printf 'export VITE_API_BACKEND_PORT="%d"\n' "$back_port"
       ;;
     *) ;;

@@ -1,5 +1,6 @@
 import { apiRequest } from '@/api/client';
 import { apiConfig } from '@/config/env';
+import { tiktokTelemetry } from '@admin/services/tiktokTelemetry';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -31,8 +32,6 @@ export interface TikTokSubscription {
   verified?: boolean | null;
   follower_count?: number | null;
   following_count?: number | null;
-  video_count?: number | null;
-  like_count?: number | null;
   profile_refreshed_at?: string | null;
   profile_error?: string | null;
   // Centralized live-status cache. Updated by the worker's scraper
@@ -40,6 +39,29 @@ export interface TikTokSubscription {
   is_live?: boolean | null;
   live_checked_at?: string | null;
   current_room_id?: string | null;
+  /** When `true`, this subscription's sanitized headline scoreboard is
+   *  exposed via the unauthenticated `/public/tiktok/lives` endpoint
+   *  and rendered on the public home page. Operator-only signals
+   *  (gifters, comments, listener state) stay private regardless. */
+  is_public?: boolean;
+}
+
+// ─── Public (unauthenticated) view ──────────────────────────────────
+//
+// Sanitized, read-only shape returned by `/public/tiktok/lives`.
+// Operator-only signals (top gifters, listener health, comments) are
+// stripped server-side — the public page never sees PII-adjacent data.
+
+export interface PublicLive {
+  unique_id: string;
+  nickname: string | null;
+  avatar_url: string | null;
+  follower_count: number | null;
+  is_live: boolean;
+  viewer_count: number | null;
+  diamonds_session: number | null;
+  started_at: string | null;        // ISO timestamp
+  hourly_buckets: number[];         // length 60, oldest→newest, diamonds/min
 }
 
 export interface TikTokRoom {
@@ -180,6 +202,22 @@ export interface TikTokMatchGiftersBySide {
     opponent_diamonds: number;
     opponent_gifts: number;
     unknown_diamonds: number;
+    /** How many sibling `tiktok_matches` rows the backend merged into
+     *  the opponent bucket — i.e. how many OTHER monitored hosts'
+     *  WebSocket streams contributed gift events to the opponent side.
+     *  0 means the opponent isn't being tracked, so the only opponent-
+     *  side gifts in the panel are `to_user`-tagged multi-target gifts
+     *  from the host's own stream. ≥1 means the opponent IS monitored
+     *  and their stream's gifts are ingested too. Defaults to 0 on the
+     *  legacy backend that doesn't emit it yet. */
+    siblings_merged?: number;
+    /** Room IDs of those sibling matches. When the user clicks an
+     *  opponent-side donor row in the match modal, the gifter detail
+     *  modal needs to query these rooms too — otherwise the donor's
+     *  gift history sits in the rival's broadcast (a different
+     *  room_id) and the modal renders empty. Passed as `extraRoomIds`
+     *  to the unified `TikTokGifterDetailModal`. */
+    sibling_room_ids?: string[];
   };
 }
 
@@ -462,6 +500,35 @@ export interface TikTokCommonGiftersPage {
   limit: number;
   offset: number;
   min_hosts: number;
+}
+
+/** Host-scoped cross-live gifter row returned by
+ *  `/admin/tiktok/lives/{handle}/cross-live-gifters` and its
+ *  public mirror. Carries here/elsewhere splits so the table can
+ *  surface "spends X here, Y across N other lives" without a
+ *  client-side recompute. */
+export interface TikTokCrossLiveGifter {
+  user_id: string | null;
+  unique_id: string | null;
+  nickname: string | null;
+  avatar_url?: string | null;
+  /** Total distinct hosts this viewer has gifted to (incl. queried). */
+  host_count: number;
+  diamonds_here: number;
+  gifts_here: number;
+  diamonds_elsewhere: number;
+  gifts_elsewhere: number;
+  /** Other hosts (excludes the queried host), sorted by diamonds desc. */
+  other_hosts: TikTokCommonGifterHostSlice[];
+}
+
+export interface TikTokCrossLiveGiftersPage {
+  items: TikTokCrossLiveGifter[];
+  total: number;
+  limit: number;
+  offset: number;
+  min_other_hosts: number;
+  host: string;
 }
 
 /** Recent room a viewer gifted in for one host. */
@@ -753,6 +820,27 @@ export const tiktokApi = {
     return apiRequest({ method: 'GET', url: `${BASE}/lives` });
   },
 
+  /** Single-handle lookup. No dedicated admin endpoint — filter from
+   *  `listLives()`. Mirrors the shape of `publicTiktokApi.getLiveByHandle`
+   *  so the shared live-detail component (used by both admin and public
+   *  routes via the `TikTokApiContext`) can fetch the host record
+   *  uniformly without branching on the active namespace. */
+  getLiveByHandle(handle: string): Promise<TikTokSubscription> {
+    return apiRequest<TikTokSubscription[]>({
+      method: 'GET',
+      url: `${BASE}/lives`,
+    }).then((rows) => {
+      const needle = handle.toLowerCase();
+      const found = rows.find((r) => (r.unique_id || '').toLowerCase() === needle);
+      if (!found) {
+        const err = new Error(`Host @${handle} not found`);
+        (err as Error & { status?: number }).status = 404;
+        throw err;
+      }
+      return found;
+    });
+  },
+
   lookupHandle(handle: string): Promise<TikTokHandleLookup> {
     return apiRequest({
       method: 'GET',
@@ -774,6 +862,18 @@ export const tiktokApi = {
       method: 'PATCH',
       url: `${BASE}/lives/${encodeURIComponent(handle)}`,
       data: { enabled },
+    });
+  },
+
+  /** Mark / unmark a subscription as publicly visible. When public,
+   *  the host's sanitized headline scoreboard is exposed via the
+   *  unauthenticated `/public/tiktok/lives` endpoint. Operator-only
+   *  signals are stripped server-side regardless of this flag. */
+  setLivePublic(handle: string, isPublic: boolean): Promise<void> {
+    return apiRequest({
+      method: 'PATCH',
+      url: `${BASE}/lives/${encodeURIComponent(handle)}/public`,
+      data: { is_public: isPublic },
     });
   },
 
@@ -900,6 +1000,25 @@ export const tiktokApi = {
     return apiRequest({
       method: 'GET',
       url: `${BASE}/common-gifters/${encodeURIComponent(userId)}/detail`,
+    });
+  },
+
+  /** Cross-live gifters scoped to one host: viewers who've gifted to
+   *  this host AND to >= `min_other_hosts` other hosts we track. Powers
+   *  the "Cross-live" tab on the live detail page. */
+  getRoomCrossLiveGifters(
+    handle: string,
+    opts?: {
+      min_other_hosts?: number;
+      q?: string;
+      limit?: number;
+      offset?: number;
+    },
+  ): Promise<TikTokCrossLiveGiftersPage> {
+    return apiRequest({
+      method: 'GET',
+      url: `${BASE}/lives/${encodeURIComponent(handle)}/cross-live-gifters`,
+      params: opts,
     });
   },
 
@@ -1490,16 +1609,128 @@ export type TikTokWsEvent = {
 export function openTikTokWebSocket(
   onMessage: (e: TikTokWsEvent) => void,
   onError?: (err: Event) => void,
-  options?: { handles?: string[] | '*' }
+  options?: {
+    handles?: string[] | '*';
+    /** Which backend endpoint to connect to. `"admin"` (default) hits
+     *  `/admin/tiktok/ws` with the local-storage JWT — every event for
+     *  every tracked subscription. `"public"` hits `/public/tiktok/ws`
+     *  with no auth — server filters to events for `is_public=True`
+     *  handles only, so an anonymous viewer can stream only what the
+     *  operator explicitly opted in to. */
+    audience?: 'admin' | 'public';
+  }
 ): WebSocket {
+  const audience = options?.audience ?? 'admin';
   const baseUrl = apiConfig.baseUrl || window.location.origin;
   const wsBase = baseUrl.replace(/^http(s?):/i, 'ws$1:');
-  const token = localStorage.getItem('token') || sessionStorage.getItem('token');
-  const url = `${wsBase}/admin/tiktok/ws${token ? `?token=${encodeURIComponent(token)}` : ''}`;
-  const ws = new WebSocket(url);
-  ws.onmessage = (e) => {
+  // Admin WS requires the JWT (browsers can't set Authorization on
+  // WS; we put it in the query). Public WS is anonymous — no token
+  // appended. The browser's same-origin policy + the backend's
+  // public-handle filter is the whole trust model.
+  const path = audience === 'admin' ? '/admin/tiktok/ws' : '/public/tiktok/ws';
+  let url = `${wsBase}${path}`;
+  if (audience === 'admin') {
+    const token = localStorage.getItem('token') || sessionStorage.getItem('token');
+    if (token) url += `?token=${encodeURIComponent(token)}`;
+  }
+  // Tell the telemetry singleton a WS attempt is starting. This is
+  // what powers the realtime-status pill in the page header. We
+  // call before the constructor so the pill flips to "connecting"
+  // immediately, not after the first JS task break.
+  tiktokTelemetry.noteWsAttempt();
+  // Diagnostic logging — emit a structured record per WS lifecycle
+  // event. Keep the token truncated (last 6 chars) so the log isn't
+  // a secret leak when shared. Toggle with `localStorage.setItem(
+  // 'TIKTOK_WS_DEBUG', '1')` if the console gets too noisy; default
+  // ON in dev so the very first WS lifecycle the user looks at is
+  // already explained.
+  const debugWs = (() => {
     try {
-      onMessage(JSON.parse(e.data) as TikTokWsEvent);
+      const v = localStorage.getItem('TIKTOK_WS_DEBUG');
+      if (v === '0') return false;
+      return true;
+    } catch { return true; }
+  })();
+  const tokenTail = audience === 'admin'
+    ? (localStorage.getItem('token') || sessionStorage.getItem('token') || '')
+        .slice(-6) || '(none)'
+    : '(public — no token)';
+  if (debugWs) {
+    // eslint-disable-next-line no-console
+    console.info('[tiktok-ws] open →', { url: url.split('?')[0], audience, tokenTail });
+  }
+  const ws = new WebSocket(url);
+  ws.addEventListener('open', () => {
+    tiktokTelemetry.noteWsOpen();
+    if (debugWs) {
+      // eslint-disable-next-line no-console
+      console.info('[tiktok-ws] OPEN', { url: url.split('?')[0], audience });
+    }
+  }, { once: true });
+  ws.addEventListener('close', (ev) => {
+    tiktokTelemetry.noteWsClosed();
+    if (debugWs) {
+      // WS close codes worth recognising at a glance:
+      //   1000 normal, 1001 going-away, 1006 abnormal (no close frame
+      //   received — what you see when the server rejects the upgrade
+      //   before accepting), 4401 unauthenticated, 4403 forbidden.
+      // eslint-disable-next-line no-console
+      console.warn('[tiktok-ws] CLOSE', {
+        url: url.split('?')[0],
+        audience,
+        code: ev.code,
+        reason: ev.reason || '(none)',
+        wasClean: ev.wasClean,
+        hint: ev.code === 1006
+          ? 'abnormal — usually means the server rejected the upgrade (auth fail) OR the network dropped'
+          : ev.code === 4401
+            ? 'unauthenticated — token missing or expired'
+            : ev.code === 4403
+              ? 'forbidden — token valid but lacks admin permission'
+              : undefined,
+      });
+    }
+  }, { once: true });
+  ws.addEventListener('error', (ev) => {
+    tiktokTelemetry.noteWsClosed();
+    if (debugWs) {
+      // eslint-disable-next-line no-console
+      console.warn('[tiktok-ws] ERROR', {
+        url: url.split('?')[0],
+        audience,
+        event: ev,
+      });
+    }
+  }, { once: true });
+
+  // React StrictMode double-invokes effects in dev — the cleanup
+  // runs while the socket is still CONNECTING, producing the noisy
+  // "WebSocket is closed before the connection is established"
+  // warning. The same race exists in prod when a user navigates
+  // away within ~100ms of mount (just less commonly visible). Wrap
+  // `close` so it defers until the socket is actually OPEN (or
+  // errors out) — semantically what the caller wanted anyway.
+  const origClose = ws.close.bind(ws);
+  ws.close = (code?: number, reason?: string) => {
+    if (ws.readyState === WebSocket.CONNECTING) {
+      const finish = () => { try { origClose(code, reason); } catch { /* ignore */ } };
+      ws.addEventListener('open', finish, { once: true });
+      ws.addEventListener('error', finish, { once: true });
+      return;
+    }
+    if (ws.readyState === WebSocket.OPEN) {
+      try { origClose(code, reason); } catch { /* ignore */ }
+    }
+    // CLOSING / CLOSED: nothing to do.
+  };
+
+  ws.onmessage = (e) => {
+    // Count every well-formed event before the caller's handler so
+    // the status pill ticks even if the caller's handler throws.
+    try {
+      const parsed = JSON.parse(e.data) as TikTokWsEvent;
+      tiktokTelemetry.noteEvent();
+      onMessage(parsed);
     } catch {
       /* malformed message; ignore */
     }

@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Optional
@@ -1215,6 +1216,7 @@ class TikTokService:
                 {
                     "unique_id": sub.unique_id,
                     "enabled": sub.enabled,
+                    "is_public": bool(getattr(sub, "is_public", False)),
                     "state": state,
                     "room_id": room_id,
                     "is_connected": is_connected,
@@ -1228,8 +1230,6 @@ class TikTokService:
                     "verified": sub.verified,
                     "follower_count": sub.follower_count,
                     "following_count": sub.following_count,
-                    "video_count": sub.video_count,
-                    "like_count": sub.like_count,
                     "profile_refreshed_at": (
                         sub.profile_refreshed_at.isoformat()
                         if sub.profile_refreshed_at else None
@@ -1451,6 +1451,44 @@ class TikTokService:
         await self._stop_session(unique_id)
         return self._persistence.delete_subscription(unique_id)
 
+    def set_subscription_public(self, unique_id: str, is_public: bool) -> dict[str, Any]:
+        """Flip the public flag for `unique_id`. Returns the updated
+        subscription as a dict (same shape one element of
+        `list_subscriptions()` produces) or raises LookupError if the
+        handle isn't tracked — the route translates that into a 404.
+
+        Pass-through to persistence; no listener side-effects. Public-
+        opt-in is purely a display setting, the listener pool doesn't
+        care.
+        """
+        unique_id = self._normalize(unique_id)
+        ok = self._persistence.set_subscription_public(unique_id, bool(is_public))
+        if not ok:
+            raise LookupError(unique_id)
+        sub = self._persistence.get_subscription(unique_id)
+        if sub is None:
+            # Was deleted between the update and the readback — treat
+            # like not-found.
+            raise LookupError(unique_id)
+        # Invalidate the public-lives summary cache so a freshly
+        # disabled handle stops appearing immediately. Without this,
+        # `/public/tiktok/lives` keeps serving the stale list for up
+        # to the cache TTL (30s), which feels wrong on a privacy
+        # action: operator clicks "off", expects "private NOW".
+        # Drop the read-side response cache; the next public hit
+        # rebuilds from `list_public_subscriptions()`.
+        self._public_lives_summary_cache = None
+        # Same reason for the public WS handle filter: when an
+        # operator flips a host private, the public WS must stop
+        # forwarding that host's events on the next received event,
+        # not 30s later. Drop the cache; next event re-reads the set.
+        self._public_handle_set_cache = None
+        return {
+            "unique_id": sub.unique_id,
+            "is_public": bool(sub.is_public),
+            "enabled":   bool(sub.enabled),
+        }
+
     async def request_reconnect(self, unique_id: str) -> bool:
         """Force the listener for `unique_id` to teardown + start fresh,
         bypassing whatever backoff sleep its supervisor is parked on.
@@ -1666,8 +1704,6 @@ class TikTokService:
             "private": data.get("private"),
             "follower_count": data.get("follower_count"),
             "following_count": data.get("following_count"),
-            "video_count": data.get("video_count"),
-            "like_count": data.get("like_count"),
         }
         self._persistence.update_subscription_profile(
             unique_id, profile=profile_record, error=None
@@ -1746,7 +1782,21 @@ class TikTokService:
                             "Live-status scrape raised for @%s", sub.unique_id
                         )
                         profile = None
-                    is_live = bool(profile.get("is_live")) if profile else None
+                    # Tri-state read: True / False / None. Don't coerce
+                    # None → False — the scraper now returns None when
+                    # it couldn't determine live status (TikTok 403'd,
+                    # WAF'd, or the SIGI script tag was missing). The
+                    # supervisor's recycle path uses None to mean
+                    # "unknown — don't touch the slot." Coercing here
+                    # would evict working sessions any time TikTok's
+                    # CDN blocked our probe, which is exactly the cascade
+                    # observed: 1 sec of 403s ➜ slot recycled ➜ 1 fewer
+                    # session ➜ next sub falls off too.
+                    raw_is_live = profile.get("is_live") if profile else None
+                    if raw_is_live is None:
+                        is_live = None
+                    else:
+                        is_live = bool(raw_is_live)
                     room_id_raw = profile.get("room_id") if profile else None
                     try:
                         room_id = int(room_id_raw) if room_id_raw else None
@@ -2068,15 +2118,42 @@ class TikTokService:
     def get_match_score_timeline(self, match_id: int) -> list[dict[str, Any]]:
         return self._persistence.get_match_score_timeline(int(match_id))
 
-    def get_match_gifters_by_side(self, match_id: int) -> dict[str, Any]:
+    def get_match_gifters_by_side(
+        self, match_id: int, *, public_only: bool = False,
+    ) -> dict[str, Any]:
         match = self._persistence.get_match_by_id(int(match_id))
         if match is None:
             return {"host": [], "opponent": [], "unknown": [], "totals": {}}
         host = self._persistence.get_room_host_handle(match.room_id)
+        # Find sibling match rows: same TikTok PK observed from another
+        # monitored host's WebSocket. Each sibling has its own `match_id`
+        # but shares `battle_id` with us. Their events get merged into
+        # the donor panel below so a 1v1 between two tracked hosts no
+        # longer hides one side's gifters.
+        #
+        # The `public_only=True` flag (set by the public mirror route)
+        # tells the persistence layer to drop any sibling whose host
+        # is NOT opted into the public surface — without it we'd leak
+        # both the private host's room_id (in `sibling_room_ids`) AND
+        # their gift-event stream (merged into the donor list) to
+        # anonymous viewers.
+        sibling_match_ids: list[int] = []
+        if match.battle_id is not None:
+            try:
+                sibling_match_ids = self._persistence.get_match_ids_by_battle_id(
+                    int(match.battle_id), exclude_match_id=int(match_id),
+                )
+            except Exception:
+                logger.exception(
+                    "sibling-match lookup failed for battle_id=%s",
+                    match.battle_id,
+                )
         result = self._persistence.get_match_gifters_by_side(
             int(match_id),
             host_unique_id=host or "",
             opponents=match.opponents or [],
+            sibling_match_ids=sibling_match_ids,
+            public_only=public_only,
         )
         # Stringify user_id for JS BigInt safety.
         for side in ("host", "opponent", "unknown"):
@@ -2406,8 +2483,12 @@ class TikTokService:
             "offset": int(offset),
         }
 
-    def get_common_gifter_detail(self, user_id: int) -> dict[str, Any]:
-        return self._persistence.common_gifter_detail(int(user_id))
+    def get_common_gifter_detail(
+        self, user_id: int, *, public_only: bool = False,
+    ) -> dict[str, Any]:
+        return self._persistence.common_gifter_detail(
+            int(user_id), public_only=public_only,
+        )
 
     # ── Notifications history ────────────────────────────────────────
 
@@ -2420,8 +2501,28 @@ class TikTokService:
     # enough that operators don't notice staleness on viewer counts /
     # session diamonds; the cache key is the sorted handle tuple so
     # different filters get their own slot.
-    _LIVES_SUMMARY_TTL_S = 10.0
+    # TTL = 35 s, intentionally longer than the frontend's 30 s poll
+    # cadence. If TTL < poll, every poll catches an expired cache and
+    # re-runs `get_lives_summary` (the ~22 SQL queries). With TTL > poll,
+    # each poll's compute refreshes the cache for the NEXT poll window
+    # — so steady-state polling hits the cache uninterrupted, and only
+    # the first request after a backend restart (handled by the warm-up
+    # task) or a >35 s gap pays the cold cost. Page freshness stays
+    # within one poll period; the in-flight WebSocket stream provides
+    # real-time events alongside this slower-cadence rollup. The
+    # frontend Cache-Control: max-age=10 in the route layer is the
+    # browser-side cap and is intentionally tighter than this TTL.
+    _LIVES_SUMMARY_TTL_S = 35.0
     _lives_summary_cache: dict[tuple[str, ...], tuple[float, dict[str, Any]]] = {}
+    # Per-key singleflight locks. When N concurrent callers race for
+    # the same cache key on a cold miss (warm-up + first user request,
+    # or multiple admin tabs opening at once), only one runs the SQL;
+    # the rest block on the lock, then read the now-populated cache.
+    # Without this the warm-up I added on startup duplicates work with
+    # whoever hits the route first. The meta-lock guards lock-creation
+    # so two callers don't each instantiate a fresh per-key lock.
+    _lives_summary_locks: dict[tuple[str, ...], threading.Lock] = {}
+    _lives_summary_meta_lock = threading.Lock()
 
     def get_lives_summary(self, handles: list[str]) -> dict[str, Any]:
         key = tuple(sorted(handles))
@@ -2429,12 +2530,276 @@ class TikTokService:
         hit = self._lives_summary_cache.get(key)
         if hit and (now - hit[0]) < self._LIVES_SUMMARY_TTL_S:
             return hit[1]
-        result = self._persistence.get_lives_summary(handles)
-        self._lives_summary_cache[key] = (now, result)
+
+        # Cold miss — singleflight. Get or create the per-key lock.
+        with self._lives_summary_meta_lock:
+            lock = self._lives_summary_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._lives_summary_locks[key] = lock
+
+        with lock:
+            # Double-checked: another caller may have populated the
+            # cache while we were waiting on the lock.
+            now2 = time.monotonic()
+            hit2 = self._lives_summary_cache.get(key)
+            if hit2 and (now2 - hit2[0]) < self._LIVES_SUMMARY_TTL_S:
+                return hit2[1]
+            result = self._persistence.get_lives_summary(handles)
+            self._lives_summary_cache[key] = (now2, result)
+            return result
+
+    # ── Public-lives sanitizer allowlists ────────────────────────────
+    #
+    # Two allowlists, one per object in each `items[]` entry. Anything
+    # NOT in these tuples is operator-only and MUST NOT leak through
+    # the unauthenticated endpoint. The shape is intentionally similar
+    # to (subset of) the admin types `TikTokSubscription` + `TikTokLiveSummary`
+    # so the public page can reuse the same card renderer as
+    # /admin/tiktok with admin actions stripped.
+    #
+    # Build-by-copy semantics: `_pick(src, allow)` only ever COPIES
+    # known-safe keys into a fresh dict. Never the inverse (drop known-
+    # bad keys), which fails open the moment a new operator-only key
+    # is added upstream.
+    #
+    # If you're adding a new key to `get_lives_summary` or the
+    # `Subscription` dataclass, decide explicitly: is this already
+    # visible on TikTok itself for the same creator? If yes, add it
+    # here. If no (internal listener state, derived-from-our-history
+    # numbers, operator-curated lists, internal identifiers), leave
+    # it out. Default is private.
+
+    # Subscription fields the public can see. These mirror what's on
+    # the creator's TikTok profile page — nickname, avatar, bio,
+    # follower count, etc. Excluded: sec_uid / profile_user_id (internal
+    # ids), private (profile-is-private flag is internal), profile_error
+    # / profile_refreshed_at / updated_at (operator-only),
+    # enabled / state / is_connected / room_id / assigned_worker_id /
+    # assignment_lease_until (listener internals).
+    _PUBLIC_SUBSCRIPTION_FIELDS = (
+        "unique_id",
+        "nickname",
+        "avatar_url",
+        "bio",
+        "verified",
+        "follower_count",
+        "following_count",
+        "is_live",
+        "current_room_id",
+        "live_checked_at",
+        "created_at",
+    )
+
+    # Summary fields the public can see. Everything here is either
+    # visible on TikTok's live UI (viewer count, top gifters on the
+    # leaderboard, active PK overlay, active poll, last gift age via
+    # observation) or derivable from public data (heat ratio, hourly
+    # diamonds buckets from the public gift feed). Excluded:
+    # `last_caption` (speech transcript — err on PII), `favorites_in_room`
+    # (operator-curated list, not on TikTok), `diamonds_vs_typical` /
+    # `median_diamonds_30d` (derived from OUR internal 30d history,
+    # surfaces a data point TikTok itself doesn't), `reconnects_1h`
+    # (listener health, internal).
+    _PUBLIC_SUMMARY_FIELDS = (
+        "active_room_id",
+        "live_started_at",
+        "viewer_count",
+        "viewer_history",
+        "diamonds_session",
+        "hourly_buckets",
+        "daily_buckets",
+        "top_gifter",            # legacy single — kept for shape compat
+        "top_gifters",           # top 3, public on TikTok's gift leaderboard
+        "n_unique_gifters",
+        "n_first_time_gifters",
+        "session_stats",         # all subkeys are session-level counters
+        "last_gift_age_s",
+        "last_comment_age_s",
+        # `last_event_age_s` is intentionally omitted — TikTok shows
+        # the live is on, but the internal "seconds since the last
+        # webcast event we observed" signal is listener-health data
+        # that the public has no business seeing.
+        "comments_per_min_recent",
+        "comments_per_min_baseline",
+        "n_envelopes_session",
+        "envelope_diamonds_session",
+        "n_pauses",
+        "last_pause_age_s",
+        "active_poll",
+        "active_match",
+        "last_broadcasts",
+        "avg_duration_min",
+        "avg_diamonds",
+        "n_rooms_30d",
+        "week_calendar",
+        "momentum_label",
+    )
+
+    # Public endpoint cache: 30s TTL per the contract. Distinct from the
+    # 10s lives-summary cache — public viewers tolerate more staleness
+    # than admin operators, and the page can fan out to N anonymous
+    # tabs so the savings matter.
+    _PUBLIC_LIVES_SUMMARY_TTL_S = 30.0
+    _public_lives_summary_cache: tuple[float, dict[str, Any]] | None = None
+
+    # Public-handle set: the lowercased `unique_id`s of every
+    # subscription with `is_public=True`. Used by the public WS
+    # endpoint to filter live events down to "things this anonymous
+    # viewer is allowed to see". The set is cached for 30 s so an
+    # operator flipping a host private takes effect within a poll
+    # cycle without hammering the DB on every WS event (events can
+    # fire 10s of times per second on a busy live).
+    _PUBLIC_HANDLE_SET_TTL_S = 30.0
+    _public_handle_set_cache: tuple[float, frozenset[str]] | None = None
+    _public_handle_set_lock = threading.Lock()
+
+    def get_public_handle_set(self) -> frozenset[str]:
+        """Returns the set of lowercased handles flagged `is_public=True`.
+        Cached 30 s + singleflight so heavy WS traffic doesn't fan
+        out into per-event DB reads. Empty frozenset is a valid
+        result (operator has no public subscriptions yet)."""
+        now = time.monotonic()
+        cached = self._public_handle_set_cache
+        if cached is not None and (now - cached[0]) < self._PUBLIC_HANDLE_SET_TTL_S:
+            return cached[1]
+        with self._public_handle_set_lock:
+            now2 = time.monotonic()
+            cached2 = self._public_handle_set_cache
+            if cached2 is not None and (now2 - cached2[0]) < self._PUBLIC_HANDLE_SET_TTL_S:
+                return cached2[1]
+            try:
+                publics = self._persistence.list_public_subscriptions()
+                handles = frozenset(
+                    s.unique_id.lstrip("@").lower()
+                    for s in publics
+                    if s.unique_id
+                )
+            except Exception:
+                logger.exception("get_public_handle_set: list_public_subscriptions failed")
+                handles = frozenset()
+            self._public_handle_set_cache = (now2, handles)
+            return handles
+
+    # BigInt-safe keys on the Subscription dataclass: room_id and
+    # profile_user_id are 64-bit, exceed JS Number.MAX_SAFE_INTEGER —
+    # stringify on the wire (the admin route does the same).
+    _BIGINT_SUBSCRIPTION_KEYS = ("current_room_id",)
+
+    @staticmethod
+    def _pick(src: Any, allow: tuple[str, ...]) -> dict[str, Any]:
+        """Return a fresh dict containing only allowlisted keys from
+        `src` (a dict or a dataclass-like object). Build-by-copy on
+        purpose: this fails CLOSED when upstream adds new fields, so
+        we never accidentally leak a future operator-only column.
+
+        Datetimes are isoformatted (dataclass fields are real datetime
+        objects); 64-bit ids enumerated in `_BIGINT_SUBSCRIPTION_KEYS`
+        are stringified so the JSON survives JS-side parsing.
+        """
+        if not src:
+            return {}
+        out: dict[str, Any] = {}
+        is_mapping = isinstance(src, dict)
+        for k in allow:
+            v = src.get(k) if is_mapping else getattr(src, k, None)
+            # iso-format datetimes (dataclass paths only — dict paths
+            # come from get_lives_summary which already stringifies).
+            if hasattr(v, "isoformat"):
+                v = v.isoformat()
+            elif k in TikTokService._BIGINT_SUBSCRIPTION_KEYS and v is not None:
+                v = str(v)
+            out[k] = v
+        return out
+
+    def get_public_lives_summary(self) -> dict[str, Any]:
+        """Sanitized public-lives payload for /public/tiktok/lives.
+
+        Response shape:
+
+            {"items": [
+                {
+                    "subscription": { ...allowlisted Subscription fields... },
+                    "summary":      { ...allowlisted TikTokLiveSummary fields... },
+                },
+                ...
+            ]}
+
+        Mirrors the admin `(subscription, summary)` pair so the public
+        home page can reuse the same card renderer as /admin/tiktok
+        with admin actions stripped — same visual shape, sanitized
+        payload. Build is by allowlist-copy, never drop-known-private:
+        any new key upstream stays opaque by default until explicitly
+        added to `_PUBLIC_SUBSCRIPTION_FIELDS` or `_PUBLIC_SUMMARY_FIELDS`.
+        """
+        now = time.monotonic()
+        cached = self._public_lives_summary_cache
+        if cached is not None and (now - cached[0]) < self._PUBLIC_LIVES_SUMMARY_TTL_S:
+            return cached[1]
+
+        # 1. Pull just the public-flagged subscriptions. Profile fields
+        #    (nickname/avatar/follower_count/is_live/...) live on this
+        #    row — get_lives_summary doesn't carry them.
+        publics = self._persistence.list_public_subscriptions()
+        handles = [s.unique_id for s in publics if s.unique_id]
+        if not handles:
+            result = {"items": []}
+            self._public_lives_summary_cache = (now, result)
+            return result
+
+        # 2. Re-use the admin summary path — same SQL fan-out, shares
+        #    the 10s TTL cache when admin + public callers overlap on
+        #    the same handle set. Then sanitize each entry so nothing
+        #    operator-only escapes.
+        summary = self.get_lives_summary(handles)
+
+        items: list[dict[str, Any]] = []
+        for sub in publics:
+            h = sub.unique_id
+            if not h:
+                continue
+            row = summary.get(h.lstrip("@").lower(), {}) or {}
+            items.append(
+                {
+                    "subscription": self._pick(sub, self._PUBLIC_SUBSCRIPTION_FIELDS),
+                    "summary":      self._pick(row, self._PUBLIC_SUMMARY_FIELDS),
+                }
+            )
+
+        result = {"items": items}
+        self._public_lives_summary_cache = (now, result)
         return result
 
+    # `get_lives_totals` is polled every 30 s by the /admin/tiktok
+    # header strip. It's three unfiltered aggregates over
+    # `tiktok_events` (24 h diamonds + 5 min events-per-min +
+    # subscription count). Even with the `(type, ts)` index the
+    # 24 h scan touches >100 k rows. A 15 s TTL cache cuts admin-tab
+    # poll load roughly in half (each tab still sees fresh numbers
+    # within a half-poll-cycle, and concurrent admin tabs collapse
+    # to one DB round-trip per 15 s instead of one per tab per 30 s).
+    # Same rationale as `_LIVES_SUMMARY_TTL_S` — 35 s buffer over the
+    # 30 s frontend poll so steady-state polling always hits warm cache.
+    _LIVES_TOTALS_TTL_S = 35.0
+    _lives_totals_cache: tuple[float, dict[str, Any]] | None = None
+    # Singleflight on cold miss — same rationale as `_lives_summary_cache`.
+    # The cache has one slot (no per-key dimension), so one lock is enough.
+    _lives_totals_lock = threading.Lock()
+
     def get_lives_totals(self) -> dict[str, Any]:
-        return self._persistence.get_lives_totals()
+        now = time.monotonic()
+        cached = self._lives_totals_cache
+        if cached is not None and (now - cached[0]) < self._LIVES_TOTALS_TTL_S:
+            return cached[1]
+
+        with self._lives_totals_lock:
+            now2 = time.monotonic()
+            cached2 = self._lives_totals_cache
+            if cached2 is not None and (now2 - cached2[0]) < self._LIVES_TOTALS_TTL_S:
+                return cached2[1]
+            result = self._persistence.get_lives_totals()
+            self._lives_totals_cache = (now2, result)
+            return result
 
     def insert_notification(
         self,
@@ -2610,6 +2975,44 @@ class TikTokService:
             "limit": int(limit),
             "offset": int(offset),
             "min_hosts": int(min_hosts),
+        }
+
+    def get_cross_live_gifters_for_host(
+        self,
+        host_unique_id: str,
+        *,
+        min_other_hosts: int = 1,
+        limit: int = 25,
+        offset: int = 0,
+        q: str | None = None,
+    ) -> dict[str, Any]:
+        """Host-scoped variant of `get_common_gifters`: only viewers
+        who gifted to this host AND to >= `min_other_hosts` other
+        hosts. Same shape as `common_gifters` with extra here/elsewhere
+        split. See persistence docstring."""
+        items = self._persistence.cross_live_gifters_for_host(
+            host_unique_id,
+            min_other_hosts=min_other_hosts,
+            limit=limit,
+            offset=offset,
+            q=q,
+        )
+        total = self._persistence.count_cross_live_gifters_for_host(
+            host_unique_id,
+            min_other_hosts=min_other_hosts,
+            q=q,
+        )
+        items_serialized = [
+            {**g, "user_id": str(g["user_id"]) if g.get("user_id") is not None else None}
+            for g in items
+        ]
+        return {
+            "items": items_serialized,
+            "total": int(total),
+            "limit": int(limit),
+            "offset": int(offset),
+            "min_other_hosts": int(min_other_hosts),
+            "host": self._normalize(host_unique_id),
         }
 
     # ── internals ────────────────────────────────────────────────────

@@ -439,6 +439,41 @@ export function PermissionsList() {
       // Row Actions
       rowActions={getRowActions}
 
+      onRowClick={(permission) => navigate({ to: `/management/rbac/permissions/${permission.id}` })}
+      mobileCard={(permission) => (
+        <div className="px-4 py-3 space-y-2">
+          <div className="flex items-start justify-between gap-2">
+            <div className="min-w-0 flex-1">
+              <div className="text-sm font-medium text-gray-900 truncate">
+                {permission.name}
+              </div>
+              {permission.category && (
+                <div className="text-xs text-gray-500 mt-0.5">{permission.category}</div>
+              )}
+            </div>
+            <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium shrink-0 ${permission.is_active
+              ? 'bg-success-50 text-success-700'
+              : 'bg-gray-100 text-gray-800'
+              }`}>
+              {permission.is_active ? (
+                <CheckCircle className="w-3 h-3 mr-1" />
+              ) : (
+                <XCircle className="w-3 h-3 mr-1" />
+              )}
+              {permission.is_active ? 'Active' : 'Inactive'}
+            </span>
+          </div>
+          {permission.description && (
+            <div className="text-xs text-gray-600 line-clamp-2">
+              {permission.description}
+            </div>
+          )}
+          <div className="text-[10px] uppercase tracking-wider text-gray-400 pt-1">
+            Created <span className="normal-case tracking-normal text-gray-500">{formatRelativeTime(permission.created_at)}</span>
+          </div>
+        </div>
+      )}
+
       // Bulk Actions
       bulkActions={[
         {

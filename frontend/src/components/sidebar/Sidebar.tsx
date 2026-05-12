@@ -6,7 +6,7 @@ import {
   MessageSquare, FileText, Receipt, Settings, Settings2,
   Lock, KeyRound, UserPlus, History, Coins,
   Layers, LogIn,
-  Database, ShieldAlert, Radio, BarChart3, Gift, Key,
+  Database, ShieldAlert, Radio, BarChart3, Gift,
 } from 'lucide-react';
 import { cn } from '../../utils/cn';
 import { appConfig } from '../../config/env';
@@ -37,7 +37,7 @@ const generalSection: NavigationSection = {
   title: 'General',
   key: 'general',
   items: [
-    { name: 'Home', href: '/', icon: Home, end: true },
+    { name: 'Home', href: '/admin', icon: Home, end: true },
   ],
 };
 
@@ -113,11 +113,21 @@ const adminTikTokSection: NavigationSection = {
   collapsible: true,
   defaultExpanded: true,
   items: [
-    { name: 'Dashboard', href: `/admin/tiktok/dashboard`, icon: BarChart3 },
-    { name: 'Lives', href: `/admin/tiktok`, icon: Radio, end: true },
-    { name: 'History', href: `/admin/tiktok/history`, icon: History },
-    { name: 'Gifts', href: `/admin/tiktok/gifts`, icon: Gift },
-    { name: 'Sign Engine', href: `/admin/tiktok/sign-config`, icon: Key },
+    { name: 'Dashboard',   href: `/admin/tiktok/dashboard`,   icon: BarChart3 },
+    { name: 'Lives',       href: `/admin/tiktok`,             icon: Radio, end: true },
+    { name: 'History',     href: `/admin/tiktok/history`,     icon: History },
+    { name: 'Gifts',       href: `/admin/tiktok/gifts`,       icon: Gift },
+    // Settings consolidates every TikTok-related config + ops
+    // surface under one sidebar entry:
+    //   - General      → typed-config grouped editor (mirrors the
+    //                    `tiktok` namespace on /admin/settings/configuration).
+    //   - Sign Engine  → the rich provider-switching UI (was a
+    //                    separate sidebar entry; now a sub-tab).
+    //   - Worker       → listener-pool status (was a tab inside
+    //                    /admin/tiktok; now a sub-tab here).
+    // The legacy /admin/tiktok/sign-config route still works for
+    // direct-URL access / bookmarks but isn't surfaced in the nav.
+    { name: 'Settings',    href: `/admin/tiktok/settings`,    icon: Settings },
   ],
 };
 

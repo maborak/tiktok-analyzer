@@ -6,7 +6,7 @@ import type { ChatMessageResponse, SessionMetadataResponse } from '@/types/api';
 import type { AdminUser } from '../types';
 import { MessageSquare, Send, Loader2, AlertTriangle, Paperclip, Trash2, ArrowLeft, FileText, X, CheckCircle, Monitor, Globe, Info, Activity } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
-import { resolveLivechatMediaUrl } from '@/utils/url';
+import { AuthImage, AuthLink } from '@/components/AuthMedia';
 import clsx from 'clsx';
 import toast from 'react-hot-toast';
 
@@ -267,19 +267,18 @@ export function LiveChatAdminConsole() {
                                             {msg.attachments && msg.attachments.length > 0 && (
                                                 <div className="mt-3 flex flex-col gap-2">
                                                     {msg.attachments.map(att => (
-                                                        <a
+                                                        <AuthLink
                                                             key={att.id}
-                                                            href={resolveLivechatMediaUrl(att.file_url)}
-                                                            target="_blank"
-                                                            rel="noopener noreferrer"
+                                                            href={att.file_url}
+                                                            fileName={att.file_name}
                                                             className={clsx(
                                                                 "flex flex-col gap-2 p-1 rounded overflow-hidden",
                                                                 isFromAgent ? "hover:bg-primary-700/50" : "hover:bg-gray-50"
                                                             )}
                                                         >
                                                             {att.content_type.startsWith('image/') ? (
-                                                                <img
-                                                                    src={resolveLivechatMediaUrl(att.file_url)}
+                                                                <AuthImage
+                                                                    src={att.file_url}
                                                                     alt={att.file_name}
                                                                     className="max-w-full h-auto rounded-lg max-h-64 object-contain bg-black/5"
                                                                 />
@@ -292,7 +291,7 @@ export function LiveChatAdminConsole() {
                                                                     <span className="truncate">{att.file_name}</span>
                                                                 </div>
                                                             )}
-                                                        </a>
+                                                        </AuthLink>
                                                     ))}
                                                 </div>
                                             )}

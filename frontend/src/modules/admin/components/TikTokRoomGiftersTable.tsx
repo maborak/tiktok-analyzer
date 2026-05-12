@@ -1,10 +1,8 @@
 import { useEffect, useState } from 'react';
 import { ChevronLeft, ChevronRight, Loader2, Search, X } from 'lucide-react';
 
-import {
-  type TikTokGifter,
-  tiktokApi,
-} from '@admin/services/tiktok';
+import { type TikTokGifter } from '@admin/services/tiktok';
+import { useTikTokApi } from '@admin/contexts/TikTokApiContext';
 import { TikTokUserBadges } from '@admin/components/TikTokUserBadges';
 
 interface Props {
@@ -44,6 +42,7 @@ export function TikTokRoomGiftersTable({
   onSelectGifter,
   onTotalChange,
 }: Props) {
+  const tiktokApi = useTikTokApi();
   // Stringify the extras for use as a stable dep key — array identity
   // changes every render even when contents don't.
   const extraKey = (extraRoomIds ?? []).join(',');
@@ -145,22 +144,115 @@ export function TikTokRoomGiftersTable({
             : 'No gifts yet.'}
         </p>
       ) : (
-        <div className="overflow-x-auto">
-        <table className="w-full text-sm min-w-[520px]">
-          <thead>
-            <tr className="border-b border-gray-200">
-              <th className="text-left py-2 auth-mono-label w-10">#</th>
-              <th className="text-left py-2 auth-mono-label">User</th>
-              <th className="text-right py-2 auth-mono-label">Diamonds</th>
-              <th className="text-right py-2 auth-mono-label">Gifts</th>
-              <th className="text-right py-2 auth-mono-label">Comments</th>
-            </tr>
-          </thead>
-          <tbody>
+        <>
+          {/* Desktop: dense 5-column table (md+). Hidden below md
+              where the columns would force horizontal scroll. */}
+          <table className="hidden md:table w-full text-sm">
+            <thead>
+              <tr className="border-b border-gray-200">
+                <th className="text-left py-2 auth-mono-label w-10">#</th>
+                <th className="text-left py-2 auth-mono-label">User</th>
+                <th className="text-right py-2 auth-mono-label">Diamonds</th>
+                <th className="text-right py-2 auth-mono-label">Gifts</th>
+                <th className="text-right py-2 auth-mono-label">Comments</th>
+              </tr>
+            </thead>
+            <tbody>
+              {items.map((g, i) => (
+                <tr
+                  key={g.user_id ?? i}
+                  className="border-b border-gray-100 hover:bg-gray-50 cursor-pointer transition-colors"
+                  onClick={() =>
+                    onSelectGifter({
+                      userId: g.user_id,
+                      uniqueId: g.unique_id,
+                      nickname: g.nickname,
+                      diamonds: g.diamonds,
+                      gifts: g.gifts,
+                      comments: g.comments,
+                      tab: 'gifts',
+                    })
+                  }
+                  title="Click for full gift history"
+                >
+                  <td className="py-2 font-mono text-xs text-gray-500 tabular-nums">
+                    {offset + i + 1}
+                  </td>
+                  <td className="py-2">
+                    <div className="flex items-center gap-2 min-w-0">
+                      {g.avatar_url ? (
+                        <img
+                          src={g.avatar_url}
+                          alt=""
+                          className="w-6 h-6 rounded-full object-cover flex-shrink-0 bg-gray-100"
+                          loading="lazy"
+                        />
+                      ) : (
+                        <span
+                          aria-hidden
+                          className="w-6 h-6 rounded-full flex-shrink-0 bg-gray-100 inline-flex items-center justify-center text-[10px] font-mono text-gray-400"
+                        >
+                          {(g.nickname || g.unique_id || '?').slice(0, 1).toUpperCase()}
+                        </span>
+                      )}
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <span className="font-medium truncate">{g.nickname ?? '—'}</span>
+                          <TikTokUserBadges identity={g.identity} />
+                        </div>
+                        {g.unique_id && (
+                          <div className="text-[11px] text-gray-500 font-mono truncate">
+                            @{g.unique_id}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </td>
+                  <td className="text-right py-2 font-mono tabular-nums">
+                    {g.diamonds.toLocaleString()}
+                  </td>
+                  <td className="text-right py-2 font-mono tabular-nums">
+                    {g.gifts.toLocaleString()}
+                  </td>
+                  <td className="text-right py-2">
+                    {g.comments > 0 ? (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onSelectGifter({
+                            userId: g.user_id,
+                            uniqueId: g.unique_id,
+                            nickname: g.nickname,
+                            diamonds: g.diamonds,
+                            gifts: g.gifts,
+                            comments: g.comments,
+                            tab: 'comments',
+                          });
+                        }}
+                        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded font-mono text-[10px] bg-sky-50 text-sky-700 dark:bg-sky-500/10 dark:text-sky-300 hover:bg-sky-100 dark:hover:bg-sky-500/20 transition-colors"
+                        title="View this user's comments"
+                      >
+                        💬 {g.comments}
+                      </button>
+                    ) : (
+                      <span className="text-gray-300 font-mono text-[10px]">—</span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+
+          {/* Mobile: stacked card per gifter (below md). Avatar +
+              nickname + badges on the top row, totals + comments chip
+              on the bottom row. Whole card opens the Gifts tab; the
+              comments chip stops propagation and opens Comments. */}
+          <ul className="md:hidden flex flex-col gap-2">
             {items.map((g, i) => (
-              <tr
+              <li
                 key={g.user_id ?? i}
-                className="border-b border-gray-100 hover:bg-gray-50 cursor-pointer transition-colors"
+                className="rounded-md border border-gray-200 bg-white dark:bg-white/[0.03] px-3 py-2.5 cursor-pointer hover:bg-gray-50 transition-colors"
                 onClick={() =>
                   onSelectGifter({
                     userId: g.user_id,
@@ -172,48 +264,50 @@ export function TikTokRoomGiftersTable({
                     tab: 'gifts',
                   })
                 }
-                title="Click for full gift history"
+                title="Tap for full gift history"
               >
-                <td className="py-2 font-mono text-xs text-gray-500 tabular-nums">
-                  {offset + i + 1}
-                </td>
-                <td className="py-2">
-                  <div className="flex items-center gap-2 min-w-0">
-                    {g.avatar_url ? (
-                      <img
-                        src={g.avatar_url}
-                        alt=""
-                        className="w-6 h-6 rounded-full object-cover flex-shrink-0 bg-gray-100"
-                        loading="lazy"
-                      />
-                    ) : (
-                      <span
-                        aria-hidden
-                        className="w-6 h-6 rounded-full flex-shrink-0 bg-gray-100 inline-flex items-center justify-center text-[10px] font-mono text-gray-400"
-                      >
-                        {(g.nickname || g.unique_id || '?').slice(0, 1).toUpperCase()}
-                      </span>
-                    )}
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-1.5 flex-wrap">
-                        <span className="font-medium truncate">{g.nickname ?? '—'}</span>
-                        <TikTokUserBadges identity={g.identity} />
-                      </div>
-                      {g.unique_id && (
-                        <div className="text-[11px] text-gray-500 font-mono truncate">
-                          @{g.unique_id}
-                        </div>
-                      )}
+                <div className="flex items-center gap-2 min-w-0">
+                  <span className="font-mono text-[10px] text-gray-500 tabular-nums shrink-0 w-6">
+                    #{offset + i + 1}
+                  </span>
+                  {g.avatar_url ? (
+                    <img
+                      src={g.avatar_url}
+                      alt=""
+                      className="w-8 h-8 rounded-full object-cover flex-shrink-0 bg-gray-100"
+                      loading="lazy"
+                    />
+                  ) : (
+                    <span
+                      aria-hidden
+                      className="w-8 h-8 rounded-full flex-shrink-0 bg-gray-100 inline-flex items-center justify-center text-xs font-mono text-gray-400"
+                    >
+                      {(g.nickname || g.unique_id || '?').slice(0, 1).toUpperCase()}
+                    </span>
+                  )}
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <span className="font-medium truncate text-sm">{g.nickname ?? '—'}</span>
+                      <TikTokUserBadges identity={g.identity} />
                     </div>
+                    {g.unique_id && (
+                      <div className="text-[11px] text-gray-500 font-mono truncate">
+                        @{g.unique_id}
+                      </div>
+                    )}
                   </div>
-                </td>
-                <td className="text-right py-2 font-mono tabular-nums">
-                  {g.diamonds.toLocaleString()}
-                </td>
-                <td className="text-right py-2 font-mono tabular-nums">
-                  {g.gifts.toLocaleString()}
-                </td>
-                <td className="text-right py-2">
+                </div>
+                <div className="mt-2 pt-2 border-t border-gray-100 flex items-center gap-3 text-[11px] font-mono">
+                  <span className="flex items-center gap-1">
+                    <span className="text-amber-600">💎</span>
+                    <span className="tabular-nums font-semibold text-gray-900">
+                      {g.diamonds.toLocaleString()}
+                    </span>
+                  </span>
+                  <span className="flex items-center gap-1 text-gray-600">
+                    <span className="text-[10px] uppercase tracking-wider text-gray-400">gifts</span>
+                    <span className="tabular-nums">{g.gifts.toLocaleString()}</span>
+                  </span>
                   {g.comments > 0 ? (
                     <button
                       type="button"
@@ -229,20 +323,19 @@ export function TikTokRoomGiftersTable({
                           tab: 'comments',
                         });
                       }}
-                      className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded font-mono text-[10px] bg-sky-50 text-sky-700 dark:bg-sky-500/10 dark:text-sky-300 hover:bg-sky-100 dark:hover:bg-sky-500/20 transition-colors"
+                      className="ml-auto inline-flex items-center gap-1 px-2 py-0.5 rounded font-mono text-[10px] bg-sky-50 text-sky-700 dark:bg-sky-500/10 dark:text-sky-300 hover:bg-sky-100 dark:hover:bg-sky-500/20 transition-colors"
                       title="View this user's comments"
                     >
                       💬 {g.comments}
                     </button>
                   ) : (
-                    <span className="text-gray-300 font-mono text-[10px]">—</span>
+                    <span className="ml-auto text-gray-300 text-[10px]">no comments</span>
                   )}
-                </td>
-              </tr>
+                </div>
+              </li>
             ))}
-          </tbody>
-        </table>
-        </div>
+          </ul>
+        </>
       )}
 
       {/* Pagination + count line — render even when loading so layout is stable. */}

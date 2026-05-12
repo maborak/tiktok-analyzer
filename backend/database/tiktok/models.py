@@ -105,6 +105,11 @@ class SubscriptionModel(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     unique_id = Column(String(64), unique=True, index=True, nullable=False)
     enabled = Column(Boolean, nullable=False, default=True, server_default="true")
+    # Opt-in flag for the unauthenticated /public/tiktok/lives endpoint.
+    # Default False so an admin must explicitly publish a handle; only a
+    # sanitized subset of get_lives_summary leaks through the public
+    # route (see TikTokService.get_public_lives_summary).
+    is_public = Column(Boolean, nullable=False, default=False, server_default="false")
     # Cached public profile (refreshed periodically by the service).
     # Source: parsing __UNIVERSAL_DATA_FOR_REHYDRATION__ on tiktok.com/@<handle>.
     profile_user_id = Column(BigInteger, nullable=True)
@@ -116,8 +121,6 @@ class SubscriptionModel(Base):
     private = Column(Boolean, nullable=True)
     follower_count = Column(Integer, nullable=True)
     following_count = Column(Integer, nullable=True)
-    video_count = Column(Integer, nullable=True)
-    like_count = Column(BigInteger, nullable=True)
     # When we last successfully fetched the public profile.
     profile_refreshed_at = Column(DateTime(timezone=True), nullable=True)
     # Centralized live-status cache. Updated by the worker's scraper

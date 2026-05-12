@@ -137,103 +137,189 @@ export function Orders() {
                     </div>
                 ) : (
                     <div>
-                        <div className="overflow-x-auto">
-                            <table className="min-w-full divide-y divide-gray-200">
-                                <thead className="bg-gray-50">
-                                    <tr>
-                                        <th scope="col" className="auth-mono-label px-6 py-3 text-left">
-                                            Date
-                                        </th>
-                                        <th scope="col" className="auth-mono-label px-6 py-3 text-left">
-                                            Amount
-                                        </th>
-                                        <th scope="col" className="auth-mono-label px-6 py-3 text-left">
-                                            Package
-                                        </th>
-                                        <th scope="col" className="auth-mono-label px-6 py-3 text-left">
-                                            Method
-                                        </th>
-                                        <th scope="col" className="auth-mono-label px-6 py-3 text-left">
-                                            Status
-                                        </th>
-                                    </tr>
-                                </thead>
-                                <tbody className="bg-white divide-y divide-gray-200">
-                                    {orders.map((order) => {
-                                        const statusConfig = getStatusConfig(order.status);
-                                        const StatusIcon = statusConfig.icon;
+                        {/* Desktop: dense table. Hidden below md where the
+                            column count would force horizontal scroll. */}
+                        <table className="hidden md:table min-w-full divide-y divide-gray-200">
+                            <thead className="bg-gray-50">
+                                <tr>
+                                    <th scope="col" className="auth-mono-label px-6 py-3 text-left">
+                                        Date
+                                    </th>
+                                    <th scope="col" className="auth-mono-label px-6 py-3 text-left">
+                                        Amount
+                                    </th>
+                                    <th scope="col" className="auth-mono-label px-6 py-3 text-left">
+                                        Package
+                                    </th>
+                                    <th scope="col" className="auth-mono-label px-6 py-3 text-left">
+                                        Method
+                                    </th>
+                                    <th scope="col" className="auth-mono-label px-6 py-3 text-left">
+                                        Status
+                                    </th>
+                                </tr>
+                            </thead>
+                            <tbody className="bg-white divide-y divide-gray-200">
+                                {orders.map((order) => {
+                                    const statusConfig = getStatusConfig(order.status);
+                                    const StatusIcon = statusConfig.icon;
 
-                                        return (
-                                            <tr key={order.id} className="hover:bg-gray-50 transition-colors">
-                                                <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                                                    {formatDate(order.created_at)}
-                                                    <div className="text-xs text-gray-500 mt-1 font-mono tracking-tight">ID: {order.id}</div>
-                                                </td>
-                                                <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-success-600">
-                                                    ${order.amount.toFixed(2)} {order.currency}
-                                                </td>
-                                                <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                                                    {order.package_name || (order.package_id && packageMap[order.package_id]?.name) || 'Custom Package'}
-                                                </td>
-                                                <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                                                    <div className="flex items-center">
-                                                        {getProviderIcon(order.provider)}
-                                                        <span className="ml-2 capitalize">{order.provider.replace('_', ' ').toLowerCase()}</span>
-                                                    </div>
-                                                </td>
-                                                <td className="px-6 py-4 whitespace-nowrap">
-                                                    <div className="flex flex-col items-start gap-2">
-                                                        <span className={clsx(
-                                                            'inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium border',
-                                                            statusConfig.bg,
-                                                            statusConfig.color,
-                                                            statusConfig.border
-                                                        )}>
-                                                            <StatusIcon className="w-3.5 h-3.5 mr-1" />
-                                                            {statusConfig.text}
-                                                        </span>
-                                                        {['completed', 'paid'].includes(order.status.toLowerCase()) && order.invoice?.id && (
-                                                            <Button
-                                                                variant="secondary"
-                                                                size="sm"
-                                                                className="flex items-center text-xs py-1 h-7"
-                                                                onClick={() => navigate({ to: routes.account.billing.invoiceDetail(order.invoice?.id ?? '') })}
-                                                            >
-                                                                <FileText className="w-3.5 h-3.5 mr-1" />
-                                                                View Invoice
-                                                            </Button>
-                                                        )}
-                                                        {order.status === 'AWAITING_PAYMENT' && ['STRIPE', 'PAYPAL'].includes(order.provider) && (
-                                                            <Button
-                                                                variant="primary"
-                                                                size="sm"
-                                                                className="btn-success text-xs py-1 h-7"
-                                                                onClick={() => navigate({ to: routes.account.billing.checkout,
-                                                                    state: {
-                                                                        resumeOrderId: order.id,
-                                                                        provider: order.provider.toLowerCase(),
-                                                                        package: {
-                                                                            id: order.package_id || '',
-                                                                            name: order.package_name || (order.package_id ? packageMap[order.package_id]?.name : 'Package') || 'Package',
-                                                                            amount: typeof order.amount === 'string' ? parseFloat(order.amount) : order.amount,
-                                                                            currency: order.currency,
-                                                                            credits: order.package_id ? packageMap[order.package_id]?.credits : 0,
-                                                                            description: `Resume payment for ${order.package_name || 'Credit Package'}`
-                                                                        }
-                                                                    } as any
-                                                                })}
-                                                            >
-                                                                Resume Payment
-                                                            </Button>
-                                                        )}
-                                                    </div>
-                                                </td>
-                                            </tr>
-                                        );
-                                    })}
-                                </tbody>
-                            </table>
-                        </div>
+                                    return (
+                                        <tr key={order.id} className="hover:bg-gray-50 transition-colors">
+                                            <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                                                {formatDate(order.created_at)}
+                                                <div className="text-xs text-gray-500 mt-1 font-mono tracking-tight">ID: {order.id}</div>
+                                            </td>
+                                            <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-success-600">
+                                                ${order.amount.toFixed(2)} {order.currency}
+                                            </td>
+                                            <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                                                {order.package_name || (order.package_id && packageMap[order.package_id]?.name) || 'Custom Package'}
+                                            </td>
+                                            <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                                                <div className="flex items-center">
+                                                    {getProviderIcon(order.provider)}
+                                                    <span className="ml-2 capitalize">{order.provider.replace('_', ' ').toLowerCase()}</span>
+                                                </div>
+                                            </td>
+                                            <td className="px-6 py-4 whitespace-nowrap">
+                                                <div className="flex flex-col items-start gap-2">
+                                                    <span className={clsx(
+                                                        'inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium border',
+                                                        statusConfig.bg,
+                                                        statusConfig.color,
+                                                        statusConfig.border
+                                                    )}>
+                                                        <StatusIcon className="w-3.5 h-3.5 mr-1" />
+                                                        {statusConfig.text}
+                                                    </span>
+                                                    {['completed', 'paid'].includes(order.status.toLowerCase()) && order.invoice?.id && (
+                                                        <Button
+                                                            variant="secondary"
+                                                            size="sm"
+                                                            className="flex items-center text-xs py-1 h-7"
+                                                            onClick={() => navigate({ to: routes.account.billing.invoiceDetail(order.invoice?.id ?? '') })}
+                                                        >
+                                                            <FileText className="w-3.5 h-3.5 mr-1" />
+                                                            View Invoice
+                                                        </Button>
+                                                    )}
+                                                    {order.status === 'AWAITING_PAYMENT' && ['STRIPE', 'PAYPAL'].includes(order.provider) && (
+                                                        <Button
+                                                            variant="primary"
+                                                            size="sm"
+                                                            className="btn-success text-xs py-1 h-7"
+                                                            onClick={() => navigate({ to: routes.account.billing.checkout,
+                                                                state: {
+                                                                    resumeOrderId: order.id,
+                                                                    provider: order.provider.toLowerCase(),
+                                                                    package: {
+                                                                        id: order.package_id || '',
+                                                                        name: order.package_name || (order.package_id ? packageMap[order.package_id]?.name : 'Package') || 'Package',
+                                                                        amount: typeof order.amount === 'string' ? parseFloat(order.amount) : order.amount,
+                                                                        currency: order.currency,
+                                                                        credits: order.package_id ? packageMap[order.package_id]?.credits : 0,
+                                                                        description: `Resume payment for ${order.package_name || 'Credit Package'}`
+                                                                    }
+                                                                } as any
+                                                            })}
+                                                        >
+                                                            Resume Payment
+                                                        </Button>
+                                                    )}
+                                                </div>
+                                            </td>
+                                        </tr>
+                                    );
+                                })}
+                            </tbody>
+                        </table>
+
+                        {/* Mobile: card list — one row per order, no
+                            horizontal scroll. Only renders below md. */}
+                        <ul className="md:hidden flex flex-col gap-2 p-3">
+                            {orders.map((order) => {
+                                const statusConfig = getStatusConfig(order.status);
+                                const StatusIcon = statusConfig.icon;
+                                const packageLabel = order.package_name || (order.package_id && packageMap[order.package_id]?.name) || 'Custom Package';
+
+                                return (
+                                    <li
+                                        key={order.id}
+                                        className="rounded-md border border-gray-200 bg-white dark:bg-white/[0.03] px-3 py-2.5 hover:bg-gray-50 transition-colors"
+                                    >
+                                        <div className="flex items-baseline justify-between gap-2 mb-1">
+                                            <div className="min-w-0 flex-1 font-mono text-[11px] text-gray-500 truncate" title={`ID: ${order.id}`}>
+                                                ID: {order.id}
+                                            </div>
+                                            <div className="shrink-0 font-medium text-success-600 tabular-nums text-sm">
+                                                ${order.amount.toFixed(2)} {order.currency}
+                                            </div>
+                                        </div>
+                                        <div className="flex items-center justify-between gap-2 mb-1.5">
+                                            <div className="min-w-0 text-xs text-gray-500 flex items-center gap-2 flex-wrap">
+                                                <span>{formatDate(order.created_at)}</span>
+                                                <span className="inline-flex items-center gap-1 capitalize">
+                                                    {getProviderIcon(order.provider)}
+                                                    {order.provider.replace('_', ' ').toLowerCase()}
+                                                </span>
+                                            </div>
+                                            <span className={clsx(
+                                                'shrink-0 inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium border',
+                                                statusConfig.bg,
+                                                statusConfig.color,
+                                                statusConfig.border
+                                            )}>
+                                                <StatusIcon className="w-3 h-3 mr-1" />
+                                                {statusConfig.text}
+                                            </span>
+                                        </div>
+                                        <div className="text-xs text-gray-700 truncate mb-1">
+                                            {packageLabel}
+                                        </div>
+                                        {((['completed', 'paid'].includes(order.status.toLowerCase()) && order.invoice?.id) ||
+                                          (order.status === 'AWAITING_PAYMENT' && ['STRIPE', 'PAYPAL'].includes(order.provider))) && (
+                                            <div className="flex flex-wrap gap-2 mt-1.5">
+                                                {['completed', 'paid'].includes(order.status.toLowerCase()) && order.invoice?.id && (
+                                                    <Button
+                                                        variant="secondary"
+                                                        size="sm"
+                                                        className="flex items-center text-xs py-1 h-7"
+                                                        onClick={() => navigate({ to: routes.account.billing.invoiceDetail(order.invoice?.id ?? '') })}
+                                                    >
+                                                        <FileText className="w-3.5 h-3.5 mr-1" />
+                                                        View Invoice
+                                                    </Button>
+                                                )}
+                                                {order.status === 'AWAITING_PAYMENT' && ['STRIPE', 'PAYPAL'].includes(order.provider) && (
+                                                    <Button
+                                                        variant="primary"
+                                                        size="sm"
+                                                        className="btn-success text-xs py-1 h-7"
+                                                        onClick={() => navigate({ to: routes.account.billing.checkout,
+                                                            state: {
+                                                                resumeOrderId: order.id,
+                                                                provider: order.provider.toLowerCase(),
+                                                                package: {
+                                                                    id: order.package_id || '',
+                                                                    name: order.package_name || (order.package_id ? packageMap[order.package_id]?.name : 'Package') || 'Package',
+                                                                    amount: typeof order.amount === 'string' ? parseFloat(order.amount) : order.amount,
+                                                                    currency: order.currency,
+                                                                    credits: order.package_id ? packageMap[order.package_id]?.credits : 0,
+                                                                    description: `Resume payment for ${order.package_name || 'Credit Package'}`
+                                                                }
+                                                            } as any
+                                                        })}
+                                                    >
+                                                        Resume Payment
+                                                    </Button>
+                                                )}
+                                            </div>
+                                        )}
+                                    </li>
+                                );
+                            })}
+                        </ul>
 
                         {/* Pagination */}
                         {totalOrders > 0 && (

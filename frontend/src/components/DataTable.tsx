@@ -163,6 +163,19 @@ export interface DataTableProps<T> {
 
   // Row styling
   getRowClassName?: (row: T) => string;
+
+  /** Per-row mobile card renderer. When provided, the underlying
+   *  `<table>` is hidden below `sm:` (640px) and this fn is called
+   *  for each row to produce a stacked card on narrow viewports —
+   *  preventing horizontal-scroll table UX on phones. Card click is
+   *  wired up via `onRowClick`. Wrap your output in semantic markup
+   *  (the DataTable supplies the `<li>` container). */
+  mobileCard?: (row: T) => ReactNode;
+  /** Optional row click handler — used by the mobile card layout to
+   *  open a row's detail / drilldown when there are no inline
+   *  actions. The desktop table doesn't change behavior; existing
+   *  `rowActions` still work as before. */
+  onRowClick?: (row: T) => void;
 }
 
 export function DataTable<T>({
@@ -238,6 +251,10 @@ export function DataTable<T>({
 
   // Row styling
   getRowClassName,
+
+  // Mobile card
+  mobileCard,
+  onRowClick,
 }: DataTableProps<T>) {
 
   // Selection handlers
@@ -540,7 +557,30 @@ export function DataTable<T>({
           </div>
         ) : (
           <>
-            <div className="overflow-x-auto">
+            {/* Mobile card list (below sm). Only rendered when the
+                caller supplied a `mobileCard` renderer — otherwise we
+                fall back to the desktop table at all widths so legacy
+                consumers keep working. */}
+            {mobileCard && (
+              <ul className="sm:hidden divide-y divide-gray-100">
+                {data.map((row, index) => {
+                  const rowId = getRowId(row);
+                  return (
+                    <li
+                      key={`m_${rowId}_${index}`}
+                      onClick={onRowClick ? () => onRowClick(row) : undefined}
+                      className={cn(
+                        onRowClick && "cursor-pointer hover:bg-gray-50 transition-colors",
+                        getRowClassName?.(row),
+                      )}
+                    >
+                      {mobileCard(row)}
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+            <div className={cn('overflow-x-auto', mobileCard && 'hidden sm:block')}>
               <table className="min-w-full">
                 <thead className="bg-gray-50/80 border-b border-gray-200">
                   <tr>

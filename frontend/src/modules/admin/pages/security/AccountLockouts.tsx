@@ -269,6 +269,84 @@ export function AccountLockouts() {
                 selectedIds={selectedIds}
                 onSelectionChange={setSelectedIds}
                 rowActions={getRowActions}
+                mobileCard={(user) => {
+                    const locked = isCurrentlyLocked(user);
+                    return (
+                        <div className="px-4 py-3 space-y-2">
+                            <div className="flex items-start justify-between gap-2">
+                                <div className="flex items-center min-w-0 flex-1">
+                                    <div className="flex-shrink-0 h-9 w-9 rounded-full bg-primary-50 dark:bg-primary-900/30 flex items-center justify-center">
+                                        <UserIcon className="h-4 w-4 text-primary-600 dark:text-primary-400" />
+                                    </div>
+                                    <div className="ml-3 min-w-0 flex-1">
+                                        <div className="text-sm font-medium text-gray-900 truncate">
+                                            {user.firstName || user.lastName
+                                                ? `${user.firstName || ''} ${user.lastName || ''}`.trim()
+                                                : user.username}
+                                        </div>
+                                        <div className="text-xs text-gray-500 truncate">{user.email}</div>
+                                    </div>
+                                </div>
+                                <button
+                                    type="button"
+                                    onClick={(e) => { e.stopPropagation(); handleUnlock(user.id); }}
+                                    className="btn-secondary shrink-0 px-2.5 py-1 text-xs"
+                                    title="Unlock user"
+                                >
+                                    <Unlock className="w-3.5 h-3.5 mr-1" />
+                                    Unlock
+                                </button>
+                            </div>
+                            <div className="grid grid-cols-3 gap-2 text-xs pt-1">
+                                <div className="min-w-0">
+                                    <div className="text-[10px] uppercase tracking-wider text-gray-400">Failed</div>
+                                    <span className={cn(
+                                        'inline-flex items-center px-1.5 py-0.5 rounded text-[11px] font-semibold tabular-nums',
+                                        user.failedLoginAttempts >= 10
+                                            ? 'bg-error-50 text-error-700 dark:bg-error-900/30 dark:text-error-400'
+                                            : user.failedLoginAttempts >= 5
+                                                ? 'bg-warning-50 text-warning-700 dark:bg-warning-900/30 dark:text-warning-400'
+                                                : 'bg-gray-100 text-gray-700'
+                                    )}>
+                                        {user.failedLoginAttempts}
+                                    </span>
+                                </div>
+                                <div className="min-w-0">
+                                    <div className="text-[10px] uppercase tracking-wider text-gray-400">Lock</div>
+                                    {locked ? (
+                                        <div className="flex items-center gap-1">
+                                            <AlertTriangle className="w-3 h-3 text-error-500 shrink-0" />
+                                            <span className="text-[11px] text-error-600 dark:text-error-400 truncate">
+                                                {formatDate(user.lockedUntil!)}
+                                            </span>
+                                        </div>
+                                    ) : (
+                                        <span className="text-[11px] text-gray-500">Expired</span>
+                                    )}
+                                </div>
+                                <div className="min-w-0">
+                                    <div className="text-[10px] uppercase tracking-wider text-gray-400">Status</div>
+                                    <span className={cn(
+                                        'inline-flex items-center px-1.5 py-0.5 rounded text-[11px] font-medium',
+                                        user.isActive
+                                            ? 'bg-success-50 text-success-700 dark:bg-success-900/30 dark:text-success-400'
+                                            : 'bg-gray-100 text-gray-800'
+                                    )}>
+                                        {user.isActive ? (
+                                            <CheckCircle className="w-2.5 h-2.5 mr-0.5" />
+                                        ) : (
+                                            <XCircle className="w-2.5 h-2.5 mr-0.5" />
+                                        )}
+                                        {user.isActive ? 'Active' : 'Inactive'}
+                                    </span>
+                                </div>
+                            </div>
+                            <div className="text-[10px] uppercase tracking-wider text-gray-400 pt-0.5">
+                                Last login <span className="normal-case tracking-normal text-gray-500 tabular-nums">{user.lastLogin ? formatDate(user.lastLogin) : 'Never'}</span>
+                            </div>
+                        </div>
+                    );
+                }}
                 bulkActions={[
                     {
                         icon: Unlock,

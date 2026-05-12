@@ -637,6 +637,66 @@ export function UsersList() {
                 onSelectionChange={setSelectedIds}
                 isRowSelectable={(user) => user.id !== currentUser?.id}
                 rowActions={getRowActions}
+                onRowClick={(user) => navigate({ to: `/admin/users/${user.id}` })}
+                mobileCard={(user) => (
+                    <div className="px-4 py-3 space-y-2">
+                        <div className="flex items-start justify-between gap-2">
+                            <div className="flex items-center min-w-0 flex-1">
+                                <div className="flex-shrink-0 h-9 w-9 rounded-full bg-primary-50 flex items-center justify-center">
+                                    <UserIcon className="h-4 w-4 text-primary-600" />
+                                </div>
+                                <div className="ml-3 min-w-0 flex-1">
+                                    <div className="text-sm font-medium text-gray-900 truncate">
+                                        {user.firstName || user.lastName
+                                            ? `${user.firstName || ''} ${user.lastName || ''}`.trim()
+                                            : user.username}
+                                        {user.id === currentUser?.id && (
+                                            <span className="auth-mono-label ml-2 text-primary-600">(you)</span>
+                                        )}
+                                    </div>
+                                    <div className="text-xs text-gray-500 truncate">{user.email}</div>
+                                </div>
+                            </div>
+                            <span className={cn(
+                                'inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium shrink-0',
+                                getRoleColor(user.role)
+                            )}>
+                                {getRoleIcon(user.role)}
+                                {user.role}
+                            </span>
+                        </div>
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                            <span className={cn(
+                                'inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium',
+                                user.isActive
+                                    ? 'bg-success-50 text-success-700'
+                                    : 'bg-gray-100 text-gray-800'
+                            )}>
+                                {user.isActive ? (
+                                    <CheckCircle className="w-2.5 h-2.5 mr-0.5" />
+                                ) : (
+                                    <XCircle className="w-2.5 h-2.5 mr-0.5" />
+                                )}
+                                {user.isActive ? 'Active' : 'Inactive'}
+                            </span>
+                            {user.isVerified && (
+                                <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[11px] font-medium bg-primary-50 text-primary-700">
+                                    Verified
+                                </span>
+                            )}
+                        </div>
+                        <div className="grid grid-cols-2 gap-2 text-xs pt-1">
+                            <div className="min-w-0">
+                                <div className="text-[10px] uppercase tracking-wider text-gray-400">Last login</div>
+                                <div className="text-gray-500 tabular-nums truncate">{user.lastLogin ? formatDate(user.lastLogin) : 'Never'}</div>
+                            </div>
+                            <div className="min-w-0">
+                                <div className="text-[10px] uppercase tracking-wider text-gray-400">Created</div>
+                                <div className="text-gray-500 tabular-nums truncate">{formatDate(user.createdAt)}</div>
+                            </div>
+                        </div>
+                    </div>
+                )}
                 bulkActions={[
                     {
                         icon: Trash2,

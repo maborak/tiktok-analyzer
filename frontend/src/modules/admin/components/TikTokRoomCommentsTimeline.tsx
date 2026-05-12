@@ -34,7 +34,8 @@ import {
   X,
 } from 'lucide-react';
 
-import { tiktokApi, type TikTokEvent } from '@admin/services/tiktok';
+import { type TikTokEvent } from '@admin/services/tiktok';
+import { useTikTokApi } from '@admin/contexts/TikTokApiContext';
 import { TikTokUserBadges, type IdentityBlock } from './TikTokUserBadges';
 import {
   useTikTokTimezone,
@@ -129,6 +130,7 @@ export function TikTokRoomCommentsTimeline({
   onTotalChange,
   onSelectUser,
 }: RoomCommentsTimelineProps) {
+  const tiktokApi = useTikTokApi();
   const { tz } = useTikTokTimezone();
   // Stable string key for the extras — array identity flips every
   // render even when contents don't.

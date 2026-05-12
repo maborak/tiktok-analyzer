@@ -134,8 +134,8 @@ export function TicketCategories() {
                         Loading categories...
                     </div>
                 ) : (
-                    <div className="overflow-x-auto">
-                        <table className="min-w-full divide-y divide-gray-200 text-sm text-left">
+                    <>
+                        <table className="hidden md:table min-w-full divide-y divide-gray-200 text-sm text-left">
                             <thead className="bg-gray-50">
                                 <tr>
                                     <th className="auth-mono-label px-6 py-3 text-left">Name</th>
@@ -190,7 +190,61 @@ export function TicketCategories() {
                                 )}
                             </tbody>
                         </table>
-                    </div>
+
+                        {/* Mobile: card list — one card per category. */}
+                        {categories.length === 0 ? (
+                            <div className="md:hidden px-6 py-10 text-center text-gray-500">
+                                No categories found. Create one.
+                            </div>
+                        ) : (
+                            <ul className="md:hidden flex flex-col gap-2 p-2">
+                                {categories.map(category => (
+                                    <li
+                                        key={category.id}
+                                        className={clsx(
+                                            "rounded-md border border-gray-200 bg-white dark:bg-white/[0.03] px-3 py-2.5 hover:bg-gray-50 transition-colors",
+                                            !category.is_active && "opacity-60"
+                                        )}
+                                    >
+                                        <div className="flex items-start justify-between gap-2 mb-1">
+                                            <div className="min-w-0 flex-1 text-sm font-medium text-gray-900 truncate">
+                                                {category.name}
+                                            </div>
+                                            <span className={clsx(
+                                                "shrink-0 inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium",
+                                                category.is_active
+                                                    ? "bg-success-50 text-success-700 dark:bg-success-500/10 dark:text-success-300"
+                                                    : "bg-gray-100 text-gray-800"
+                                            )}>
+                                                {category.is_active ? 'Active' : 'Archived'}
+                                            </span>
+                                        </div>
+                                        {category.description && (
+                                            <div className="text-xs text-gray-500 mb-2">
+                                                {category.description}
+                                            </div>
+                                        )}
+                                        <div className="flex justify-end gap-2">
+                                            <Button
+                                                variant="secondary"
+                                                onClick={() => handleToggleStatus(category)}
+                                                className="h-8 py-0 px-3 text-xs"
+                                            >
+                                                {category.is_active ? 'Archive' : 'Activate'}
+                                            </Button>
+                                            <Button
+                                                variant="secondary"
+                                                onClick={() => openEditModal(category)}
+                                                className="h-8 py-0 px-3 text-xs"
+                                            >
+                                                <Edit className="w-4 h-4" />
+                                            </Button>
+                                        </div>
+                                    </li>
+                                ))}
+                            </ul>
+                        )}
+                    </>
                 )}
             </div>
 

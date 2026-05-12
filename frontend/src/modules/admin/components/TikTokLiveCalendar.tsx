@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Calendar as CalendarIcon } from 'lucide-react';
 
-import { tiktokApi, type TikTokRoom } from '@admin/services/tiktok';
+import { type TikTokRoom } from '@admin/services/tiktok';
+import { useTikTokApi } from '@admin/contexts/TikTokApiContext';
 import {
   useTikTokTimezone,
   dateKeyInZone,
@@ -56,6 +57,7 @@ export function TikTokLiveCalendar({
   rooms,
   onSelectDay,
 }: Props) {
+  const tiktokApi = useTikTokApi();
   const { tz } = useTikTokTimezone();
   const [data, setData] = useState<CalendarData | null>(null);
   const [loading, setLoading] = useState(false);

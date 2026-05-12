@@ -331,8 +331,8 @@ export function RolesList() {
 
       {/* Table */}
       <div className="card p-0 overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="min-w-full divide-y divide-gray-200">
+        <>
+          <table className="hidden md:table min-w-full divide-y divide-gray-200">
             <thead className="bg-gray-50">
               <tr>
                 <th className="auth-mono-label px-6 py-3 text-left">
@@ -464,7 +464,109 @@ export function RolesList() {
               )}
             </tbody>
           </table>
-        </div>
+
+          {/* Mobile: card list — one card per role. */}
+          <div className={`md:hidden ${loading ? 'opacity-50' : ''}`}>
+            {loading ? (
+              <div className="px-6 py-12 flex items-center justify-center">
+                <Loader2 className="h-6 w-6 animate-spin text-primary-600" />
+              </div>
+            ) : roles.length === 0 ? (
+              <div className="px-6 py-12 text-center">
+                <Shield className="mx-auto h-12 w-12 text-gray-400" />
+                <h3
+                  className="mt-2 text-sm font-medium text-gray-900"
+                  style={{ fontFamily: 'var(--font-mono-display)', letterSpacing: 'var(--tracking-display-tight)' }}
+                >
+                  No roles found
+                </h3>
+                <p className="page-subtitle mt-1">Create a new role to get started</p>
+              </div>
+            ) : (
+              <ul className="flex flex-col gap-2 p-2">
+                {roles.map((role) => (
+                  <li
+                    key={role.id}
+                    className="rounded-md border border-gray-200 bg-white dark:bg-white/[0.03] px-3 py-2.5 hover:bg-gray-50 transition-colors"
+                  >
+                    <div className="flex items-start justify-between gap-2 mb-2">
+                      <div className="min-w-0 flex-1 flex items-center gap-2">
+                        <Shield className="h-4 w-4 text-gray-400 shrink-0" />
+                        <span className="text-sm font-medium text-gray-900 truncate">{role.name}</span>
+                      </div>
+                      <div className="shrink-0 flex items-center gap-1">
+                        <button
+                          onClick={() => navigate({ to: `/admin/rbac/roles/${role.id}` })}
+                          className="text-gray-500 hover:text-primary-400 p-1 transition-colors"
+                          title="View details"
+                        >
+                          <Eye className="h-4 w-4" />
+                        </button>
+                        <button
+                          onClick={() => navigate({ to: `/admin/rbac/roles/${role.id}/edit` })}
+                          className="text-gray-500 hover:text-primary-400 p-1 transition-colors"
+                          title="Edit role"
+                        >
+                          <Edit className="h-4 w-4" />
+                        </button>
+                        {!role.is_system ? (
+                          <button
+                            onClick={() => setDeleteRoleId(role.id)}
+                            className="text-gray-500 hover:text-primary-400 p-1 transition-colors"
+                            title="Delete role"
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </button>
+                        ) : (
+                          <span className="p-1 text-gray-300" title="System roles cannot be deleted">
+                            <Trash2 className="h-4 w-4" />
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                    {role.description && (
+                      <div className="text-xs text-gray-600 mb-2">
+                        {role.description}
+                      </div>
+                    )}
+                    <div className="grid grid-cols-3 gap-2">
+                      <div>
+                        <div className="text-[10px] uppercase tracking-wider text-gray-400 mb-0.5">Type</div>
+                        {role.is_system ? (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-primary-100 text-primary-800 dark:bg-primary-500/15 dark:text-primary-300">
+                            <Lock className="h-3 w-3" />
+                            System
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium bg-gray-100 text-gray-800">
+                            Custom
+                          </span>
+                        )}
+                      </div>
+                      <div>
+                        <div className="text-[10px] uppercase tracking-wider text-gray-400 mb-0.5">Status</div>
+                        <span
+                          className={`inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium ${role.is_active
+                            ? 'bg-success-50 text-success-700 dark:bg-success-500/10 dark:text-success-300'
+                            : 'bg-error-50 text-error-700 dark:bg-error-500/10 dark:text-error-300'
+                            }`}
+                        >
+                          {role.is_active ? 'Active' : 'Inactive'}
+                        </span>
+                      </div>
+                      <div>
+                        <div className="text-[10px] uppercase tracking-wider text-gray-400 mb-0.5">Created</div>
+                        <div className="text-[11px] text-gray-500 tabular-nums">
+                          {formatRelativeTime(role.created_at)}
+                        </div>
+                      </div>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </>
 
         {/* Pagination */}
         {totalPages > 1 && (

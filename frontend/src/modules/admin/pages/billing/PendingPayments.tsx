@@ -195,8 +195,8 @@ export function PendingPayments() {
                         <p className="page-subtitle mt-1">There are no pending manual payments that require verification.</p>
                     </div>
                 ) : (
-                    <div className="overflow-x-auto">
-                        <table className="min-w-full divide-y divide-gray-200">
+                    <>
+                        <table className="hidden md:table min-w-full divide-y divide-gray-200">
                             <thead className="bg-gray-50">
                                 <tr>
                                     <th scope="col" className="auth-mono-label px-6 py-3 text-left">
@@ -289,7 +289,94 @@ export function PendingPayments() {
                                 ))}
                             </tbody>
                         </table>
-                    </div>
+
+                        {/* Mobile: card list — one card per pending payment. */}
+                        <ul className="md:hidden flex flex-col gap-2 p-2">
+                            {payments.map((payment) => (
+                                <li
+                                    key={payment.id}
+                                    className="rounded-md border border-gray-200 bg-white dark:bg-white/[0.03] px-3 py-2.5 hover:bg-gray-50 transition-colors"
+                                >
+                                    <div className="flex items-start justify-between gap-2 mb-2">
+                                        <div className="min-w-0 flex-1 flex items-start gap-2">
+                                            <input
+                                                type="checkbox"
+                                                className="h-4 w-4 text-primary-600 focus:ring-primary-500 border-gray-200 rounded mt-0.5 shrink-0"
+                                                checked={selectedIds.has(payment.id)}
+                                                onChange={() => toggleSelection(payment.id)}
+                                            />
+                                            <div className="min-w-0 flex-1">
+                                                <div className="text-sm font-medium text-gray-900 truncate">{payment.user_email}</div>
+                                                <div className="flex gap-2 items-center mt-0.5">
+                                                    <span className="text-[11px] text-gray-500">ID: {payment.user_id}</span>
+                                                    <button onClick={() => viewUserDetails(payment.user_id)} className="text-[11px] text-primary-600 hover:text-primary-800 dark:text-primary-300 underline flex items-center gap-1">
+                                                        <UserIcon className="h-3 w-3" /> Details
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        </div>
+                                        <span className={`shrink-0 inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${payment.provider === 'BITCOIN' ? 'bg-warning-100 text-warning-700 dark:bg-warning-500/15 dark:text-warning-300' : 'bg-primary-50 text-primary-700 dark:bg-primary-500/10 dark:text-primary-300'
+                                            }`}>
+                                            {payment.provider}
+                                        </span>
+                                    </div>
+                                    <div className="grid grid-cols-3 gap-2 mb-2">
+                                        <div>
+                                            <div className="text-[10px] uppercase tracking-wider text-gray-400 mb-0.5">Amount</div>
+                                            <div className="text-sm text-gray-900 font-medium tabular-nums">
+                                                {payment.currency} {payment.amount.toFixed(2)}
+                                            </div>
+                                        </div>
+                                        <div>
+                                            <div className="text-[10px] uppercase tracking-wider text-gray-400 mb-0.5">Package</div>
+                                            <div className="text-xs text-gray-500 truncate">
+                                                {payment.package_name || 'Credit Package'}
+                                            </div>
+                                        </div>
+                                        <div>
+                                            <div className="text-[10px] uppercase tracking-wider text-gray-400 mb-0.5">Date</div>
+                                            <div className="text-xs text-gray-500 tabular-nums">
+                                                {new Date(payment.created_at).toLocaleDateString()}
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div className="mb-2">
+                                        <div className="text-[10px] uppercase tracking-wider text-gray-400 mb-0.5">Invoice</div>
+                                        {payment.invoice_number ? (
+                                            <div className="flex items-center gap-2">
+                                                <span className="text-xs font-medium text-gray-900">{payment.invoice_number}</span>
+                                                <span className="text-[10px] text-gray-500 uppercase">{payment.invoice_status}</span>
+                                            </div>
+                                        ) : (
+                                            <span className="text-xs text-gray-400 italic">No Invoice</span>
+                                        )}
+                                    </div>
+                                    <div className="flex items-center justify-end gap-2">
+                                        <button
+                                            onClick={() => handleVerify(payment.id, 'approve')}
+                                            disabled={processingId === payment.id}
+                                            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-success-50 text-success-700 dark:bg-success-500/10 dark:text-success-300 hover:bg-success-50 font-medium transition-colors disabled:opacity-50 text-xs"
+                                        >
+                                            {processingId === payment.id ? (
+                                                <RefreshCw className="h-4 w-4 animate-spin" />
+                                            ) : (
+                                                <CheckCircle className="h-4 w-4" />
+                                            )}
+                                            Approve
+                                        </button>
+                                        <button
+                                            onClick={() => handleVerify(payment.id, 'reject')}
+                                            disabled={processingId === payment.id}
+                                            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-error-50 text-error-700 dark:bg-error-500/10 dark:text-error-300 hover:bg-error-50 font-medium transition-colors disabled:opacity-50 text-xs"
+                                        >
+                                            <XCircle className="h-4 w-4" />
+                                            Reject
+                                        </button>
+                                    </div>
+                                </li>
+                            ))}
+                        </ul>
+                    </>
                 )}
 
                 {/* Pagination */}

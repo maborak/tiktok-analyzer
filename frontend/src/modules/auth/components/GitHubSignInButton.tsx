@@ -1,5 +1,6 @@
 import { useCallback } from 'react';
 import { githubConfig } from '@/config/env';
+import { startOAuthFlow } from '@/utils/oauthState';
 
 /**
  * GitHub Sign-In button using the full-redirect OAuth flow.
@@ -7,15 +8,21 @@ import { githubConfig } from '@/config/env';
  * Clicking redirects to GitHub's authorization page. After the user authorizes,
  * GitHub redirects back to /auth/github/callback with a ?code= parameter.
  * The GitHubCallbackPage handles the code exchange.
+ *
+ * Embeds a CSPRNG `state` parameter that the callback verifies against
+ * sessionStorage. Defends against login-CSRF / account-fixation per
+ * audit FE-CRITICAL #2.
  */
 export function GitHubSignInButton() {
   const handleClick = useCallback(() => {
+    const state = startOAuthFlow('github', { intent: 'signin' });
     const redirectUri = `${window.location.origin}/auth/github/callback`;
     const params = new URLSearchParams({
       client_id: githubConfig.clientId,
       redirect_uri: redirectUri,
       scope: 'user:email',
       prompt: 'select_account',
+      state,
     });
     window.location.href = `https://github.com/login/oauth/authorize?${params.toString()}`;
   }, []);

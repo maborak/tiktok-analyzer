@@ -1,24 +1,29 @@
 """TikTok public-profile scraper.
 
-We need profile info (nickname, avatar, follower count, live state) for
-creators we monitor. TikTokLive only knows the webcast API, which gates
-most accounts behind a session cookie. Two unauth-friendly paths exist
-on the public site:
+Two-phase probe with explicit responsibility split:
 
-  1. ``https://www.tiktok.com/@<handle>/live`` — has a `SIGI_STATE` JSON
-     blob whose `LiveRoom.liveRoomUserInfo.user` carries everything we
-     care about plus current live state (`status` == 2 means live, 4
-     means ended; `roomId` is set when live).
-  2. ``https://www.tiktok.com/@<handle>`` — has a richer
-     `__UNIVERSAL_DATA_FOR_REHYDRATION__` blob under
-     `webapp.user-detail.userInfo`. More stats (videoCount, heartCount,
-     friendCount) than the live page.
+  1. **Live status (authoritative)** — Euler-signed
+     `client.web.fetch_room_info(unique_id=handle)`. Hits
+     `webcast.us.tiktok.com`, not the public website, so the
+     anti-bot WAF doesn't apply. Returns `UserOfflineError` for
+     non-live creators (confident False), data for live ones
+     (confident True + room_id + basic identity from `data.owner`).
+     Costs 1 Euler sign per call — paid Euler tier comfortably
+     sustains this; free tier will rate-limit.
 
-In practice TikTok's anti-bot WAF (SlardarWAF) hits the bare profile URL
-much more aggressively than `/live`, so we try `/live` first and fall
-back to the profile URL only when the live page didn't yield useful
-data. Both endpoints can hit captcha challenges; we detect the WAF
-response shape and surface a clear error rather than silently failing.
+  2. **Profile stats (best-effort enrichment)** — anonymous
+     ``https://www.tiktok.com/@<handle>`` HTML scrape, parsing
+     `__UNIVERSAL_DATA_FOR_REHYDRATION__` for follower / video /
+     like / friend counts + bio + verified flag. None of these
+     come from the WebCast API, so this path is the only source.
+     WAF / 403 on this URL is now a *stats degradation*, not a
+     live-status problem — the supervisor's recycle decisions
+     rely solely on the Euler-derived `is_live`.
+
+The legacy ``/@<handle>/live`` HTML probe is gone. Its only unique
+value was live-status discovery, which Euler does better (signed,
+no WAF gate, also returns room_id). Keeping it would mean two
+anonymous HTTP calls per cycle for redundant data.
 """
 
 from __future__ import annotations
@@ -37,13 +42,6 @@ _UNIVERSAL_TAG = re.compile(
     re.DOTALL,
 )
 
-# Legacy tag, still present on /@user/live pages — carries everything we
-# need for the live path (less data than the profile path, but enough).
-_SIGI_TAG = re.compile(
-    r'<script id="SIGI_STATE"[^>]*>(.+?)</script>',
-    re.DOTALL,
-)
-
 # Sticky WAF page footprint: ~1.5KB HTML with a slardar-config script,
 # no profile data.
 _WAF_MARKER = "slardar-config"
@@ -52,7 +50,18 @@ _WAF_MARKER = "slardar-config"
 def _empty_record(handle: str) -> dict[str, Any]:
     return {
         "exists": None,
-        "is_live": False,
+        # TRI-STATE: True / False / None. Defaults to None ("unknown")
+        # because reaching this fn before any probe path runs means
+        # we haven't observed live status yet. The old default of
+        # `False` was load-bearing wrong: when both probe paths
+        # failed (TikTok 403'd / WAF'd / parse error), the record
+        # was returned with is_live=False — which the supervisor
+        # treated as a CONFIDENT "user offline" signal and recycled
+        # the session. Working live sessions got evicted because
+        # TikTok blocked our metadata probe. Keeping it `None` here
+        # forces the merge functions below to ONLY flip to True or
+        # False when they have actual ground truth.
+        "is_live": None,
         "room_id": None,
         "user_id": None,
         "sec_uid": None,
@@ -64,9 +73,6 @@ def _empty_record(handle: str) -> dict[str, Any]:
         "private": None,
         "follower_count": None,
         "following_count": None,
-        "video_count": None,
-        "like_count": None,
-        "friend_count": None,
         "error": None,
     }
 
@@ -113,34 +119,51 @@ async def fetch_public_profile(handle: str) -> dict[str, Any]:
     client = TikTokLiveClient(unique_id=f"@{handle}")
 
     try:
-        # Path 1: /live — preferred. Often succeeds when /@user is WAF'd.
-        live_payload = await _fetch_live_page(client, handle, debug_records)
-        if live_payload is not None:
-            _merge_from_live(out, live_payload)
+        # ── Step 1: Euler — live status + identity (AUTHORITATIVE) ──
+        # Always fires. Webcast.us.tiktok.com isn't gated by the
+        # public-site WAF, so this is the reliable discovery path.
+        # On success: sets `is_live`, room_id, nickname, avatar,
+        # user_id, exists=True. On UserOfflineError: confident
+        # `is_live=False`. On UserNotFoundError: `exists=False`.
+        # On any other failure (rate-limit, sign error, network):
+        # leaves `is_live=None` so the supervisor doesn't make a
+        # confident wrong call.
+        await _probe_euler_room_info(client, handle, out, debug_records)
 
-        # Path 2: profile root — richer stats.
-        need_profile_fallback = (
-            out["nickname"] is None
-            or out["follower_count"] is None
-            or out["video_count"] is None
+        # ── Step 2: Anonymous /@handle — RICH STATS ONLY ────────────
+        # Source of follower / video / like / friend counts + bio +
+        # verified flag. None of those appear in Euler's room
+        # response, so this scrape is the only path that fills them.
+        # Failure here is purely a stats freshness issue — the
+        # supervisor's recycle decisions don't touch these fields.
+        # The DB just keeps last-known values; UI shows them slightly
+        # stale rather than blank.
+        profile_payload = await _fetch_profile_page(
+            client, handle, debug_records,
         )
-        if need_profile_fallback:
-            profile_payload = await _fetch_profile_page(
-                client, handle, debug_records,
-            )
-            if profile_payload == "WAF":
-                if out["nickname"] is None:
-                    out["error"] = "TikTok WAF blocked our preview probe."
-            elif profile_payload == "NOTFOUND":
-                out["exists"] = False
-                out["error"] = "User not found on TikTok."
-            elif isinstance(profile_payload, dict):
-                _merge_from_profile(out, profile_payload)
-                out["exists"] = True
+        if profile_payload == "WAF":
+            # Stats degraded but live status (from Euler) is fine.
+            # Surface a soft warning so the diagnostic UI can show
+            # "stats probe WAF'd, live status from Euler is OK".
+            if out["nickname"] is None:
+                # Only flag a hard error if Euler didn't fill identity
+                # either (creator currently offline + stats WAF'd).
+                out["error"] = "TikTok WAF blocked stats probe (live status from Euler still OK)."
+        elif profile_payload == "NOTFOUND":
+            # Profile page 404 is more authoritative for existence
+            # than Euler's UserNotFoundError (which Euler sometimes
+            # masks as offline). Override.
+            out["exists"] = False
+            out["error"] = "User not found on TikTok."
+        elif isinstance(profile_payload, dict):
+            _merge_from_profile(out, profile_payload)
+            out["exists"] = True
 
-        # If neither path filled anything, surface the most informative error.
+        # Final `exists` resolution: Euler succeeding implies the
+        # account exists; the stats scrape confirms it. When both
+        # paths failed entirely, leave `exists=None` (unknown) and
+        # surface a clear error.
         if out["exists"] is None and out["nickname"] is None:
-            out["exists"] = None
             if not out["error"]:
                 out["error"] = "Could not retrieve any profile data."
         elif out["nickname"] and out["exists"] is None:
@@ -201,105 +224,139 @@ def _probe_debug(
     }
 
 
-async def _fetch_live_page(
-    client, handle: str, debug_sink: list[dict[str, Any]] | None = None,
-) -> dict | None:
-    """Return the parsed `LiveRoom.liveRoomUserInfo` dict, or None on
-    any failure / WAF / missing data. When a `debug_sink` list is
-    passed, append a structured diagnostic record on every failure
-    path so the caller can surface it."""
-    url = f"https://www.tiktok.com/@{handle}/live"
+async def _probe_euler_room_info(
+    client,
+    handle: str,
+    out: dict[str, Any],
+    debug_sink: list[dict[str, Any]] | None,
+) -> None:
+    """Euler-signed liveness + identity probe. PRIMARY path.
+
+    Calls TikTokLive's `client.web.fetch_room_info(unique_id=...)`,
+    which hits `webcast.us.tiktok.com` with an Euler-signed request.
+    Different host from the public profile page, different auth
+    surface — the public-site WAF doesn't gate this endpoint.
+
+    Mutates `out` in place. Four observable outcomes:
+
+      - Live: sets `is_live=True`, `room_id`, plus nickname /
+        avatar / user_id from `data.owner`. Marks `exists=True`.
+      - Offline (UserOfflineError): sets `is_live=False`. Note
+        the response carries no identity in this branch — UI
+        keeps last-known nickname/avatar from a previous probe.
+      - Not found (UserNotFoundError): marks `exists=False`,
+        `is_live=False`.
+      - Indeterminate (rate-limit, sign error, network): leaves
+        `is_live` and `exists` at their current values (typically
+        `None`). The stats scrape that runs next still gets to
+        try; if it succeeds, we at least have identity.
+
+    NEVER raises. Cost: 1 Euler sign request per call. With a paid
+    Euler API key this runs every probe cycle (~12/min sustained
+    for 72 handles); free tier will quickly rate-limit.
+    """
+    url_label = "webcast/room/info (Euler-signed)"
     try:
-        resp = await client.web.get(url=url, base_params=False)
-    except Exception as e:
-        logger.debug("/live fetch error for @%s: %r", handle, e)
-        if debug_sink is not None:
-            debug_sink.append({
-                "url": url, "status": None, "body_len": 0,
-                "snippet": "", "reason": f"exception: {type(e).__name__}: {e}",
-            })
-        return None
-    status = getattr(resp, "status_code", None)
-    text = getattr(resp, "text", "") or ""
-    if _detect_waf(text):
-        logger.warning(
-            "WAF detected on %s for @%s (status=%s len=%d); first 200 chars: %s",
-            url, handle, status, len(text), text[:200].replace("\n", " "),
+        # Lazy import — the error classes live deep in TikTokLive
+        # and we don't want to pay the import cost on every call.
+        from TikTokLive.client.errors import (
+            UserOfflineError,
+            UserNotFoundError,
         )
-        if debug_sink is not None:
-            debug_sink.append(_probe_debug(
-                url=url, status=status, body=text, reason="waf",
-            ))
-        return None
-    m = _SIGI_TAG.search(text)
-    if not m:
-        if debug_sink is not None:
-            debug_sink.append(_probe_debug(
-                url=url, status=status, body=text,
-                reason="no SIGI_STATE script tag",
-            ))
-        return None
+    except Exception:
+        UserOfflineError = Exception  # type: ignore[assignment,misc]
+        UserNotFoundError = Exception  # type: ignore[assignment,misc]
+
     try:
-        sigi = json.loads(m.group(1))
-    except (TypeError, ValueError) as e:
-        if debug_sink is not None:
-            debug_sink.append(_probe_debug(
-                url=url, status=status, body=m.group(1),
-                reason=f"sigi json parse: {e}",
-            ))
-        return None
-    live_room = sigi.get("LiveRoom") if isinstance(sigi, dict) else None
-    if not isinstance(live_room, dict):
+        info = await client.web.fetch_room_info(unique_id=handle)
+    except UserOfflineError:
+        # TikTok says the creator isn't currently broadcasting.
+        # Confident `False` — supervisor can safely deprioritise.
+        out["is_live"] = False
         if debug_sink is not None:
             debug_sink.append({
-                "url": url, "status": status, "body_len": len(text),
-                "snippet": "", "reason": "no LiveRoom in SIGI_STATE",
+                "url": url_label, "status": None, "body_len": 0,
+                "snippet": "", "reason": "euler fallback: UserOfflineError",
             })
-        return None
-    info = live_room.get("liveRoomUserInfo")
-    if not isinstance(info, dict) and debug_sink is not None:
-        debug_sink.append({
-            "url": url, "status": status, "body_len": len(text),
-            "snippet": "", "reason": "no liveRoomUserInfo",
-        })
-    return info if isinstance(info, dict) else None
-
-
-def _merge_from_live(out: dict[str, Any], live_info: dict[str, Any]) -> None:
-    user = live_info.get("user") or {}
-    stats = live_info.get("stats") or user.get("stats") or {}
-    if not isinstance(user, dict):
         return
-    out["exists"] = True
-    out["unique_id"] = user.get("uniqueId") or out["unique_id"]
-    uid = user.get("id")
-    out["user_id"] = str(uid) if uid else None
-    out["sec_uid"] = user.get("secUid") or out["sec_uid"]
-    out["nickname"] = user.get("nickname") or out["nickname"]
-    out["bio"] = user.get("signature") or out["bio"]
-    if user.get("verified") is not None:
-        out["verified"] = bool(user.get("verified"))
-    avatar = (
-        user.get("avatarLarger")
-        or user.get("avatarMedium")
-        or user.get("avatarThumb")
-    )
-    if avatar:
-        out["avatar_url"] = avatar
+    except UserNotFoundError:
+        # Account doesn't exist on TikTok. Mark as such; the
+        # supervisor and UI both check `exists`.
+        out["exists"] = False
+        out["is_live"] = False
+        if debug_sink is not None:
+            debug_sink.append({
+                "url": url_label, "status": None, "body_len": 0,
+                "snippet": "", "reason": "euler fallback: UserNotFoundError",
+            })
+        return
+    except Exception as e:
+        # Sign error / rate-limit / network. Don't pretend we know.
+        if debug_sink is not None:
+            debug_sink.append({
+                "url": url_label, "status": None, "body_len": 0,
+                "snippet": "",
+                "reason": f"euler fallback failed: {type(e).__name__}: {e}",
+            })
+        return
 
-    # Live signal: status==2 means live, 4 means ended, else not live.
-    status = user.get("status")
-    if status == 2:
+    # Successful response. Two possible shapes:
+    #   1. Outer envelope: {"data": {...}, "status": 0, ...}
+    #   2. Raw room dict (when the library normalises early).
+    # The existing `lookup_handle` code unwraps the same way.
+    if not isinstance(info, dict):
+        if debug_sink is not None:
+            debug_sink.append({
+                "url": url_label, "status": None, "body_len": 0,
+                "snippet": "",
+                "reason": f"euler fallback: unexpected response type {type(info).__name__}",
+            })
+        return
+    data = info.get("data", info)
+    if not isinstance(data, dict) or not data:
+        # Empty envelope — TikTokLive sometimes returns this instead
+        # of raising. Treat as "not live" (no active room found).
+        out["is_live"] = False
+        if debug_sink is not None:
+            debug_sink.append({
+                "url": url_label, "status": None, "body_len": 0,
+                "snippet": "", "reason": "euler fallback: empty envelope",
+            })
+        return
+
+    # Status field semantics match the SIGI path: 2 = live, anything
+    # else = not live. Some payloads omit `status` and signal liveness
+    # through the presence of `id` (room_id) + a non-empty `title`.
+    status = data.get("status")
+    room_id = data.get("id") or data.get("room_id")
+    if status == 2 or (status is None and room_id):
         out["is_live"] = True
-        rid = user.get("roomId")
-        if rid and str(rid) != "0":
-            out["room_id"] = str(rid)
+        if room_id and str(room_id) != "0":
+            out["room_id"] = str(room_id)
+        # Reuse the nicknames / avatars / counts the response carries
+        # so this isn't ONLY a liveness probe — fills the cache too.
+        owner = data.get("owner") or {}
+        if isinstance(owner, dict):
+            if not out.get("nickname"):
+                out["nickname"] = owner.get("nickname")
+            if not out.get("user_id") and owner.get("id"):
+                out["user_id"] = str(owner["id"])
+            if not out.get("avatar_url"):
+                ava = owner.get("avatar_medium") or owner.get("avatar_thumb")
+                if isinstance(ava, dict):
+                    urls = ava.get("url_list") or []
+                    if urls:
+                        out["avatar_url"] = urls[0]
+        out["exists"] = True
+        return
 
-    if isinstance(stats, dict):
-        if stats.get("followerCount") is not None:
-            out["follower_count"] = _opt_int(stats.get("followerCount"))
-        if stats.get("followingCount") is not None:
-            out["following_count"] = _opt_int(stats.get("followingCount"))
+    # Status set but != 2 → confirmed offline.
+    out["is_live"] = False
+    if debug_sink is not None:
+        debug_sink.append({
+            "url": url_label, "status": None, "body_len": 0, "snippet": "",
+            "reason": f"euler fallback: status={status} (not live)",
+        })
 
 
 # ─── /@user path ───────────────────────────────────────────────────
@@ -397,11 +454,3 @@ def _merge_from_profile(out: dict[str, Any], info: dict[str, Any]) -> None:
             out["follower_count"] = _opt_int(stats.get("followerCount"))
         if stats.get("followingCount") is not None:
             out["following_count"] = _opt_int(stats.get("followingCount"))
-        if stats.get("videoCount") is not None:
-            out["video_count"] = _opt_int(stats.get("videoCount"))
-        if stats.get("heartCount") is not None or stats.get("heart") is not None:
-            out["like_count"] = _opt_int(
-                stats.get("heartCount") or stats.get("heart")
-            )
-        if stats.get("friendCount") is not None:
-            out["friend_count"] = _opt_int(stats.get("friendCount"))

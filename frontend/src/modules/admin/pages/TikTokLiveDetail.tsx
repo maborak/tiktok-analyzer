@@ -29,17 +29,18 @@ import {
   type TikTokSubscription,
   type TikTokWsEvent,
   openTikTokWebSocket,
-  tiktokApi,
 } from '@admin/services/tiktok';
 import { MultiLineChart, eventColor } from '@admin/components/TikTokCharts';
 import { EChartsRangeArea } from '@admin/components/EChartsRangeArea';
 import { AnimatedScore } from '@admin/components/AnimatedScore';
 import { TikTokAddLiveModal } from '@admin/components/TikTokAddLiveModal';
-import { TikTokGifterModal } from '@admin/components/TikTokGifterModal';
+import { TikTokGifterDetailModal } from '@admin/components/TikTokGifterDetailModal';
 import { TikTokBroadcastSelector } from '@admin/components/TikTokBroadcastSelector';
+import { TikTokRealtimeIndicator } from '@admin/components/TikTokRealtimeIndicator';
 import { TikTokMatchEventsModal } from '@admin/components/TikTokMatchEventsModal';
 import { TikTokRoomCommentsTimeline } from '@admin/components/TikTokRoomCommentsTimeline';
 import { TikTokRoomGiftersTable } from '@admin/components/TikTokRoomGiftersTable';
+import { TikTokRoomCrossLiveGiftersTable } from '@admin/components/TikTokRoomCrossLiveGiftersTable';
 import { TikTokRoomRecipientsCard } from '@admin/components/TikTokRoomRecipientsCard';
 import { TikTokLiveCalendar } from '@admin/components/TikTokLiveCalendar';
 import {
@@ -53,6 +54,11 @@ import {
   dateKeyInZone,
   zoneDayBoundsUtc,
 } from '@admin/contexts/TikTokTimezoneContext';
+import { useTikTokApi } from '@admin/contexts/TikTokApiContext';
+import {
+  TikTokRuntimeConfigProvider,
+  useTikTokRuntimeConfig,
+} from '@admin/contexts/TikTokRuntimeConfigContext';
 import { TIMEZONE_OPTIONS } from '@admin/contexts/timezoneOptions';
 
 /**
@@ -77,20 +83,56 @@ const BROADCAST_WINDOW: WindowOption = {
   label: 'Entire broadcast',
 };
 
-export function TikTokLiveDetail() {
-  // Wrap the whole page in the timezone provider so every formatter
-  // call below — including those inside child components like the
-  // calendar, broadcast selector, comments timeline, and matches
-  // panel — sees the same `tz` context. The provider has to wrap
-  // the component that consumes it, so we extract the body.
+/** Props for the live-detail page.
+ *
+ *  `readOnly` is set to `true` when this component is rendered behind
+ *  the unauthenticated `/lives/$handle` public route — the same React
+ *  tree as `/admin/tiktok/$handle`, minus every admin-only affordance
+ *  (Add-Rival monitor pills, write actions, listener-status debug,
+ *  etc.). The default `false` preserves every admin call site untouched.
+ *
+ *  The API namespace itself swaps via `TikTokApiContext` — there is no
+ *  `api` prop here. Public usage wraps the component in
+ *  `<TikTokApiProvider value={publicTiktokApi}>` so every `useTikTokApi`
+ *  consumer in the subtree hits `/public/tiktok/*` instead of
+ *  `/admin/tiktok/*`. */
+interface TikTokLiveDetailProps {
+  /** When true, hide every admin-write affordance — rival add-to-monitor
+   *  pills + their confirmation modal, the probe-debug button (which
+   *  reads worker_log), and any future delete/pause/reconnect buttons.
+   *  Data-read panels (chart, calendar, broadcasts, top gifters,
+   *  comments timeline, past battles) stay fully interactive. */
+  readOnly?: boolean;
+}
+
+export function TikTokLiveDetail({ readOnly = false }: TikTokLiveDetailProps = {}) {
+  // Two providers wrap the body: timezone (per-page tz preference)
+  // and runtime-config (TikTok poll cadence + WS-vs-poll modes from
+  // typed admin config).
+  //
+  // The runtime-config audience is `admin` for admin mounts (full
+  // set of keys from `/admin/tiktok/runtime-config` behind auth) and
+  // `public` for the readOnly mount used by `/lives/<handle>` (sees
+  // only the public-safe slice from `/public/tiktok/runtime-config`).
+  // Both audiences end up driving the same body component — the
+  // audience prop just decides which endpoint feeds the values.
   return (
     <TikTokTimezoneProvider>
-      <TikTokLiveDetailBody />
+      <TikTokRuntimeConfigProvider audience={readOnly ? 'public' : 'admin'}>
+        <TikTokLiveDetailBody readOnly={readOnly} />
+      </TikTokRuntimeConfigProvider>
     </TikTokTimezoneProvider>
   );
 }
 
-function TikTokLiveDetailBody() {
+function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
+  const tiktokApi = useTikTokApi();
+  // Runtime knobs from typed admin config (poll cadence + WS mode).
+  // `pollIntervalMs` drives the host-profile refresh below; the WS
+  // open later in this body is gated by mode + readOnly. Public WS
+  // is not yet implemented, so for `readOnly` mounts we always
+  // skip the WS regardless of `publicRealtime`.
+  const { pollIntervalMs, adminRealtime, publicRealtime } = useTikTokRuntimeConfig();
   // Route param: handle (without @).
   const { handle: rawHandle } = useParams({ strict: false }) as { handle?: string };
   const handle = (rawHandle || '').replace(/^@/, '');
@@ -149,6 +191,12 @@ function TikTokLiveDetailBody() {
     until?: string | null;
     /** Human label for the third scope chip (e.g. "This battle"). */
     windowLabel?: string;
+    /** Extra room IDs to add to the gifter modal's `extraRoomIds`.
+     *  Used when the click came from the match modal's donor panel
+     *  for an opponent-side gifter — their gift events sit in the
+     *  rival's room, which isn't in `effectiveExtraRoomIds`. Merging
+     *  these in lets the per-room searchEvents query see them too. */
+    extraRoomIds?: string[];
   } | null>(null);
   // Selected past match for the events-modal drill-in.
   const [selectedMatch, setSelectedMatch] = useState<TikTokMatch | null>(null);
@@ -315,7 +363,7 @@ function TikTokLiveDetailBody() {
     return out;
   }, [aggregatedRoomsChrono, stats?.buckets?.starts, stats?.bucket_seconds, customRange]);
   // Top Gifters card tab.
-  const [giftersTab, setGiftersTab] = useState<'gifters' | 'comments'>('gifters');
+  const [giftersTab, setGiftersTab] = useState<'gifters' | 'comments' | 'crosslive'>('gifters');
   // Scope for the gifters/comments tables. 'live' = whatever room or
   // window the chart is currently focused on (default behaviour);
   // 'alltime' = sum across every recorded room for this host. The
@@ -332,6 +380,12 @@ function TikTokLiveDetailBody() {
   // "Comments" stays uncounted until clicked.
   const [topGiftersTotal, setTopGiftersTotal] = useState<number | null>(null);
   const [commentsTotal, setCommentsTotal] = useState<number | null>(null);
+  const [crossLiveTotal, setCrossLiveTotal] = useState<number | null>(null);
+  // Clicking a cross-live gifter opens the shared cross-host detail
+  // modal (already used by /admin/tiktok/lives' Common Gifters table).
+  // The string user_id is the only piece of identity the cross-live
+  // endpoint reliably returns; the modal fetches the rest itself.
+  const [selectedCrossUserId, setSelectedCrossUserId] = useState<string | null>(null);
   // Bumped by the card-header refresh button — forwards the click into the
   // gifters table and the events timeline to force a refetch.
   const [eventsRefreshKey, setEventsRefreshKey] = useState(0);
@@ -556,21 +610,20 @@ function TikTokLiveDetailBody() {
     let cancelled = false;
     const fetchHost = () => {
       tiktokApi
-        .listLives()
-        .then((subs) => {
+        .getLiveByHandle(handle)
+        .then((me) => {
           if (cancelled) return;
-          const me = subs.find((s) => s.unique_id === handle);
           if (me) setHostProfile(me);
         })
         .catch(() => { /* fallback to whatever we had */ });
     };
     fetchHost();
-    const t = setInterval(fetchHost, 30_000);
+    const t = setInterval(fetchHost, pollIntervalMs);
     return () => {
       cancelled = true;
       clearInterval(t);
     };
-  }, [handle]);
+  }, [handle, pollIntervalMs]);
 
   // Periodic rooms-list refresh — picks up a fresh broadcast that started
   // after the page loaded (the creator went LIVE during the session).
@@ -879,7 +932,11 @@ function TikTokLiveDetailBody() {
               return true;
             });
           })
-        : tiktokApi.listMatchesForRoom(roomId, 50);
+        // Use `listMatches({ handle, room_id })` instead of the
+        // legacy `listMatchesForRoom` so the call works on both
+        // namespaces — the public endpoint requires `handle`, the
+        // admin endpoint accepts and ignores it.
+        : tiktokApi.listMatches({ handle, room_id: roomId, limit: 50 });
     fetcher
       .then((ms) => {
         if (!cancelled) setMatches(ms);
@@ -935,12 +992,62 @@ function TikTokLiveDetailBody() {
   }, [aggregatedRooms]);
 
   useEffect(() => {
+    // Pick which WS audience to open based on render mode + config:
+    //
+    //   - Admin mount (`readOnly=false`): connect to `/admin/tiktok/ws`
+    //     (auth, sees every tracked handle). Operator can disable
+    //     via TIKTOK_ADMIN_REALTIME_MODE=poll — useful when debugging
+    //     WS issues or running on a constrained network.
+    //
+    //   - Public mount (`readOnly=true`): connect to `/public/tiktok/ws`
+    //     (no auth, server-side filtered to `is_public=True` handles).
+    //     Operator can disable via TIKTOK_PUBLIC_REALTIME_MODE=poll;
+    //     default IS `poll` so flipping public WS on is a deliberate
+    //     opt-in (a private→public toggle on a host is the surface
+    //     that controls per-host exposure; the WS toggle is the
+    //     fleet-wide kill switch).
+    //
+    // The branch below ALSO scopes the WS subscription to just this
+    // page's handle so the server only forwards relevant events; the
+    // admin-side `*` subscription would deliver every host's stream
+    // which the page doesn't render anyway.
+    const realtimeMode = readOnly ? publicRealtime : adminRealtime;
+    if (realtimeMode === 'poll') return;
+    const audience = readOnly ? 'public' : 'admin';
     const ws = openTikTokWebSocket(
       (msg) => {
         // Belt-and-braces: server already filters by handle, but keep
         // the client-side check for correctness during reconnect races.
         if (msg.unique_id !== handle) return;
         setRecent((prev) => [msg, ...prev].slice(0, 60));
+        // ── Client-side chart delta on every counted event ─────────
+        // When WS is on, merge each event's contribution into the
+        // chart's current bucket so the line redraws ~immediately
+        // instead of waiting for the next 10s poll. No extra backend
+        // round-trip — the chart reconciles to authoritative server
+        // state on the next `fetchStats` regardless. Covered types:
+        // gift / comment / join / like / follow / share (see
+        // MERGEABLE_WS_TYPES). Gift is the only type that also moves
+        // the diamond column. Gating: this whole effect early-returns
+        // when `realtimeMode === 'poll'`, so reaching here means
+        // operator config allows WS-driven UI updates.
+        if (
+          msg.room_id &&
+          roomId &&
+          String(msg.room_id) === String(roomId)
+        ) {
+          // Skip merges while the user has a brushed range pinned
+          // (we shouldn't mutate frozen data) or in day-aggregate
+          // mode (that view owns `stats` from a different pipeline).
+          if (effectiveWindowRef.current.kind === 'custom') {
+            /* skip */
+          } else {
+            const agg = aggregatedRoomsRef.current;
+            if (!(agg && agg.length > 1)) {
+              setStats((prev) => (prev ? applyEventDeltaToStats(prev, msg) : prev));
+            }
+          }
+        }
         // A WS event for a room we don't have in `rooms` means a new
         // broadcast started since we last fetched — refresh immediately
         // so the dropdown picks it up.
@@ -979,7 +1086,7 @@ function TikTokLiveDetailBody() {
         }
       },
       undefined,
-      { handles: [handle] }
+      { handles: [handle], audience }
     );
     wsRef.current = ws;
     const isLive = selectedRoom && !selectedRoom.ended_at && !roomEndedHeuristic(selectedRoom);
@@ -1011,7 +1118,7 @@ function TikTokLiveDetailBody() {
       clearInterval(t);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [handle, roomId, selectedRoom?.ended_at]);
+  }, [handle, roomId, selectedRoom?.ended_at, adminRealtime, publicRealtime, readOnly]);
 
   // ── derived ───────────────────────────────────────────────────────
 
@@ -1118,7 +1225,17 @@ function TikTokLiveDetailBody() {
         }
         actions={
           <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
-            <Link to="/admin/tiktok">
+            {/* Realtime/poll indicator — same component on admin and
+                public mounts; reads runtime config + telemetry to show
+                whether the page is streaming WS events or falling
+                back to REST polling. The `audience` prop picks which
+                configured mode (admin vs public) it describes. */}
+            <TikTokRealtimeIndicator audience={readOnly ? 'public' : 'admin'} />
+            {/* Back link — admin routes back to the lives index;
+                public routes back to the unauthenticated home page.
+                Same affordance, different target depending on which
+                surface the user is browsing. */}
+            <Link to={readOnly ? '/' : '/admin/tiktok'}>
               <Button variant="ghost" size="sm">
                 <ArrowLeft className="w-4 h-4 mr-1" />
                 Lives
@@ -1182,6 +1299,7 @@ function TikTokLiveDetailBody() {
             profile={hostProfile}
             recent={recent}
             selectedRoom={selectedRoom}
+            readOnly={readOnly}
           />
         </div>
         <div className="lg:w-[360px] lg:shrink-0">
@@ -1293,6 +1411,7 @@ function TikTokLiveDetailBody() {
           hostProfile={hostProfile}
           onSelectMatch={setSelectedMatch}
           scopeLabel={chartViewLabel}
+          readOnly={readOnly}
         />
       )}
 
@@ -1545,6 +1664,17 @@ function TikTokLiveDetailBody() {
               </span>
             )}
           </CardTabButton>
+          <CardTabButton
+            active={giftersTab === 'crosslive'}
+            onClick={() => setGiftersTab('crosslive')}
+          >
+            Cross-live
+            {crossLiveTotal != null && (
+              <span className="ml-1.5 text-[10px] font-mono text-gray-500">
+                ({crossLiveTotal.toLocaleString()})
+              </span>
+            )}
+          </CardTabButton>
           <button
             type="button"
             onClick={() => {
@@ -1555,7 +1685,9 @@ function TikTokLiveDetailBody() {
             title={
               giftersTab === 'gifters'
                 ? 'Refresh top gifters'
-                : 'Refresh comments'
+                : giftersTab === 'comments'
+                  ? 'Refresh comments'
+                  : 'Refresh cross-live gifters'
             }
           >
             <RefreshCw className="w-3.5 h-3.5" />
@@ -1660,25 +1792,57 @@ function TikTokLiveDetailBody() {
           />
         )}
 
+        {/* Cross-live: gifters of this host who also gift in other
+            tracked lives. The endpoint is host-scoped (not room-scoped)
+            so the table reads the URL handle directly — it ignores the
+            chart's range / scope chips above on purpose. The cross-
+            live concept summarises a viewer's behaviour ACROSS lives,
+            not within one broadcast window. */}
+        {giftersTab === 'crosslive' && (
+          <TikTokRoomCrossLiveGiftersTable
+            handle={handle}
+            refreshKey={eventsRefreshKey}
+            onSelectCrossGifter={setSelectedCrossUserId}
+            onTotalChange={setCrossLiveTotal}
+          />
+        )}
+
+        <TikTokGifterDetailModal
+          isOpen={selectedCrossUserId !== null}
+          userId={selectedCrossUserId}
+          onClose={() => setSelectedCrossUserId(null)}
+          defaultTab="profile"
+        />
+
       </section>
 
-      {/* recent activity tail */}
-      <section className="card">
-        <h2 className="auth-mono-label mb-2">Recent activity</h2>
-        <ul className="space-y-1 text-xs font-mono max-h-72 overflow-auto">
-          {recent.length === 0 && (
-            <li className="text-gray-500">Waiting for events…</li>
-          )}
-          {recent.map((e, i) => (
-            <li key={i} className="truncate">
-              <span style={{ color: eventColor(e.type) }}>{e.type}</span>{' '}
-              <span className="text-gray-700">{summarizeEvent(e)}</span>
-            </li>
-          ))}
-        </ul>
-      </section>
+      {/* Recent activity tail — populated EXCLUSIVELY by the WebSocket
+          stream. The public page intentionally skips the WS (see the
+          `if (readOnly) return;` guard near the WS open call) because
+          the WS endpoint is admin-auth-only and would leak non-public
+          handles' real-time feed to anonymous viewers. With no other
+          data source the section would sit on "Waiting for events…"
+          forever, so we hide it entirely in readOnly mode. The other
+          panels (gifters, comments timeline, match list) already cover
+          "what's happening" via REST polling. */}
+      {!readOnly && (
+        <section className="card">
+          <h2 className="auth-mono-label mb-2">Recent activity</h2>
+          <ul className="space-y-1 text-xs font-mono max-h-72 overflow-auto">
+            {recent.length === 0 && (
+              <li className="text-gray-500">Waiting for events…</li>
+            )}
+            {recent.map((e, i) => (
+              <li key={i} className="truncate">
+                <span style={{ color: eventColor(e.type) }}>{e.type}</span>{' '}
+                <span className="text-gray-700">{summarizeEvent(e)}</span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
 
-      <TikTokGifterModal
+      <TikTokGifterDetailModal
         isOpen={selectedGifter !== null}
         onClose={() => setSelectedGifter(null)}
         userId={selectedGifter?.userId ?? null}
@@ -1687,7 +1851,8 @@ function TikTokLiveDetailBody() {
         diamondsTotal={selectedGifter?.diamonds ?? 0}
         giftsCount={selectedGifter?.gifts ?? 0}
         commentsCount={selectedGifter?.comments ?? 0}
-        defaultTab={selectedGifter?.tab ?? 'gifts'}
+        defaultTab="current"
+        currentInnerTab={selectedGifter?.tab ?? 'gifts'}
         roomId={roomId}
         // Pass the SAME room set the parent gifters/comments table
         // queries against (`effectiveExtraRoomIds`). In live scope
@@ -1697,7 +1862,18 @@ function TikTokLiveDetailBody() {
         // all-time table would query only the path roomId and the
         // modal would render empty for gifters who only contributed
         // in *other* broadcasts.
-        extraRoomIds={effectiveExtraRoomIds}
+        //
+        // When the click came from the match modal's donor panel
+        // for an opponent-side gifter, `selectedGifter.extraRoomIds`
+        // carries the rival's `room_id` (sibling-stream room). Merge
+        // it in so opponent donors find their gifts — those events
+        // live in the rival's broadcast, not the current page's room.
+        extraRoomIds={(() => {
+          const base = effectiveExtraRoomIds ?? [];
+          const extras = selectedGifter?.extraRoomIds ?? [];
+          if (extras.length === 0) return effectiveExtraRoomIds;
+          return Array.from(new Set([...base, ...extras]));
+        })()}
         // Human-readable label for the room set so the modal's header
         // banner + scope chip name the dataset accurately. Mirrors the
         // scope-chip labelling above so the modal's framing matches
@@ -1725,6 +1901,7 @@ function TikTokLiveDetailBody() {
         windowUntil={selectedGifter?.until ?? null}
         windowLabel={selectedGifter?.windowLabel}
         currentHandle={handle}
+        readOnly={readOnly}
       />
 
       <TikTokMatchEventsModal
@@ -1734,6 +1911,7 @@ function TikTokLiveDetailBody() {
         hostHandle={handle}
         onSelectGifter={setSelectedGifter}
         onSelectMatch={setSelectedMatch}
+        readOnly={readOnly}
       />
 
       <Modal
@@ -1968,6 +2146,119 @@ function roomEndedHeuristic(room: TikTokRoom): boolean {
   return ageMs > STALE_ROOM_MS;
 }
 
+/** Event types whose chart counters we merge client-side from WS.
+ *
+ *  These match the names the backend uses in `tiktok_events.type`
+ *  and the keys it emits in `TikTokRoomStats.buckets.by_type`. Other
+ *  WS event types — match_*, viewer_count, room_info, live_end,
+ *  room_pause, room_unpause — are handled separately:
+ *    - match_* triggers a full `fetchStats` (the active_match state
+ *      changes shape; safer to refetch than to merge).
+ *    - viewer_count carries a snapshot value, not a delta — bound
+ *      elsewhere from the live sparkline path.
+ *    - room_info / live_end / room_pause / room_unpause change room-
+ *      level state, not the chart counters.
+ */
+const MERGEABLE_WS_TYPES = new Set([
+  'gift',
+  'comment',
+  'join',
+  'like',
+  'follow',
+  'share',
+]);
+
+/**
+ * Apply a single WS event to a `TikTokRoomStats` snapshot, producing
+ * a new snapshot with the event's contribution merged into the
+ * appropriate chart bucket.
+ *
+ * Each event row in `tiktok_events` is counted ONCE in
+ * `buckets.by_type[type][idx]` (the backend's `COUNT(*) GROUP BY type`
+ * doesn't multiply by `repeat_count`). So this merger increments the
+ * per-type bucket counter by exactly 1 per WS event — matching the
+ * server-side semantic so the next reconcile poll lines up cleanly.
+ *
+ * Gift is the only type that also moves the diamond chart:
+ *   diamonds[idx]   += diamond_count * repeat_count
+ *   diamonds_total  += diamond_count * repeat_count
+ * (other types don't contribute to the diamond line.)
+ *
+ * Reconciliation: the next `fetchStats` returns authoritative
+ * server state and replaces `stats` wholesale, wiping any merged
+ * deltas. Drift between polls is bounded by one poll cycle — same
+ * staleness the page had with WS off. Optimistic merge gives the
+ * "live ticks" UX without changing the truth.
+ *
+ * Bucket selection rule: pick the bucket whose start time is the
+ * largest one ≤ `Date.now()`. WS events arrive near-real-time, so
+ * `Date.now()` is a fine approximation for the event time.
+ *
+ * No-ops when stats is null-ish, the event type isn't mergeable, or
+ * the buckets array is empty.
+ */
+function applyEventDeltaToStats(
+  stats: TikTokRoomStats,
+  msg: TikTokWsEvent,
+): TikTokRoomStats {
+  if (!MERGEABLE_WS_TYPES.has(msg.type)) return stats;
+  const starts = stats.buckets?.starts ?? [];
+  if (starts.length === 0) return stats;
+
+  // Find the bucket the event falls into. Walk backwards because
+  // the most-recent buckets are the common case.
+  const eventMs = Date.now();
+  let idx = 0;
+  for (let i = starts.length - 1; i >= 0; i--) {
+    const startMs = new Date(starts[i]).getTime();
+    if (Number.isFinite(startMs) && eventMs >= startMs) {
+      idx = i;
+      break;
+    }
+  }
+
+  // Counter delta: every event row contributes +1 to its type's
+  // bucket count and the matching counts_window / counts_total
+  // entries.
+  const prevByType = stats.buckets.by_type ?? {};
+  const typeArr = (prevByType[msg.type] ?? new Array(starts.length).fill(0)).slice();
+  typeArr[idx] = (typeArr[idx] ?? 0) + 1;
+  const newByType = { ...prevByType, [msg.type]: typeArr };
+
+  // Diamond delta: gift-only. Other types leave the diamond column
+  // alone. We copy `diamonds[]` either way so the bucket-array
+  // reference flips and downstream memos see a fresh value.
+  const payload = (msg.payload ?? {}) as Record<string, unknown>;
+  const diamondPer = Number(payload.diamond_count ?? 0);
+  const repeat = Number(payload.repeat_count ?? 1);
+  const diamondDelta =
+    msg.type === 'gift' && Number.isFinite(diamondPer) && Number.isFinite(repeat) && diamondPer > 0
+      ? diamondPer * repeat
+      : 0;
+  const newDiamonds = stats.buckets.diamonds.slice();
+  if (diamondDelta > 0) {
+    newDiamonds[idx] = (newDiamonds[idx] ?? 0) + diamondDelta;
+  }
+
+  return {
+    ...stats,
+    diamonds_total: (stats.diamonds_total ?? 0) + diamondDelta,
+    counts_window: {
+      ...stats.counts_window,
+      [msg.type]: (stats.counts_window?.[msg.type] ?? 0) + 1,
+    },
+    counts_total: {
+      ...stats.counts_total,
+      [msg.type]: (stats.counts_total?.[msg.type] ?? 0) + 1,
+    },
+    buckets: {
+      ...stats.buckets,
+      diamonds: newDiamonds,
+      by_type: newByType,
+    },
+  };
+}
+
 // ── ProfileHeaderCard ───────────────────────────────────────────────
 //
 // Rich profile header for the live-detail page: avatar, nickname +
@@ -1980,6 +2271,11 @@ interface ProfileHeaderCardProps {
   profile: TikTokSubscription | null;
   recent: TikTokWsEvent[];
   selectedRoom: TikTokRoom | null;
+  /** When true, suppress operator-only chrome: the listener-status
+   *  health pills (Worker hb / Last event), the probe-debug button +
+   *  modal (which read worker_log), and skip the listenerStatus poll
+   *  entirely (the public namespace doesn't expose it). */
+  readOnly?: boolean;
 }
 
 function ProfileHeaderCard({
@@ -1987,7 +2283,9 @@ function ProfileHeaderCard({
   profile,
   recent,
   selectedRoom,
+  readOnly = false,
 }: ProfileHeaderCardProps) {
+  const tiktokApi = useTikTokApi();
   // Re-render once a second so the "last event Xs ago" stays accurate
   // even when no new events arrive.
   const [, force] = useState(0);
@@ -2004,10 +2302,15 @@ function ProfileHeaderCard({
   // `lastEventAgeS` below only sees events that arrived after the page
   // loaded — these two come from the worker's own counters and survive
   // page refreshes.
+  //
+  // Skipped in read-only mode: the public namespace doesn't surface
+  // worker internals, and the pills + probe-debug button that consume
+  // this data are hidden below.
   const [listenerStatus, setListenerStatus] = useState<
     import('@admin/services/tiktok').TikTokListenerStatus | null
   >(null);
   useEffect(() => {
+    if (readOnly) return;
     let cancelled = false;
     const tick = () => {
       tiktokApi
@@ -2025,7 +2328,9 @@ function ProfileHeaderCard({
       cancelled = true;
       clearInterval(t);
     };
-  }, []);
+    // tiktokApi is stable per provider; safe to leave out of deps.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [readOnly]);
 
   // Find this handle's session entry across all workers, and the
   // worker that owns it (for heartbeat).
@@ -2105,8 +2410,6 @@ function ProfileHeaderCard({
           <div className="mt-2 flex items-center gap-x-5 gap-y-1 flex-wrap text-sm">
             <ProfileStat label="Followers" value={profile?.follower_count} />
             <ProfileStat label="Following" value={profile?.following_count} />
-            <ProfileStat label="Videos" value={profile?.video_count} />
-            <ProfileStat label="Likes" value={profile?.like_count} />
             {profile?.profile_user_id && (
               <span className="text-[10px] font-mono text-gray-500">
                 user_id: {profile.profile_user_id}
@@ -2144,34 +2447,41 @@ function ProfileHeaderCard({
               tooltip="Last is-live check. The worker's centralized scraper polls this every ~60s for offline handles."
             />
             {/* Worker liveness — the listener PROCESS heartbeat, not
-                this handle. Stale ⇒ ingestion is paused for everyone. */}
-            <FreshnessAgePill
-              label="Worker hb"
-              ageS={workerForHandle?.heartbeat_age_s ?? null}
-              tooltip={
-                workerForHandle
-                  ? `Worker ${workerForHandle.worker_key} (pid ${workerForHandle.pid}) — heartbeat to DB. Stale (>30s) means the listener process is hung or stopped; no events for any handle until it recovers.`
-                  : 'No worker is currently assigned to this handle. Subscription is over capacity or unclaimed — only the live-status scraper covers it (no events ingested).'
-              }
-              neverLabel={workerForHandle ? 'never' : 'unassigned'}
-              greenUntil={30}
-              amberUntil={120}
-            />
+                this handle. Stale ⇒ ingestion is paused for everyone.
+                Hidden in read-only mode (public viewers shouldn't see
+                operator-side ingestion health). */}
+            {!readOnly && (
+              <FreshnessAgePill
+                label="Worker hb"
+                ageS={workerForHandle?.heartbeat_age_s ?? null}
+                tooltip={
+                  workerForHandle
+                    ? `Worker ${workerForHandle.worker_key} (pid ${workerForHandle.pid}) — heartbeat to DB. Stale (>30s) means the listener process is hung or stopped; no events for any handle until it recovers.`
+                    : 'No worker is currently assigned to this handle. Subscription is over capacity or unclaimed — only the live-status scraper covers it (no events ingested).'
+                }
+                neverLabel={workerForHandle ? 'never' : 'unassigned'}
+                greenUntil={30}
+                amberUntil={120}
+              />
+            )}
             {/* Per-session last-event ingestion. Comes from the worker's
                 own counter, so it survives a page refresh (unlike the
                 WS-derived FreshnessBadge above which only sees events
-                arrived since this tab opened). */}
-            <FreshnessAgePill
-              label="Last event"
-              ageS={sessionForHandle?.last_event_age_s ?? null}
-              tooltip={
-                sessionForHandle
-                  ? `Most recent event ingested for @${handle} (state: ${sessionForHandle.state}, ${sessionForHandle.events_total.toLocaleString()} total in this session). 'never' usually means the creator hasn't been live since the worker started.`
-                  : 'No active listener session for this handle yet — over capacity or just added. Once a worker claims it, this pill will populate.'
-              }
-              greenUntil={60}
-              amberUntil={600}
-            />
+                arrived since this tab opened). Hidden in read-only
+                mode for the same reason as the worker heartbeat pill. */}
+            {!readOnly && (
+              <FreshnessAgePill
+                label="Last event"
+                ageS={sessionForHandle?.last_event_age_s ?? null}
+                tooltip={
+                  sessionForHandle
+                    ? `Most recent event ingested for @${handle} (state: ${sessionForHandle.state}, ${sessionForHandle.events_total.toLocaleString()} total in this session). 'never' usually means the creator hasn't been live since the worker started.`
+                    : 'No active listener session for this handle yet — over capacity or just added. Once a worker claims it, this pill will populate.'
+                }
+                greenUntil={60}
+                amberUntil={600}
+              />
+            )}
           </div>
 
           {/* Timezone selector — every date / time on this page (chart
@@ -2184,31 +2494,37 @@ function ProfileHeaderCard({
             <TimezoneSelector />
           </div>
 
-          <button
-            type="button"
-            onClick={() => setDebugOpen(true)}
-            className={
-              'mt-2 inline-flex items-center gap-1.5 text-[11px] font-mono ' +
-              (profile?.profile_error
-                ? 'text-amber-700 hover:text-amber-900 dark:text-amber-300 dark:hover:text-amber-100'
-                : 'text-gray-500 hover:text-gray-800')
-            }
-            title="Open probe-debug modal: latest error + recent probe history from worker_log"
-          >
-            <Bug className="w-3.5 h-3.5" />
-            <span className="underline decoration-dotted">
-              {profile?.profile_error
-                ? `profile probe: ${profile.profile_error.split('\n')[0]}`
-                : 'probe history'}
-            </span>
-          </button>
-          <ProbeDebugModal
-            isOpen={debugOpen}
-            onClose={() => setDebugOpen(false)}
-            handle={handle}
-            error={profile?.profile_error ?? null}
-            profileRefreshedAt={profile?.profile_refreshed_at ?? null}
-          />
+          {/* Probe-debug trigger + modal — admin-only. Reads worker_log,
+              which is operator-side state, so hidden in public mode. */}
+          {!readOnly && (
+            <>
+              <button
+                type="button"
+                onClick={() => setDebugOpen(true)}
+                className={
+                  'mt-2 inline-flex items-center gap-1.5 text-[11px] font-mono ' +
+                  (profile?.profile_error
+                    ? 'text-amber-700 hover:text-amber-900 dark:text-amber-300 dark:hover:text-amber-100'
+                    : 'text-gray-500 hover:text-gray-800')
+                }
+                title="Open probe-debug modal: latest error + recent probe history from worker_log"
+              >
+                <Bug className="w-3.5 h-3.5" />
+                <span className="underline decoration-dotted">
+                  {profile?.profile_error
+                    ? `profile probe: ${profile.profile_error.split('\n')[0]}`
+                    : 'probe history'}
+                </span>
+              </button>
+              <ProbeDebugModal
+                isOpen={debugOpen}
+                onClose={() => setDebugOpen(false)}
+                handle={handle}
+                error={profile?.profile_error ?? null}
+                profileRefreshedAt={profile?.profile_refreshed_at ?? null}
+              />
+            </>
+          )}
         </div>
       </div>
     </section>
@@ -2386,6 +2702,7 @@ function ProbeDebugModal({
   error: string | null;
   profileRefreshedAt: string | null;
 }) {
+  const tiktokApi = useTikTokApi();
   const { tz } = useTikTokTimezone();
   // Pull recent profile_probe_* rows from the worker_log so the modal
   // also surfaces partial-success and historical WAF detections, not
@@ -2719,6 +3036,8 @@ interface MatchesPanelProps {
    *  the user understands "no battles" applies to the current view,
    *  not the whole creator. */
   scopeLabel?: string;
+  /** When true, suppress the rival monitor pills inside `LiveMatchView`. */
+  readOnly?: boolean;
 }
 
 // HostProfile is the full subscription record now — `MatchupCell`
@@ -2733,6 +3052,7 @@ function MatchesPanel({
   hostProfile,
   onSelectMatch,
   scopeLabel,
+  readOnly = false,
 }: MatchesPanelProps) {
   // Default tab: live if there's an active match, otherwise past.
   const [tab, setTab] = useState<'live' | 'past'>(
@@ -2795,7 +3115,11 @@ function MatchesPanel({
       </div>
       <div className="bg-white dark:bg-gray-100/5 p-4">
         {tab === 'live' ? (
-          <LiveMatchView match={activeMatch} hostHandle={hostHandle} />
+          <LiveMatchView
+            match={activeMatch}
+            hostHandle={hostHandle}
+            readOnly={readOnly}
+          />
         ) : (
           <PastMatchesTable
             matches={ended}
@@ -2837,9 +3161,14 @@ function TabButton({
 interface LiveMatchViewProps {
   match: TikTokMatch;
   hostHandle: string;
+  /** When true, hide the rival monitor pills + their confirmation
+   *  modal. The pills call `createLive`, which is an admin-write
+   *  endpoint not exposed to public viewers. */
+  readOnly?: boolean;
 }
 
-function LiveMatchView({ match, hostHandle }: LiveMatchViewProps) {
+function LiveMatchView({ match, hostHandle, readOnly = false }: LiveMatchViewProps) {
+  const tiktokApi = useTikTokApi();
   // Re-render every second so the duration / countdown updates.
   const [, setTick] = useState(0);
   useEffect(() => {
@@ -2886,6 +3215,13 @@ function LiveMatchView({ match, hostHandle }: LiveMatchViewProps) {
   const [subscribedSet, setSubscribedSet] = useState<Set<string>>(() => new Set());
   const [addRivalOpen, setAddRivalOpen] = useState<TikTokMatchOpponent | null>(null);
   useEffect(() => {
+    // Skip in read-only mode: the public namespace doesn't expose
+    // listLives, and the rival pills are hidden so we never need to
+    // know the subscription set anyway.
+    if (readOnly) {
+      setSubscribedSet(new Set());
+      return;
+    }
     let cancelled = false;
     tiktokApi
       .listLives()
@@ -2897,7 +3233,8 @@ function LiveMatchView({ match, hostHandle }: LiveMatchViewProps) {
       })
       .catch(() => { /* silent — backend's createLive guards against dupes anyway */ });
     return () => { cancelled = true; };
-  }, [match.id]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [match.id, readOnly]);
   const confirmAddRival = async () => {
     const handle = addRivalOpen?.unique_id;
     if (!handle) return;
@@ -3132,8 +3469,10 @@ function LiveMatchView({ match, hostHandle }: LiveMatchViewProps) {
           4-way battle). Each pill flips between "+ Add to monitor"
           (opens the canonical confirm modal) and "✓ Monitoring"
           (links to that creator's detail page). Renders only when
-          we have an actual handle — anonymous opponents are skipped. */}
-      {rivals.some((r) => r.unique_id) && (
+          we have an actual handle — anonymous opponents are skipped.
+          Hidden entirely in read-only mode — the pills + their
+          confirmation modal both call admin-write endpoints. */}
+      {!readOnly && rivals.some((r) => r.unique_id) && (
         <div className="mt-4 pt-3 border-t border-gray-200 dark:border-white/10 flex items-center gap-2 flex-wrap">
           <span className="text-[10px] uppercase tracking-wider font-mono text-gray-500 mr-1">
             Rival{rivals.filter((r) => r.unique_id).length > 1 ? 's' : ''}:
@@ -3170,13 +3509,17 @@ function LiveMatchView({ match, hostHandle }: LiveMatchViewProps) {
 
       {/* Confirm modal — reuses the canonical Add Live preview so
           the operator sees the same avatar/followers/bio they'd see
-          on /admin/tiktok's Add Live flow. */}
-      <TikTokAddLiveModal
-        isOpen={addRivalOpen !== null}
-        handle={addRivalOpen?.unique_id ?? ''}
-        onCancel={() => setAddRivalOpen(null)}
-        onConfirm={confirmAddRival}
-      />
+          on /admin/tiktok's Add Live flow. Suppressed in read-only
+          mode so it never mounts in public contexts (its onConfirm
+          calls createLive, an admin-write endpoint). */}
+      {!readOnly && (
+        <TikTokAddLiveModal
+          isOpen={addRivalOpen !== null}
+          handle={addRivalOpen?.unique_id ?? ''}
+          onCancel={() => setAddRivalOpen(null)}
+          onConfirm={confirmAddRival}
+        />
+      )}
     </div>
   );
 }
@@ -3188,6 +3531,7 @@ function LiveMatchTopDonors({
   match: TikTokMatch;
   hostHandle: string;
 }) {
+  const tiktokApi = useTikTokApi();
   const [sides, setSides] = useState<TikTokMatchGiftersBySide | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -3565,8 +3909,11 @@ function PastMatchesTable({
   const visible = matches.slice(pageStart, pageStart + PAST_MATCHES_PAGE_SIZE);
 
   return (
-    <div className="overflow-x-auto">
-      <table className="w-full text-sm min-w-[640px]">
+    <div>
+      {/* Desktop: 6-column table (md+). Below md the columns can't
+          fit, so we render a stacked card list instead — no horizontal
+          scroll. */}
+      <table className="hidden md:table w-full text-sm">
         <thead>
           <tr className="border-b border-gray-200">
             <th className="text-left py-2 auth-mono-label">When</th>
@@ -3643,6 +3990,86 @@ function PastMatchesTable({
           })}
         </tbody>
       </table>
+
+      {/* Mobile: one card per match (below md). Header row: when +
+          result chip. Middle: matchup (host vs rival). Bottom: score,
+          duration, diamonds in three compact mono stats. */}
+      <ul className="md:hidden flex flex-col gap-2">
+        {visible.map((m) => {
+          const { hostScore, rivalScore } = computeMatchScores(m, hostHandle);
+          return (
+            <li
+              key={m.id}
+              className={
+                'rounded-md border border-gray-200 bg-white dark:bg-white/[0.03] px-3 py-2.5 transition-colors ' +
+                (onSelect ? 'cursor-pointer hover:bg-gray-50' : '')
+              }
+              onClick={onSelect ? () => onSelect(m) : undefined}
+              title={onSelect ? 'Tap for full event log' : undefined}
+            >
+              <div className="flex items-center justify-between gap-2 mb-2">
+                <span className="font-mono text-xs text-gray-600 whitespace-nowrap">
+                  {m.started_at ? fmtMonthDayTime(m.started_at, tz) : '—'}
+                </span>
+                <span
+                  className={
+                    'font-mono text-[10px] px-1.5 py-0.5 rounded uppercase ' +
+                    (RESULT_TONE[m.result] ?? RESULT_TONE.ended)
+                  }
+                >
+                  {m.result}
+                </span>
+              </div>
+              <div className="mb-2">
+                <MatchupCell
+                  match={m}
+                  hostHandle={hostHandle}
+                  hostProfile={hostProfile}
+                />
+              </div>
+              <div className="pt-2 border-t border-gray-100 grid grid-cols-3 gap-2 text-[11px] font-mono">
+                <div className="flex flex-col">
+                  <span className="text-[10px] uppercase tracking-wider text-gray-400">Score</span>
+                  <span className="tabular-nums">
+                    <span
+                      className={
+                        hostScore > rivalScore
+                          ? 'text-emerald-700 dark:text-emerald-300 font-semibold'
+                          : 'text-gray-700'
+                      }
+                    >
+                      {hostScore.toLocaleString()}
+                    </span>
+                    <span className="mx-1 text-gray-400">:</span>
+                    <span
+                      className={
+                        rivalScore > hostScore
+                          ? 'text-rose-700 dark:text-rose-300 font-semibold'
+                          : 'text-gray-700'
+                      }
+                    >
+                      {rivalScore.toLocaleString()}
+                    </span>
+                  </span>
+                </div>
+                <div className="flex flex-col">
+                  <span className="text-[10px] uppercase tracking-wider text-gray-400">Duration</span>
+                  <span className="tabular-nums text-gray-700">
+                    {formatBattleDuration(m)}
+                  </span>
+                </div>
+                <div className="flex flex-col text-right">
+                  <span className="text-[10px] uppercase tracking-wider text-gray-400">Diamonds</span>
+                  <span className="tabular-nums text-gray-900 font-semibold">
+                    {(m.diamonds_total ?? 0).toLocaleString()}
+                    <span className="ml-1 text-amber-600">💎</span>
+                  </span>
+                </div>
+              </div>
+            </li>
+          );
+        })}
+      </ul>
 
       {totalPages > 1 && (
         <div className="flex items-center justify-between pt-3 mt-1 border-t border-gray-100">

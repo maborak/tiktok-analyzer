@@ -18,6 +18,7 @@ from fastapi import (
     Depends,
     HTTPException,
     Query,
+    Response,
     WebSocket,
     WebSocketDisconnect,
     status,
@@ -48,6 +49,10 @@ class SubscriptionUpdate(BaseModel):
     enabled: bool
 
 
+class SubscriptionPublicUpdate(BaseModel):
+    is_public: bool
+
+
 # Note on integer types: TikTok room_ids, user_ids and our event ids are
 # 64-bit BigInts that exceed Number.MAX_SAFE_INTEGER (2^53). JSON numbers
 # decoded by browsers lose precision on values > 9 × 10^15. We serialize
@@ -57,6 +62,10 @@ class SubscriptionUpdate(BaseModel):
 class SubscriptionResponse(BaseModel):
     unique_id: str
     enabled: bool
+    # Public-lives opt-in: when True the handle surfaces on the
+    # unauthenticated /public/tiktok/lives endpoint (with a sanitized
+    # subset of fields). Independent of `enabled`.
+    is_public: bool = False
     state: str
     room_id: Optional[str] = None
     is_connected: bool
@@ -70,8 +79,6 @@ class SubscriptionResponse(BaseModel):
     verified: Optional[bool] = None
     follower_count: Optional[int] = None
     following_count: Optional[int] = None
-    video_count: Optional[int] = None
-    like_count: Optional[int] = None
     profile_refreshed_at: Optional[str] = None
     profile_error: Optional[str] = None
     # Centralized live-status cache (updated by worker's scraper task).
@@ -182,16 +189,26 @@ async def list_lives(
 
 @router.get("/lives/totals")
 async def lives_totals(
+    response: Response,
     _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
 ):
     """Page-level rollup for the /admin/tiktok header strip:
-    n_live / n_total / diamonds_24h / events_per_min."""
+    n_live / n_total / diamonds_24h / events_per_min.
+
+    Polled every 30 s by the page. Service-layer TTL cache (35 s) +
+    `Cache-Control: max-age=30` lets concurrent admin tabs collapse
+    to one DB round per cache window AND lets a re-mount within the
+    poll cycle skip the request entirely (browser cache). `to_thread`
+    keeps the event loop responsive during the cache-miss SQL
+    aggregates."""
     svc = _require_service()
-    return svc.get_lives_totals()
+    response.headers["Cache-Control"] = "private, max-age=30"
+    return await asyncio.to_thread(svc.get_lives_totals)
 
 
 @router.get("/lives/summary")
 async def lives_summary(
+    response: Response,
     handles: Optional[str] = Query(
         None,
         description=(
@@ -204,7 +221,15 @@ async def lives_summary(
     """Per-host enrichment for every row on /admin/tiktok Lives.
     Drives sparklines, viewer count, session diamonds, top gifter,
     PK chip, last broadcasts, and momentum tags — all in one
-    round-trip."""
+    round-trip.
+
+    Polled every 30 s. Service-layer 35 s TTL + parallel query fan-out
+    means a steady-state poll hits warm cache (a sub-50 ms request).
+    `Cache-Control: max-age=30` lets a re-mount within the poll cycle
+    skip the request entirely on the browser side. `to_thread` keeps
+    the event loop responsive on a cold miss (the parallelised
+    `get_lives_summary` runs ~10 query families against the connection
+    pool — under 700 ms wall-clock with 72 handles)."""
     svc = _require_service()
     handle_list: list[str] = []
     if handles:
@@ -217,7 +242,8 @@ async def lives_summary(
         # No filter → use every subscription.
         subs = await svc.list_subscriptions()
         handle_list = [s["unique_id"] for s in subs if s.get("unique_id")]
-    return svc.get_lives_summary(handle_list)
+    response.headers["Cache-Control"] = "private, max-age=30"
+    return await asyncio.to_thread(svc.get_lives_summary, handle_list)
 
 
 @router.get("/lookup", response_model=HandleLookupResponse)
@@ -259,6 +285,30 @@ async def patch_live(
         if s["unique_id"] == sub.unique_id:
             return s
     raise HTTPException(status_code=500, detail="subscription updated but not found")
+
+
+@router.patch("/lives/{handle}/public", status_code=status.HTTP_204_NO_CONTENT)
+async def patch_live_public(
+    handle: str,
+    update: SubscriptionPublicUpdate,
+    _user: AuthContext = Depends(rbac.require("admin:write")),
+):
+    """Flip the `is_public` flag for a subscription. When true the
+    handle surfaces on the unauthenticated /public/tiktok/lives
+    endpoint (sanitized payload). 204 on success, 404 if the handle
+    isn't tracked.
+
+    Independent of `enabled` — a paused-but-public sub stays listed,
+    but its live state will read offline until the listener resumes.
+    """
+    svc = _require_service()
+    handle = handle.lstrip("@")
+    try:
+        svc.set_subscription_public(handle, bool(update.is_public))
+    except LookupError:
+        raise HTTPException(status_code=404, detail="subscription not found")
+    # 204 — caller polls /admin/tiktok/lives if it needs the new row.
+    return None
 
 
 @router.post("/lives/{handle}/refresh", response_model=SubscriptionResponse)
@@ -755,7 +805,7 @@ def _set_listener_target(*, desired_status: str | None, command: str | None,
 @router.post("/listener/pause")
 async def listener_pause(
     worker_id: int | None = None,
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.require("admin:write")),
 ):
     """Stop every active session on the target worker(s). Worker stays
     alive — `desired_status='paused'`. `worker_id` query param targets
@@ -774,7 +824,7 @@ async def listener_pause(
 @router.post("/listener/resume")
 async def listener_resume(
     worker_id: int | None = None,
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.require("admin:write")),
 ):
     """Re-spawn sessions on the target worker(s)."""
     import os as _os
@@ -791,7 +841,7 @@ async def listener_resume(
 @router.post("/listener/kill")
 async def listener_kill(
     worker_id: int | None = None,
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.require("admin:write")),
 ):
     """Tell the target worker(s) to exit. The worker observes
     `command='kill'` on its next reconcile tick, releases assignments,
@@ -816,7 +866,7 @@ async def listener_kill(
 @router.post("/lives/{handle}/release")
 async def listener_release_handle(
     handle: str,
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.require("admin:write")),
 ):
     """Yank a subscription's worker assignment so another worker can
     claim it. The currently-owning worker's reconcile tick will notice
@@ -1475,7 +1525,7 @@ async def unread_notifications(
 @router.post("/notifications", status_code=201)
 async def create_notification(
     body: NotificationCreate,
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.require("admin:write")),
 ):
     svc = _require_service()
     parsed_user_id: int | None = None
@@ -1684,6 +1734,55 @@ async def get_common_gifters(
     )
 
 
+@router.get("/runtime-config")
+async def admin_tiktok_runtime_config(
+    response: Response,
+    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+):
+    """Admin view of the TikTok runtime config — full set of typed
+    keys (`poll_interval_ms`, `admin_realtime`, `public_realtime`).
+
+    The public mirror at `/public/tiktok/runtime-config` trims to a
+    public-safe slice; this admin endpoint returns everything so the
+    admin frontend can render the right WS-vs-poll behaviour on its
+    own pages AND show what the public surface is currently configured
+    to do (without anonymous viewers learning the admin mode).
+
+    `Cache-Control: no-store` — toggle in the Configuration UI takes
+    effect on the next page reload."""
+    response.headers["Cache-Control"] = "no-store"
+    # Reuse the public-side reader so the resolve/clamp/validate logic
+    # lives in exactly one place. The hexagonal-ish thing to do would
+    # be to put it on the service layer; left here because it's a
+    # 30-line config read with no cross-cutting concerns.
+    from routes.public_tiktok import _read_tiktok_runtime_config
+    return _read_tiktok_runtime_config()
+
+
+@router.get("/lives/{handle}/cross-live-gifters")
+async def get_cross_live_gifters_for_host(
+    handle: str,
+    min_other_hosts: int = Query(1, ge=1, le=20),
+    q: Optional[str] = Query(None, description="Match nickname or @unique_id (case-insensitive)"),
+    limit: int = Query(25, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+):
+    """Cross-live gifters scoped to one host: viewers who have gifted
+    to `handle` AND to >= `min_other_hosts` other hosts we track. Same
+    shape as `/admin/tiktok/common-gifters` plus per-row `here` vs
+    `elsewhere` totals so the UI can surface "spends X on this live,
+    Y across N other lives" inline."""
+    svc = _require_service()
+    return svc.get_cross_live_gifters_for_host(
+        handle,
+        min_other_hosts=min_other_hosts,
+        q=q,
+        limit=limit,
+        offset=offset,
+    )
+
+
 @router.get("/dashboard")
 async def get_dashboard(
     since_hours: int = Query(24, ge=1, le=24 * 30),
@@ -1858,6 +1957,13 @@ async def count_events(
 async def ws_events(ws: WebSocket):
     """Streams TikTok events to the client.
 
+    Auth: the client appends `?token=<jwt>` to the URL. We validate it
+    against the same AuthService used by HTTP admin routes and require
+    `admin:write`. Without this gate, anyone who can reach the host
+    can stream the in-memory fan-out for every tracked subscription —
+    including handles the operator has NOT flipped `is_public=True` —
+    bypassing the allowlist on the `/public/tiktok/*` HTTP surface.
+
     By default the WS forwards EVERY event for every active subscription.
     The client can filter to specific creators by sending a JSON control
     message at any time:
@@ -1874,13 +1980,60 @@ async def ws_events(ws: WebSocket):
       - Worker mode (PHOVEU_BACKEND_TIKTOK_LISTENER_MODE=worker): subscribes
         to the Redis pub/sub channel that the worker publishes to.
     """
+    # Validate JWT BEFORE ws.accept(). Closing without accepting sends
+    # an HTTP rejection on the upgrade — no half-open WS that an
+    # unauthenticated viewer could mine for events. Close codes follow
+    # the 4000-range convention (app-defined): 4401 = unauthenticated,
+    # 4403 = authenticated but missing admin permission.
+    #
+    # Authorisation matches the rest of the admin TikTok surface:
+    # `admin:write` OR any documented read-only equivalent. The HTTP
+    # handlers above use `rbac.require_any_read_only(["admin:write"])`
+    # — so a user with `admin:read` works on the REST endpoints. The
+    # WS originally hard-required `admin:write` and so rejected those
+    # read-only admins (visible as a stream of 403s in the dev log
+    # while the page still rendered fine). We align here by accepting
+    # `admin:write` OR `admin:read`. If you need a "no read-only WS"
+    # policy (e.g. WS leaks an internal state the read role shouldn't
+    # see), tighten this back to `admin:write` only.
+    token = ws.query_params.get("token")
+    if not token:
+        logger.info("WS auth reject: no token in query string.")
+        await ws.close(code=4401)
+        return
+    try:
+        from utils.auth_provider import get_auth_service
+        auth_context = get_auth_service().get_auth_context(token)
+    except Exception:
+        logger.exception("WS auth reject: get_auth_context raised.")
+        auth_context = None
+    if auth_context is None:
+        logger.info("WS auth reject: invalid or expired token.")
+        await ws.close(code=4401)
+        return
+    has_write = auth_context.has_permission("admin:write")
+    has_read = auth_context.has_permission("admin:read")
+    if not (has_write or has_read):
+        logger.info(
+            "WS auth reject: user=%s lacks admin:write OR admin:read "
+            "(permissions=%s).",
+            getattr(auth_context.user, "username", "?"),
+            sorted(list(getattr(auth_context, "permissions", []) or [])),
+        )
+        await ws.close(code=4403)
+        return
+
     import os
     listener_mode = os.getenv(
         "PHOVEU_BACKEND_TIKTOK_LISTENER_MODE", "in_process"
     ).strip().lower()
 
     await ws.accept()
-    logger.info("WS /admin/tiktok/ws client connected (mode=%s).", listener_mode)
+    logger.info(
+        "WS /admin/tiktok/ws client connected (mode=%s, user=%s).",
+        listener_mode,
+        auth_context.user.username,
+    )
 
     # Filter state: None = no filter (receive everything). Otherwise a
     # set of allowed unique_ids. Mutated by the control-message reader

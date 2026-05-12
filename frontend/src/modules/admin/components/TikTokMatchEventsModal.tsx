@@ -66,8 +66,8 @@ import {
   type TikTokMatchSideGifter,
   type TikTokMatchHeadToHeadRow,
   type TikTokH2HCommonGifter,
-  tiktokApi,
 } from '@admin/services/tiktok';
+import { useTikTokApi } from '@admin/contexts/TikTokApiContext';
 import { TikTokAddLiveModal } from '@admin/components/TikTokAddLiveModal';
 
 echarts.use([
@@ -163,12 +163,24 @@ interface MatchEventsModalProps {
     since?: string | null;
     until?: string | null;
     windowLabel?: string;
+    /** Sibling-stream room IDs the parent should pass through to the
+     *  gifter detail modal as `extraRoomIds`. Carries the rival's
+     *  `room_id` so an opponent-side donor's gifts (which sit in the
+     *  rival's broadcast, not the current page's) are still found by
+     *  the modal's per-room searchEvents query. */
+    extraRoomIds?: string[];
   }) => void;
   /** Optional: swap the modal's current match. Used by the H2H tab
    *  and the Marquee Battles cards to drill into a related battle
    *  without closing → reopening. The parent owns the
    *  `selectedMatch` state that drives this modal. */
   onSelectMatch?: (m: TikTokMatch) => void;
+  /** When true, suppress every admin-write affordance: the opponent
+   *  cells' "+ Add to monitor" pills + the underlying `listLives`
+   *  prefetch + the `TikTokAddLiveModal` confirmation. Used when the
+   *  modal is mounted from the public live-detail page. Default
+   *  `false` preserves the admin behaviour. */
+  readOnly?: boolean;
 }
 
 type Tab = 'overview' | 'timeline' | 'gifters' | 'activity' | 'h2h';
@@ -190,12 +202,16 @@ export function TikTokMatchEventsModal({
   hostHandle,
   onSelectGifter,
   onSelectMatch,
+  readOnly = false,
 }: MatchEventsModalProps) {
+  const tiktokApi = useTikTokApi();
   const [tab, setTab] = useState<Tab>('overview');
   // Lowercased handles already in `tiktok_subscriptions`. Drives the
   // "✓ Monitoring" vs "+ Add to monitor" affordance on each opponent
   // card. Refetched on every modal open since a new live could have
-  // been added since the last open.
+  // been added since the last open. Skipped entirely in read-only
+  // mode — the public namespace doesn't expose listLives, and the
+  // opponent monitor pills are hidden anyway.
   const [subscribedSet, setSubscribedSet] = useState<Set<string>>(() => new Set());
   // Pending "Add to monitor" confirmation. We hand the opponent's
   // handle off to the canonical `TikTokAddLiveModal` so the preview
@@ -209,6 +225,10 @@ export function TikTokMatchEventsModal({
 
   useEffect(() => {
     if (!isOpen) return;
+    if (readOnly) {
+      setSubscribedSet(new Set());
+      return;
+    }
     let cancelled = false;
     tiktokApi
       .listLives()
@@ -227,7 +247,8 @@ export function TikTokMatchEventsModal({
     return () => {
       cancelled = true;
     };
-  }, [isOpen]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, readOnly]);
 
   const confirmAdd = async () => {
     if (!addCandidate?.unique_id) return;
@@ -274,19 +295,24 @@ export function TikTokMatchEventsModal({
           hostHandle={hostHandle}
           subscribedSet={subscribedSet}
           onAddRequested={setAddCandidate}
+          readOnly={readOnly}
         />
       )}
 
       {/* Add-to-monitor — same modal flow as /admin/tiktok's Add Live
           so the operator sees identical preview data (avatar,
           followers, live state, bio, warnings, already-subscribed
-          banner). */}
-      <TikTokAddLiveModal
-        isOpen={addCandidate !== null}
-        handle={addCandidate?.unique_id ?? ''}
-        onCancel={() => setAddCandidate(null)}
-        onConfirm={confirmAdd}
-      />
+          banner). Suppressed in read-only mode so it never mounts in
+          public contexts (its onConfirm calls createLive, an
+          admin-write endpoint). */}
+      {!readOnly && (
+        <TikTokAddLiveModal
+          isOpen={addCandidate !== null}
+          handle={addCandidate?.unique_id ?? ''}
+          onCancel={() => setAddCandidate(null)}
+          onConfirm={confirmAdd}
+        />
+      )}
 
       {/* Tab bar — overflow scroll on narrow viewports so the 5 tabs
           don't wrap and break the underline alignment. */}
@@ -359,6 +385,7 @@ function MatchHeader({
   hostHandle,
   subscribedSet,
   onAddRequested,
+  readOnly = false,
 }: {
   match: TikTokMatch;
   hostHandle: string;
@@ -368,6 +395,9 @@ function MatchHeader({
    *  card — the modal opens a confirmation dialog with the full
    *  opponent record (avatar, score, etc.). */
   onAddRequested: (o: TikTokMatchOpponent) => void;
+  /** When true, opponent cells render with name/avatar only — no
+   *  "+ Add to monitor" pill, no internal admin link. */
+  readOnly?: boolean;
 }) {
   const { tz } = useTikTokTimezone();
   // The TS type says `opponents: TikTokMatchOpponent[]`, but the
@@ -576,6 +606,7 @@ function MatchHeader({
                       : false
                   }
                   onAddRequested={onAddRequested}
+                  readOnly={readOnly}
                 />
               ))}
             </div>
@@ -595,10 +626,16 @@ function OpponentCell({
   o,
   isMonitored,
   onAddRequested,
+  readOnly = false,
 }: {
   o: TikTokMatchOpponent;
   isMonitored: boolean;
   onAddRequested: (o: TikTokMatchOpponent) => void;
+  /** When true, drop the trailing monitor pill entirely — both the
+   *  "+ Add to monitor" button (admin-write) and the "✓ Monitoring"
+   *  link (points at the admin route a public viewer can't see).
+   *  Public users still get the avatar / name / handle row. */
+  readOnly?: boolean;
 }) {
   const handle = o.unique_id || '';
   const display = o.nickname || handle || '—';
@@ -629,7 +666,7 @@ function OpponentCell({
           </div>
         )}
       </div>
-      {!handle ? (
+      {readOnly ? null : !handle ? (
         <span className="shrink-0 text-[10px] font-mono text-gray-400 italic">
           no handle
         </span>
@@ -667,6 +704,7 @@ function OverviewTab({
   hostHandle: string;
   onSelectGifter?: MatchEventsModalProps['onSelectGifter'];
 }) {
+  const tiktokApi = useTikTokApi();
   const [sides, setSides] = useState<TikTokMatchGiftersBySide | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -750,6 +788,7 @@ function MatchTopDonors({
   const total = rows.reduce((acc, r) => acc + r.diamonds, 0) || 1;
   const since = match.started_at;
   const until = match.ended_at ?? match.last_seen_at;
+  const siblingRoomIds = sides.totals?.sibling_room_ids;
   const pick = (r: Row) => {
     if (!onSelectGifter) return;
     onSelectGifter({
@@ -763,6 +802,7 @@ function MatchTopDonors({
       since,
       until,
       windowLabel: 'This battle',
+      extraRoomIds: siblingRoomIds,
     });
   };
   const sideTone = (s: Row['side']) => {
@@ -943,7 +983,21 @@ function SideBalanceBar({
           diamonds={t.opponent_diamonds}
           subline={
             oppScore != null
-              ? `PK score ${compact(oppScore)}${oppMissing > 0 ? ` · +${compact(oppMissing)} from opponent's stream (not ingested)` : ''}`
+              ? (() => {
+                  const base = `PK score ${compact(oppScore)}`;
+                  if (oppMissing <= 0) return base;
+                  // Phrase the gap differently when we DID ingest the
+                  // opponent's stream (sibling merge): the missing
+                  // diamonds aren't lost to "the other broadcast we
+                  // can't see", they're a discrepancy between TikTok's
+                  // weighted PK tally and the raw gift events. Show
+                  // that as "+Xk vs TikTok's tally" instead of the
+                  // misleading "from opponent's stream (not ingested)".
+                  const merged = (t.siblings_merged ?? 0) > 0;
+                  return merged
+                    ? `${base} · we captured ${compact(t.opponent_diamonds)}, gap ${compact(oppMissing)} (TikTok multipliers)`
+                    : `${base} · +${compact(oppMissing)} from opponent's stream (not ingested)`;
+                })()
               : undefined
           }
         />
@@ -961,17 +1015,31 @@ function SideBalanceBar({
         )}
       </div>
       {/* Honest caption — the audit's "save evidence when inferring"
-          rule. Without this, an operator would think the system
-          missed the opponent's gifts; in fact those happen in the
-          opponent's separate broadcast. */}
+          rule. Two phrasings depending on whether the opponent's
+          stream is also monitored: when it IS, we merged their gift
+          events in, and any remaining gap to TikTok's PK score is a
+          tally-vs-events discrepancy (multipliers, golden minute,
+          server-side adjustments); when it ISN'T, we genuinely don't
+          have their per-event breakdown because we never subscribed
+          to that broadcast. */}
       {oppScore != null && oppScore > 0 && t.opponent_diamonds < oppScore && (
-        <p className="mt-2 text-[11px] text-gray-500 font-mono leading-relaxed">
-          Opponent's PK score reflects gifts sent in their own broadcast — we
-          only subscribe to <span className="text-emerald-700 dark:text-emerald-300">@{hostHandle}</span>'s
-          stream, so opponent-side gifters and per-event diamond breakdowns
-          aren't available. The score chip above carries TikTok's authoritative
-          tally for that side.
-        </p>
+        (t.siblings_merged ?? 0) > 0 ? (
+          <p className="mt-2 text-[11px] text-gray-500 font-mono leading-relaxed">
+            Opponent is monitored too — we merged their stream's gift
+            events into the breakdown above. The remaining gap to
+            TikTok's PK score reflects their authoritative tally with
+            multipliers / weighted scoring we can't reconstruct from
+            raw gift events.
+          </p>
+        ) : (
+          <p className="mt-2 text-[11px] text-gray-500 font-mono leading-relaxed">
+            Opponent's PK score reflects gifts sent in their own broadcast — we
+            only subscribe to <span className="text-emerald-700 dark:text-emerald-300">@{hostHandle}</span>'s
+            stream, so opponent-side gifters and per-event diamond breakdowns
+            aren't available. The score chip above carries TikTok's authoritative
+            tally for that side.
+          </p>
+        )
       )}
     </section>
   );
@@ -1035,6 +1103,7 @@ function SideTopGifters({
 }) {
   const since = match.started_at;
   const until = match.ended_at ?? match.last_seen_at;
+  const siblingRoomIds = sides.totals?.sibling_room_ids;
   const pickGifter = (g: TikTokMatchSideGifter) => {
     if (!onSelectGifter) return;
     onSelectGifter({
@@ -1048,6 +1117,7 @@ function SideTopGifters({
       since,
       until,
       windowLabel: 'This battle',
+      extraRoomIds: siblingRoomIds,
     });
   };
   return (
@@ -1151,6 +1221,7 @@ function ScoreTimelineTab({
   match: TikTokMatch;
   hostHandle: string;
 }) {
+  const tiktokApi = useTikTokApi();
   const [frames, setFrames] = useState<TikTokMatchScoreFrame[] | null>(null);
   const [loading, setLoading] = useState(false);
   const isDark = useDarkMode();
@@ -1462,6 +1533,7 @@ function GiftersTab({
   hostHandle: string;
   onSelectGifter?: MatchEventsModalProps['onSelectGifter'];
 }) {
+  const tiktokApi = useTikTokApi();
   const GIFTER_PAGE_SIZES = [25, 50, 100, 250] as const;
 
   const [sides, setSides] = useState<TikTokMatchGiftersBySide | null>(null);
@@ -1652,90 +1724,172 @@ function GiftersTab({
           No gifters match the current filters.
         </p>
       ) : (
-        <div className="rounded-lg border border-gray-200 overflow-x-auto">
-          <table className="w-full text-xs min-w-[640px]">
-            <thead className="bg-gray-50 dark:bg-white/[0.04]">
-              <tr>
-                <th className="px-3 py-1.5 text-left auth-mono-label">#</th>
-                <th className="px-3 py-1.5 text-left auth-mono-label">Gifter</th>
-                <th className="px-3 py-1.5 text-left auth-mono-label">Side</th>
-                <th className="px-3 py-1.5 text-right auth-mono-label">Diamonds</th>
-                <th className="px-3 py-1.5 text-right auth-mono-label">Gifts</th>
-                <th className="px-3 py-1.5 text-right auth-mono-label">Largest</th>
-              </tr>
-            </thead>
-            <tbody>
-              {visible.map((g, i) => {
-                const display = g.nickname || g.unique_id || '—';
-                const sideMeta = {
-                  host:     { label: 'host',     class: 'bg-emerald-100 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-300' },
-                  opponent: { label: 'opponent', class: 'bg-rose-100 dark:bg-rose-500/15 text-rose-700 dark:text-rose-300' },
-                  unknown:  { label: '?',        class: 'bg-gray-100 text-gray-600' },
-                  all:      { label: '—',        class: 'bg-gray-100 text-gray-600' },
-                }[g.side];
-                return (
-                  <tr
-                    key={`${g.user_id}-${g.side}`}
-                    className="border-t border-gray-200 hover:bg-gray-50 dark:hover:bg-white/[0.04] cursor-pointer"
-                    onClick={() =>
-                      onSelectGifter?.({
-                        userId: g.user_id,
-                        uniqueId: g.unique_id,
-                        nickname: g.nickname,
-                        diamonds: g.diamonds,
-                        gifts: g.gifts,
-                        comments: 0,
-                        tab: 'gifts',
-                        since,
-                        until,
-                        windowLabel: 'This battle',
-                      })
-                    }
-                  >
-                    <td className="px-3 py-1.5 text-gray-400 tabular-nums">{offset + i + 1}</td>
-                    <td className="px-3 py-1.5">
-                      <div className="flex items-center gap-2">
-                        {g.avatar_url ? (
-                          <img
-                            src={g.avatar_url}
-                            alt=""
-                            className="w-6 h-6 rounded-full object-cover"
-                            referrerPolicy="no-referrer"
-                            loading="lazy"
-                          />
-                        ) : (
-                          <div className="w-6 h-6 rounded-full bg-gray-200 dark:bg-white/10 text-gray-500 flex items-center justify-center text-[10px] font-bold">
-                            {display[0]?.toUpperCase()}
-                          </div>
-                        )}
-                        <span className="font-medium">{display}</span>
-                        {g.unique_id && g.unique_id !== display && (
-                          <span className="text-[10px] text-gray-500 font-mono">
-                            @{g.unique_id}
-                          </span>
-                        )}
+        <>
+          {/* Desktop: 6-column table (md+). */}
+          <div className="hidden md:block rounded-lg border border-gray-200">
+            <table className="w-full text-xs">
+              <thead className="bg-gray-50 dark:bg-white/[0.04]">
+                <tr>
+                  <th className="px-3 py-1.5 text-left auth-mono-label">#</th>
+                  <th className="px-3 py-1.5 text-left auth-mono-label">Gifter</th>
+                  <th className="px-3 py-1.5 text-left auth-mono-label">Side</th>
+                  <th className="px-3 py-1.5 text-right auth-mono-label">Diamonds</th>
+                  <th className="px-3 py-1.5 text-right auth-mono-label">Gifts</th>
+                  <th className="px-3 py-1.5 text-right auth-mono-label">Largest</th>
+                </tr>
+              </thead>
+              <tbody>
+                {visible.map((g, i) => {
+                  const display = g.nickname || g.unique_id || '—';
+                  const sideMeta = {
+                    host:     { label: 'host',     class: 'bg-emerald-100 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-300' },
+                    opponent: { label: 'opponent', class: 'bg-rose-100 dark:bg-rose-500/15 text-rose-700 dark:text-rose-300' },
+                    unknown:  { label: '?',        class: 'bg-gray-100 text-gray-600' },
+                    all:      { label: '—',        class: 'bg-gray-100 text-gray-600' },
+                  }[g.side];
+                  return (
+                    <tr
+                      key={`${g.user_id}-${g.side}`}
+                      className="border-t border-gray-200 hover:bg-gray-50 dark:hover:bg-white/[0.04] cursor-pointer"
+                      onClick={() =>
+                        onSelectGifter?.({
+                          userId: g.user_id,
+                          uniqueId: g.unique_id,
+                          nickname: g.nickname,
+                          diamonds: g.diamonds,
+                          gifts: g.gifts,
+                          comments: 0,
+                          tab: 'gifts',
+                          since,
+                          until,
+                          windowLabel: 'This battle',
+                        })
+                      }
+                    >
+                      <td className="px-3 py-1.5 text-gray-400 tabular-nums">{offset + i + 1}</td>
+                      <td className="px-3 py-1.5">
+                        <div className="flex items-center gap-2">
+                          {g.avatar_url ? (
+                            <img
+                              src={g.avatar_url}
+                              alt=""
+                              className="w-6 h-6 rounded-full object-cover"
+                              referrerPolicy="no-referrer"
+                              loading="lazy"
+                            />
+                          ) : (
+                            <div className="w-6 h-6 rounded-full bg-gray-200 dark:bg-white/10 text-gray-500 flex items-center justify-center text-[10px] font-bold">
+                              {display[0]?.toUpperCase()}
+                            </div>
+                          )}
+                          <span className="font-medium">{display}</span>
+                          {g.unique_id && g.unique_id !== display && (
+                            <span className="text-[10px] text-gray-500 font-mono">
+                              @{g.unique_id}
+                            </span>
+                          )}
+                        </div>
+                      </td>
+                      <td className="px-3 py-1.5">
+                        <span className={`inline-flex items-center px-1.5 py-0.5 rounded-full text-[10px] uppercase tracking-wider ${sideMeta.class}`}>
+                          {sideMeta.label}
+                        </span>
+                      </td>
+                      <td className="px-3 py-1.5 text-right font-mono tabular-nums text-amber-700 dark:text-amber-300 font-bold">
+                        {g.diamonds.toLocaleString()}
+                      </td>
+                      <td className="px-3 py-1.5 text-right font-mono tabular-nums">
+                        {g.gifts.toLocaleString()}
+                      </td>
+                      <td className="px-3 py-1.5 text-right font-mono tabular-nums text-gray-500">
+                        {g.largest_single.toLocaleString()}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          {/* Mobile: card per gifter (below md). */}
+          <ul className="md:hidden flex flex-col gap-2">
+            {visible.map((g, i) => {
+              const display = g.nickname || g.unique_id || '—';
+              const sideMeta = {
+                host:     { label: 'host',     class: 'bg-emerald-100 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-300' },
+                opponent: { label: 'opponent', class: 'bg-rose-100 dark:bg-rose-500/15 text-rose-700 dark:text-rose-300' },
+                unknown:  { label: '?',        class: 'bg-gray-100 text-gray-600' },
+                all:      { label: '—',        class: 'bg-gray-100 text-gray-600' },
+              }[g.side];
+              return (
+                <li
+                  key={`${g.user_id}-${g.side}`}
+                  className="rounded-md border border-gray-200 bg-white dark:bg-white/[0.03] px-3 py-2.5 cursor-pointer hover:bg-gray-50 dark:hover:bg-white/[0.04] transition-colors"
+                  onClick={() =>
+                    onSelectGifter?.({
+                      userId: g.user_id,
+                      uniqueId: g.unique_id,
+                      nickname: g.nickname,
+                      diamonds: g.diamonds,
+                      gifts: g.gifts,
+                      comments: 0,
+                      tab: 'gifts',
+                      since,
+                      until,
+                      windowLabel: 'This battle',
+                    })
+                  }
+                >
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span className="font-mono text-[10px] text-gray-400 tabular-nums shrink-0 w-6">
+                      #{offset + i + 1}
+                    </span>
+                    {g.avatar_url ? (
+                      <img
+                        src={g.avatar_url}
+                        alt=""
+                        className="w-8 h-8 rounded-full object-cover shrink-0"
+                        referrerPolicy="no-referrer"
+                        loading="lazy"
+                      />
+                    ) : (
+                      <div className="w-8 h-8 rounded-full bg-gray-200 dark:bg-white/10 text-gray-500 flex items-center justify-center text-xs font-bold shrink-0">
+                        {display[0]?.toUpperCase()}
                       </div>
-                    </td>
-                    <td className="px-3 py-1.5">
-                      <span className={`inline-flex items-center px-1.5 py-0.5 rounded-full text-[10px] uppercase tracking-wider ${sideMeta.class}`}>
-                        {sideMeta.label}
+                    )}
+                    <div className="min-w-0 flex-1">
+                      <div className="text-sm font-medium truncate">{display}</div>
+                      {g.unique_id && g.unique_id !== display && (
+                        <div className="text-[11px] text-gray-500 font-mono truncate">
+                          @{g.unique_id}
+                        </div>
+                      )}
+                    </div>
+                    <span className={`shrink-0 inline-flex items-center px-1.5 py-0.5 rounded-full text-[10px] uppercase tracking-wider ${sideMeta.class}`}>
+                      {sideMeta.label}
+                    </span>
+                  </div>
+                  <div className="mt-2 pt-2 border-t border-gray-100 grid grid-cols-3 gap-2 text-[11px] font-mono">
+                    <div className="flex flex-col">
+                      <span className="text-[10px] uppercase tracking-wider text-gray-400">Diamonds</span>
+                      <span className="tabular-nums font-bold text-amber-700 dark:text-amber-300">
+                        {g.diamonds.toLocaleString()}
                       </span>
-                    </td>
-                    <td className="px-3 py-1.5 text-right font-mono tabular-nums text-amber-700 dark:text-amber-300 font-bold">
-                      {g.diamonds.toLocaleString()}
-                    </td>
-                    <td className="px-3 py-1.5 text-right font-mono tabular-nums">
-                      {g.gifts.toLocaleString()}
-                    </td>
-                    <td className="px-3 py-1.5 text-right font-mono tabular-nums text-gray-500">
-                      {g.largest_single.toLocaleString()}
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
+                    </div>
+                    <div className="flex flex-col">
+                      <span className="text-[10px] uppercase tracking-wider text-gray-400">Gifts</span>
+                      <span className="tabular-nums text-gray-700">{g.gifts.toLocaleString()}</span>
+                    </div>
+                    <div className="flex flex-col text-right">
+                      <span className="text-[10px] uppercase tracking-wider text-gray-400">Largest</span>
+                      <span className="tabular-nums text-gray-500">{g.largest_single.toLocaleString()}</span>
+                    </div>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        </>
       )}
       {/* Pagination — only when more than one page exists. */}
       {totalPages > 1 && (
@@ -1800,6 +1954,7 @@ function ActivityTab({
   match: TikTokMatch;
   hostHandle: string;
 }) {
+  const tiktokApi = useTikTokApi();
   const { tz } = useTikTokTimezone();
   const [activeType, setActiveType] = useState<string | null>(null);
   const [q, setQ] = useState('');
@@ -1828,9 +1983,15 @@ function ActivityTab({
     let cancelled = false;
     setLoading(true);
     const md = minDiamonds === '' ? undefined : Number(minDiamonds);
+    // Public namespace requires `room_ids` even when filtering by
+    // `match_id` (auth boundary is the room set, not the match). The
+    // admin namespace ignores it when match_id is present, so pinning
+    // the match's home room here is safe for both contexts.
+    const matchRoomIds = match.room_id ? [String(match.room_id)] : undefined;
     Promise.all([
       tiktokApi.searchEvents({
         match_id: match.id,
+        room_ids: matchRoomIds,
         type: activeType || undefined,
         q: debouncedQ || undefined,
         min_diamonds: md,
@@ -1840,6 +2001,7 @@ function ActivityTab({
       total === null
         ? tiktokApi.countEvents({
             match_id: match.id,
+            room_ids: matchRoomIds,
             type: activeType || undefined,
             q: debouncedQ || undefined,
             min_diamonds: md,
@@ -1936,68 +2098,114 @@ function ActivityTab({
         </div>
       </div>
 
-      <div className="rounded-lg border border-gray-200 overflow-x-auto">
-        <table className="w-full text-sm min-w-[640px]">
-          <thead className="bg-gray-50 dark:bg-white/[0.04]">
-            <tr>
-              <th className="px-3 py-2 text-left auth-mono-label">When</th>
-              <th className="px-3 py-2 text-left auth-mono-label">Type</th>
-              <th className="px-3 py-2 text-left auth-mono-label">User</th>
-              <th className="px-3 py-2 text-left auth-mono-label">Detail</th>
-            </tr>
-          </thead>
-          <tbody>
-            {loading && items.length === 0 && (
+      {/* Loading / empty banners are shared between layouts. */}
+      {loading && items.length === 0 && (
+        <div className="px-3 py-8 text-center text-gray-500 rounded-lg border border-gray-200">
+          <Loader2 className="w-4 h-4 inline mr-2 animate-spin" />
+          Loading events…
+        </div>
+      )}
+      {!loading && items.length === 0 && (
+        <div className="px-3 py-8 text-center text-gray-500 rounded-lg border border-gray-200">
+          No events match the current filters.
+        </div>
+      )}
+
+      {/* Desktop: 4-column table (md+). */}
+      {items.length > 0 && (
+        <div className="hidden md:block rounded-lg border border-gray-200">
+          <table className="w-full text-sm">
+            <thead className="bg-gray-50 dark:bg-white/[0.04]">
               <tr>
-                <td colSpan={4} className="px-3 py-8 text-center text-gray-500">
-                  <Loader2 className="w-4 h-4 inline mr-2 animate-spin" />
-                  Loading events…
-                </td>
+                <th className="px-3 py-2 text-left auth-mono-label">When</th>
+                <th className="px-3 py-2 text-left auth-mono-label">Type</th>
+                <th className="px-3 py-2 text-left auth-mono-label">User</th>
+                <th className="px-3 py-2 text-left auth-mono-label">Detail</th>
               </tr>
-            )}
-            {!loading && items.length === 0 && (
-              <tr>
-                <td colSpan={4} className="px-3 py-8 text-center text-gray-500">
-                  No events match the current filters.
-                </td>
-              </tr>
-            )}
-            {items.map((e) => {
-              const p = (e.payload || {}) as Record<string, unknown>;
-              const u =
-                (p.user as { unique_id?: string; nickname?: string } | undefined) ||
-                {};
-              const meta = metaFor(e.type);
-              return (
-                <tr key={e.id} className="border-t border-gray-200">
-                  <td className="px-3 py-1.5 font-mono text-xs text-gray-500 whitespace-nowrap">
+            </thead>
+            <tbody>
+              {items.map((e) => {
+                const p = (e.payload || {}) as Record<string, unknown>;
+                const u =
+                  (p.user as { unique_id?: string; nickname?: string } | undefined) ||
+                  {};
+                const meta = metaFor(e.type);
+                return (
+                  <tr key={e.id} className="border-t border-gray-200">
+                    <td className="px-3 py-1.5 font-mono text-xs text-gray-500 whitespace-nowrap">
+                      {fmtTime(e.ts, tz)}
+                    </td>
+                    <td className="px-3 py-1.5">
+                      <span
+                        className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded font-mono text-[10px] ${meta.tone}`}
+                      >
+                        {meta.icon}
+                        {meta.label}
+                      </span>
+                    </td>
+                    <td className="px-3 py-1.5 text-xs">
+                      {u.nickname && <span className="font-medium">{u.nickname}</span>}
+                      {u.unique_id && (
+                        <span className="ml-1 font-mono text-[11px] text-gray-500">
+                          @{u.unique_id}
+                        </span>
+                      )}
+                    </td>
+                    <td className="px-3 py-1.5 text-xs text-gray-700">
+                      {summarize(e)}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* Mobile: one card per event (below md). Header row: time +
+          type pill. Body: user + summary. */}
+      {items.length > 0 && (
+        <ul className="md:hidden flex flex-col gap-1.5">
+          {items.map((e) => {
+            const p = (e.payload || {}) as Record<string, unknown>;
+            const u =
+              (p.user as { unique_id?: string; nickname?: string } | undefined) ||
+              {};
+            const meta = metaFor(e.type);
+            return (
+              <li
+                key={e.id}
+                className="rounded-md border border-gray-200 bg-white dark:bg-white/[0.03] px-3 py-2"
+              >
+                <div className="flex items-center justify-between gap-2 mb-1">
+                  <span className="font-mono text-[11px] text-gray-500 whitespace-nowrap">
                     {fmtTime(e.ts, tz)}
-                  </td>
-                  <td className="px-3 py-1.5">
-                    <span
-                      className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded font-mono text-[10px] ${meta.tone}`}
-                    >
-                      {meta.icon}
-                      {meta.label}
-                    </span>
-                  </td>
-                  <td className="px-3 py-1.5 text-xs">
+                  </span>
+                  <span
+                    className={`shrink-0 inline-flex items-center gap-1 px-1.5 py-0.5 rounded font-mono text-[10px] ${meta.tone}`}
+                  >
+                    {meta.icon}
+                    {meta.label}
+                  </span>
+                </div>
+                {(u.nickname || u.unique_id) && (
+                  <div className="text-xs mb-0.5">
                     {u.nickname && <span className="font-medium">{u.nickname}</span>}
                     {u.unique_id && (
                       <span className="ml-1 font-mono text-[11px] text-gray-500">
                         @{u.unique_id}
                       </span>
                     )}
-                  </td>
-                  <td className="px-3 py-1.5 text-xs text-gray-700">
-                    {summarize(e)}
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
+                  </div>
+                )}
+                <div className="text-xs text-gray-700 break-words">
+                  {summarize(e)}
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      )}
       <div className="flex items-center justify-between gap-2 text-[11px] font-mono text-gray-500">
         <span>
           {realTotal === 0
@@ -2046,6 +2254,7 @@ function HeadToHeadTab({
    *  that prior battle. Parent owns the `selectedMatch` state. */
   onOpenMatch?: (matchId: number) => void;
 }) {
+  const tiktokApi = useTikTokApi();
   const { tz } = useTikTokTimezone();
   const [rows, setRows] = useState<TikTokMatchHeadToHeadRow[] | null>(null);
   const [loading, setLoading] = useState(false);
@@ -2708,60 +2917,133 @@ function H2HRowsTable({
       </p>
     );
   }
+  const outcomeTone = (outcome: string | null | undefined) =>
+    ({
+      won:   'text-emerald-700 dark:text-emerald-300',
+      lost:  'text-rose-700 dark:text-rose-300',
+      draw:  'text-amber-700 dark:text-amber-300',
+      ended: 'text-gray-500',
+    }[outcome ?? 'ended']);
+  const decisiveBadgeFor = (decisive_pct: number | null | undefined) =>
+    decisive_pct != null
+      ? decisive_pct >= 50
+        ? { label: 'decisive', cls: 'bg-rose-100 dark:bg-rose-500/15 text-rose-700 dark:text-rose-300' }
+        : decisive_pct >= 20
+          ? { label: 'comfortable', cls: 'bg-amber-100 dark:bg-amber-500/15 text-amber-700 dark:text-amber-300' }
+          : { label: 'close', cls: 'bg-sky-100 dark:bg-sky-500/15 text-sky-700 dark:text-sky-300' }
+      : null;
+
   return (
-    <section className="rounded-lg border border-gray-200 overflow-x-auto">
-      <table className="w-full text-xs min-w-[640px]">
-        <thead className="bg-gray-50 dark:bg-white/[0.04]">
-          <tr>
-            <th className="px-3 py-1.5 text-left auth-mono-label">When</th>
-            <th className="px-3 py-1.5 text-left auth-mono-label">Opponent(s)</th>
-            <th className="px-3 py-1.5 text-right auth-mono-label">Score</th>
-            <th className="px-3 py-1.5 text-right auth-mono-label">Margin</th>
-            <th className="px-3 py-1.5 text-right auth-mono-label">Diamonds</th>
-            <th className="px-3 py-1.5 text-right auth-mono-label">Outcome</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((r) => {
-            const tone = {
-              won:   'text-emerald-700 dark:text-emerald-300',
-              lost:  'text-rose-700 dark:text-rose-300',
-              draw:  'text-amber-700 dark:text-amber-300',
-              ended: 'text-gray-500',
-            }[r.outcome ?? 'ended'];
-            // Decisive vs nail-biter pill on the margin column.
-            const decisiveBadge =
-              r.decisive_pct != null
-                ? r.decisive_pct >= 50
-                  ? { label: 'decisive', cls: 'bg-rose-100 dark:bg-rose-500/15 text-rose-700 dark:text-rose-300' }
-                  : r.decisive_pct >= 20
-                    ? { label: 'comfortable', cls: 'bg-amber-100 dark:bg-amber-500/15 text-amber-700 dark:text-amber-300' }
-                    : { label: 'close', cls: 'bg-sky-100 dark:bg-sky-500/15 text-sky-700 dark:text-sky-300' }
-                : null;
-            return (
-              <tr
-                key={r.id}
-                className="border-t border-gray-200 hover:bg-gray-50 dark:hover:bg-white/[0.04] cursor-pointer"
-                onClick={() => onOpen?.(r.id)}
-                title="Open this battle"
-              >
-                <td className="px-3 py-1.5 text-gray-500 font-mono whitespace-nowrap">
+    <>
+      {/* Desktop: 6-column table (md+). */}
+      <section className="hidden md:block rounded-lg border border-gray-200">
+        <table className="w-full text-xs">
+          <thead className="bg-gray-50 dark:bg-white/[0.04]">
+            <tr>
+              <th className="px-3 py-1.5 text-left auth-mono-label">When</th>
+              <th className="px-3 py-1.5 text-left auth-mono-label">Opponent(s)</th>
+              <th className="px-3 py-1.5 text-right auth-mono-label">Score</th>
+              <th className="px-3 py-1.5 text-right auth-mono-label">Margin</th>
+              <th className="px-3 py-1.5 text-right auth-mono-label">Diamonds</th>
+              <th className="px-3 py-1.5 text-right auth-mono-label">Outcome</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => {
+              const tone = outcomeTone(r.outcome);
+              const decisiveBadge = decisiveBadgeFor(r.decisive_pct);
+              return (
+                <tr
+                  key={r.id}
+                  className="border-t border-gray-200 hover:bg-gray-50 dark:hover:bg-white/[0.04] cursor-pointer"
+                  onClick={() => onOpen?.(r.id)}
+                  title="Open this battle"
+                >
+                  <td className="px-3 py-1.5 text-gray-500 font-mono whitespace-nowrap">
+                    {fmtTs(r.started_at, tz)}
+                  </td>
+                  <td className="px-3 py-1.5">
+                    {(r.opponent_handles ?? []).slice(0, 3).map((h) => `@${h}`).join(', ')}
+                    {(r.opponent_handles?.length ?? 0) > 3 && (
+                      <span className="text-gray-500"> +{(r.opponent_handles?.length ?? 0) - 3}</span>
+                    )}
+                  </td>
+                  <td className="px-3 py-1.5 text-right font-mono tabular-nums">
+                    {r.host_score != null && r.opp_score != null
+                      ? `${compact(r.host_score)}–${compact(r.opp_score)}`
+                      : '—'}
+                  </td>
+                  <td className="px-3 py-1.5 text-right font-mono tabular-nums">
+                    {r.margin != null ? (
+                      <span className="inline-flex items-center gap-1.5 justify-end">
+                        <span className={r.margin > 0 ? 'text-emerald-700 dark:text-emerald-300' : r.margin < 0 ? 'text-rose-700 dark:text-rose-300' : 'text-gray-500'}>
+                          {r.margin >= 0 ? '+' : '−'}{compact(Math.abs(r.margin))}
+                        </span>
+                        {decisiveBadge && (
+                          <span className={`text-[9px] uppercase tracking-wider px-1 py-0.5 rounded-full ${decisiveBadge.cls}`}>
+                            {decisiveBadge.label}
+                          </span>
+                        )}
+                      </span>
+                    ) : '—'}
+                  </td>
+                  <td
+                    className="px-3 py-1.5 text-right font-mono tabular-nums text-amber-700 dark:text-amber-300"
+                    title="Diamonds we ingested for this match. May be 0 when only the opponent's stream had gifts."
+                  >
+                    {r.diamonds_total > 0 ? r.diamonds_total.toLocaleString() : '—'}
+                  </td>
+                  <td
+                    className={`px-3 py-1.5 text-right font-mono uppercase tracking-wider text-[10px] font-bold ${tone}`}
+                  >
+                    {r.outcome}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </section>
+
+      {/* Mobile: card per battle (below md). */}
+      <ul className="md:hidden flex flex-col gap-2">
+        {rows.map((r) => {
+          const tone = outcomeTone(r.outcome);
+          const decisiveBadge = decisiveBadgeFor(r.decisive_pct);
+          return (
+            <li
+              key={r.id}
+              className="rounded-md border border-gray-200 bg-white dark:bg-white/[0.03] px-3 py-2.5 cursor-pointer hover:bg-gray-50 dark:hover:bg-white/[0.04] transition-colors"
+              onClick={() => onOpen?.(r.id)}
+              title="Tap to open this battle"
+            >
+              <div className="flex items-center justify-between gap-2 mb-1.5">
+                <span className="font-mono text-[11px] text-gray-500 whitespace-nowrap">
                   {fmtTs(r.started_at, tz)}
-                </td>
-                <td className="px-3 py-1.5">
-                  {(r.opponent_handles ?? []).slice(0, 3).map((h) => `@${h}`).join(', ')}
-                  {(r.opponent_handles?.length ?? 0) > 3 && (
-                    <span className="text-gray-500"> +{(r.opponent_handles?.length ?? 0) - 3}</span>
-                  )}
-                </td>
-                <td className="px-3 py-1.5 text-right font-mono tabular-nums">
-                  {r.host_score != null && r.opp_score != null
-                    ? `${compact(r.host_score)}–${compact(r.opp_score)}`
-                    : '—'}
-                </td>
-                <td className="px-3 py-1.5 text-right font-mono tabular-nums">
+                </span>
+                <span className={`shrink-0 font-mono uppercase tracking-wider text-[10px] font-bold ${tone}`}>
+                  {r.outcome}
+                </span>
+              </div>
+              <div className="text-xs mb-2 break-words">
+                {(r.opponent_handles ?? []).slice(0, 3).map((h) => `@${h}`).join(', ')}
+                {(r.opponent_handles?.length ?? 0) > 3 && (
+                  <span className="text-gray-500"> +{(r.opponent_handles?.length ?? 0) - 3}</span>
+                )}
+              </div>
+              <div className="pt-2 border-t border-gray-100 grid grid-cols-3 gap-2 text-[11px] font-mono">
+                <div className="flex flex-col">
+                  <span className="text-[10px] uppercase tracking-wider text-gray-400">Score</span>
+                  <span className="tabular-nums text-gray-700">
+                    {r.host_score != null && r.opp_score != null
+                      ? `${compact(r.host_score)}–${compact(r.opp_score)}`
+                      : '—'}
+                  </span>
+                </div>
+                <div className="flex flex-col">
+                  <span className="text-[10px] uppercase tracking-wider text-gray-400">Margin</span>
                   {r.margin != null ? (
-                    <span className="inline-flex items-center gap-1.5 justify-end">
+                    <span className="inline-flex items-center gap-1 tabular-nums">
                       <span className={r.margin > 0 ? 'text-emerald-700 dark:text-emerald-300' : r.margin < 0 ? 'text-rose-700 dark:text-rose-300' : 'text-gray-500'}>
                         {r.margin >= 0 ? '+' : '−'}{compact(Math.abs(r.margin))}
                       </span>
@@ -2771,25 +3053,25 @@ function H2HRowsTable({
                         </span>
                       )}
                     </span>
-                  ) : '—'}
-                </td>
-                <td
-                  className="px-3 py-1.5 text-right font-mono tabular-nums text-amber-700 dark:text-amber-300"
-                  title="Diamonds we ingested for this match. May be 0 when only the opponent's stream had gifts."
-                >
-                  {r.diamonds_total > 0 ? r.diamonds_total.toLocaleString() : '—'}
-                </td>
-                <td
-                  className={`px-3 py-1.5 text-right font-mono uppercase tracking-wider text-[10px] font-bold ${tone}`}
-                >
-                  {r.outcome}
-                </td>
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
-    </section>
+                  ) : (
+                    <span className="text-gray-500">—</span>
+                  )}
+                </div>
+                <div className="flex flex-col text-right">
+                  <span className="text-[10px] uppercase tracking-wider text-gray-400">Diamonds</span>
+                  <span
+                    className="tabular-nums text-amber-700 dark:text-amber-300"
+                    title="Diamonds we ingested for this match. May be 0 when only the opponent's stream had gifts."
+                  >
+                    {r.diamonds_total > 0 ? r.diamonds_total.toLocaleString() : '—'}
+                  </span>
+                </div>
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+    </>
   );
 }
 

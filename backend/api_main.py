@@ -110,21 +110,30 @@ def initialize_services():
     
     logger.info("Initializing services...")
 
-    # JWT secret safety check — refuse to start in production with the default secret
+    # JWT secret safety check — fail-CLOSED. Previously this check only
+    # bit when `PHOVEU_PRODUCTION=true|1|yes` was explicitly set, so a
+    # production deploy that forgot the flag (very easy mistake) would
+    # boot silently with the placeholder secret and sign forgeable JWTs.
+    # Now: if the secret is still the default, refuse to boot unless an
+    # operator has explicitly opted into dev mode via
+    # `PHOVEU_DEV_MODE=true|1|yes`. Dev mode logs a loud warning so the
+    # state is visible even locally.
     _default_jwt_secret = "your-super-secret-jwt-key-here-change-this-in-production"
     if CONFIG.get("JWT_SECRET") == _default_jwt_secret:
-        is_production = os.getenv("PHOVEU_PRODUCTION", "").lower() in ("true", "1", "yes")
-        if is_production:
+        is_dev = os.getenv("PHOVEU_DEV_MODE", "").lower() in ("true", "1", "yes")
+        if not is_dev:
             logger.critical(
                 "REFUSING TO START: JWT_SECRET is still the default value. "
-                "Set PHOVEU_BACKEND_JWT_SECRET to a secure random string before running in production."
+                "Set PHOVEU_BACKEND_JWT_SECRET to a secure random string. "
+                "If this is intentional for local development, set "
+                "PHOVEU_DEV_MODE=true to acknowledge the risk."
             )
             raise SystemExit(1)
-        else:
-            logger.warning(
-                "JWT_SECRET is the default value — acceptable for development only. "
-                "Set PHOVEU_BACKEND_JWT_SECRET before deploying to production."
-            )
+        logger.warning(
+            "JWT_SECRET is the default value — acceptable for development only "
+            "(PHOVEU_DEV_MODE=true). Set PHOVEU_BACKEND_JWT_SECRET before "
+            "deploying to production."
+        )
 
     # Schema validation is now done in main() before FastAPI starts
     logger.info("✅ Database schema validated before startup")
@@ -519,7 +528,59 @@ async def lifespan(app: FastAPI):
             await asyncio.sleep(interval)
 
     monitor_task = asyncio.create_task(run_background_maintenance())
-    
+
+    # ── TikTok cache warm-up ────────────────────────────────────────
+    # `/admin/tiktok` hits two endpoints on mount whose backing
+    # service methods have ~10–15 s in-process TTL caches but pay the
+    # full ~22 sequential SQL queries on a cold miss. Without this
+    # pre-warm the FIRST visit after a backend restart eats the full
+    # ~250–500 ms wall-clock. We kick the warm-up off as a fire-and-
+    # forget background task right after services init so:
+    #   • startup latency is unchanged (we don't `await`),
+    #   • the warm-up runs in a thread (via `to_thread`) so the event
+    #     loop stays responsive for incoming requests,
+    #   • if a user request arrives BEFORE the warm-up finishes, they
+    #     race against it — but every visit beyond the first ~500 ms
+    #     post-startup hits a populated cache and feels instant.
+    # Per-uvicorn-worker (each worker has its own in-process cache),
+    # so the warm-up runs once per worker. Cheap.
+    async def _warm_tiktok_caches() -> None:
+        tiktok_svc = services.get("tiktok_service")
+        if tiktok_svc is None:
+            return
+        try:
+            t0 = time.monotonic()
+            subs = await tiktok_svc.list_subscriptions()
+            handles = [
+                s["unique_id"]
+                for s in subs
+                if isinstance(s, dict) and s.get("unique_id")
+            ]
+            # Both calls are sync and DB-bound — `to_thread` to keep
+            # the event loop free for HTTP requests landing on uvicorn
+            # while the warm-up is in flight. `gather` so both calls
+            # run in parallel against the connection pool. Singleflight
+            # on the service-layer cache means a user request landing
+            # mid-warm-up blocks on the same lock instead of duplicating.
+            await asyncio.gather(
+                asyncio.to_thread(tiktok_svc.get_lives_summary, handles),
+                asyncio.to_thread(tiktok_svc.get_lives_totals),
+                return_exceptions=True,
+            )
+            # Wall-clock timing is the diagnostic signal: if this is
+            # >300 ms regularly, parallelising the ~22 sequential
+            # SQL queries inside get_lives_summary becomes worthwhile.
+            elapsed_ms = (time.monotonic() - t0) * 1000.0
+            logger.info(
+                "TikTok caches warmed in %.0f ms (%d handle%s).",
+                elapsed_ms, len(handles), "" if len(handles) == 1 else "s",
+            )
+        except Exception:
+            # Warm-up is best-effort; never block startup on it.
+            logger.exception("TikTok cache warm-up failed (non-fatal)")
+
+    warmup_task = asyncio.create_task(_warm_tiktok_caches())
+
     yield
     
     # Shutdown hooks
@@ -528,6 +589,15 @@ async def lifespan(app: FastAPI):
         await monitor_task
     except asyncio.CancelledError:
         pass
+
+    # Warm-up usually finishes in <1 s and is GC'd by then, but cancel
+    # defensively in case of a shutdown during a slow startup.
+    if not warmup_task.done():
+        warmup_task.cancel()
+        try:
+            await warmup_task
+        except (asyncio.CancelledError, Exception):
+            pass
 
     # Stop TikTok subscription pool (only when running in-process — in
     # worker mode the worker handles its own shutdown).

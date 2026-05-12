@@ -94,13 +94,14 @@ import { Button } from '@/components/ui/Button';
 import { Modal } from '@/components/ui/Modal';
 import {
   type TikTokCommonGifterDetail,
-  tiktokApi,
 } from '@admin/services/tiktok';
 import {
   TikTokUserBadges,
   type IdentityBlock,
 } from '@admin/components/TikTokUserBadges';
 import type { TikTokEvent } from '@admin/services/tiktok';
+import { useTikTokApi } from '@admin/contexts/TikTokApiContext';
+import { useTikTokRuntimeConfig } from '@admin/contexts/TikTokRuntimeConfigContext';
 import {
   useTikTokTimezone,
   fmtMonthDayTime,
@@ -116,6 +117,15 @@ interface Props {
   initialUniqueId?: string | null;
   initialAvatarUrl?: string | null;
   onClose: () => void;
+  /** When true, render WITHOUT the outer `<Modal>` chrome and the
+   *  shared identity header (avatar + nickname + stats + favourite
+   *  toggle + close). Used by the unified `TikTokGifterDetailModal`
+   *  which provides those at the shell level. The parent guarantees
+   *  this component only mounts while its tab is active — `isOpen`
+   *  is ignored in embedded mode and effects always fire as if open.
+   *
+   *  Default false → backwards-compatible with existing callers. */
+  embedded?: boolean;
 }
 
 function compactCount(n: number): string {
@@ -228,8 +238,26 @@ export function TikTokCommonGifterDetailModal({
   initialUniqueId,
   initialAvatarUrl,
   onClose,
+  embedded = false,
 }: Props) {
+  // Audience-aware API + audience flag for hiding admin-only mutations
+  // (favorite toggle / etc.) on the public mount. `useTikTokApi()`
+  // returns whichever namespace the surrounding TikTokApiProvider
+  // chose — admin tiktokApi on /admin/tiktok/<handle>, publicTiktokApi
+  // on /lives/<handle>. The public namespace has the read methods
+  // this modal needs (searchEvents, countEvents) but not the
+  // favorites mutations, so we ALSO check audience before calling
+  // those.
+  const tiktokApi = useTikTokApi();
+  const { audience } = useTikTokRuntimeConfig();
+  const isAdmin = audience === 'admin';
   const { tz } = useTikTokTimezone();
+  // In embedded mode the parent (the unified TikTokGifterDetailModal)
+  // only mounts us when its tab is active, so always treat as open
+  // for data-fetching effects below. Same pattern as
+  // TikTokGifterModal — derived alias to keep React's
+  // exhaustive-deps lint happy with a single named dep.
+  const isOpenEff = embedded || isOpen;
   const [data, setData] = useState<TikTokCommonGifterDetail | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -248,7 +276,16 @@ export function TikTokCommonGifterDetailModal({
   const [favoriteBusy, setFavoriteBusy] = useState(false);
 
   useEffect(() => {
-    if (!isOpen || !userId) {
+    if (!isOpenEff || !userId) {
+      setIsFavorite(null);
+      return;
+    }
+    // Admin-only: the favorites system is an operator-curated list
+    // and `isFavoriteGifter` is an /admin endpoint. On the public
+    // audience the publicTiktokApi doesn't expose this method —
+    // skip the lookup entirely and leave the star unset (the UI
+    // hides the favorite affordance anyway when `!isAdmin`).
+    if (!isAdmin) {
       setIsFavorite(null);
       return;
     }
@@ -264,7 +301,8 @@ export function TikTokCommonGifterDetailModal({
     return () => {
       cancelled = true;
     };
-  }, [isOpen, userId]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpenEff, userId, isAdmin]);
 
   const onToggleFavorite = async () => {
     if (!userId || favoriteBusy) return;
@@ -291,7 +329,7 @@ export function TikTokCommonGifterDetailModal({
   };
 
   useEffect(() => {
-    if (!isOpen || !userId) {
+    if (!isOpenEff || !userId) {
       setData(null);
       setError(null);
       return;
@@ -319,56 +357,57 @@ export function TikTokCommonGifterDetailModal({
     return () => {
       cancelled = true;
     };
-  }, [isOpen, userId]);
+  }, [isOpenEff, userId]);
 
   const nickname = data?.nickname ?? initialNickname ?? null;
   const uniqueId = data?.unique_id ?? initialUniqueId ?? null;
   const avatarUrl = data?.avatar_url ?? initialAvatarUrl ?? null;
   const display = nickname || uniqueId || (userId ? `User ${userId}` : 'Viewer');
 
-  return (
-    <Modal
-      isOpen={isOpen}
-      onClose={onClose}
-      title="Common gifter — deep analysis"
-      className="max-w-4xl"
-      footer={
-        <div className="flex items-center justify-between gap-2 w-full">
-          <span className="text-xs text-gray-500 font-mono">
-            {data
-              ? `${data.totals.host_count} hosts · ${data.totals.room_count} rooms · ${data.totals.gifts.toLocaleString()} gifts`
-              : ' '}
-          </span>
-          <div className="flex items-center gap-2">
-            <Button
-              variant={isFavorite ? 'primary' : 'ghost'}
-              onClick={onToggleFavorite}
-              disabled={favoriteBusy || !userId}
-              title={
-                isFavorite
-                  ? 'Remove from favourites — stops live alerts when they gift'
-                  : 'Add to favourites — fires a live alert whenever they gift in any tracked broadcast'
-              }
-            >
-              <Star
-                className={`w-4 h-4 mr-1.5 ${isFavorite ? 'fill-current' : ''}`}
-              />
-              {isFavorite ? 'Favourited' : 'Add to Favourites'}
-            </Button>
-            <Button variant="ghost" onClick={onClose}>Close</Button>
-          </div>
-        </div>
-      }
-    >
+  const modalFooter = (
+    <div className="flex items-center justify-between gap-2 w-full">
+      <span className="text-xs text-gray-500 font-mono">
+        {data
+          ? `${data.totals.host_count} hosts · ${data.totals.room_count} rooms · ${data.totals.gifts.toLocaleString()} gifts`
+          : ' '}
+      </span>
+      <div className="flex items-center gap-2">
+        {/* Favorites are admin-curated and only meaningful when
+            the WS notifier is wired to the operator's UI. Hide
+            the toggle entirely on the public audience — the
+            button's handlers call `tiktokApi.addFavoriteGifter`
+            / `removeFavoriteGifter`, neither of which exist on
+            the public namespace. */}
+        {isAdmin && (
+          <Button
+            variant={isFavorite ? 'primary' : 'ghost'}
+            onClick={onToggleFavorite}
+            disabled={favoriteBusy || !userId}
+            title={
+              isFavorite
+                ? 'Remove from favourites — stops live alerts when they gift'
+                : 'Add to favourites — fires a live alert whenever they gift in any tracked broadcast'
+            }
+          >
+            <Star
+              className={`w-4 h-4 mr-1.5 ${isFavorite ? 'fill-current' : ''}`}
+            />
+            {isFavorite ? 'Favourited' : 'Add to Favourites'}
+          </Button>
+        )}
+        <Button variant="ghost" onClick={onClose}>Close</Button>
+      </div>
+    </div>
+  );
+
+  const body = (
+    <>
       {/* Hero block — combines identity, the lifetime-diamonds
           headline, persona, dormancy callout, and rank/scale meta.
-          The previous design had an 8-cell grid where every figure
-          (lifetime diamonds, last_seen, rooms) had equal weight,
-          which buried the actually-interesting facts. The audit
-          recommended promoting persona + dormancy to header
-          subtitles so the eye lands on the signal before the
-          accounting. */}
-      {(() => {
+          Suppressed in embedded mode: the unified shell provides a
+          shared identity header at the top of the modal, so we'd
+          otherwise duplicate the avatar / nickname / personas. */}
+      {!embedded && (() => {
         const persona = inferPersona(data?.behavior);
         const dorm = data ? inferDormancy(data.totals.last_seen_at) : null;
         const personaToneClass = {
@@ -628,6 +667,20 @@ export function TikTokCommonGifterDetailModal({
           onSeedConsumed={() => setNetworkSeed(null)}
         />
       )}
+    </>
+  );
+
+  if (embedded) return body;
+
+  return (
+    <Modal
+      isOpen={isOpen}
+      onClose={onClose}
+      title="Common gifter — deep analysis"
+      className="max-w-4xl"
+      footer={modalFooter}
+    >
+      {body}
     </Modal>
   );
 }
@@ -952,6 +1005,10 @@ function HostMessages({
    *  parent (cheap, doesn't trigger a count query). */
   messageQ?: string;
 }) {
+  // Audience-aware API — the parent gate ensures this only renders
+  // on admin, but resolve through context anyway so a stray render
+  // on public doesn't 401.
+  const tiktokApi = useTikTokApi();
   const PAGE_OPTIONS = [10, 25, 50, 100] as const;
   const [open, setOpen] = useState(false);
   const [items, setItems] = useState<import('@admin/services/tiktok').TikTokEvent[]>([]);
@@ -2406,37 +2463,38 @@ function HeatmapPanel({
         <Clock className="w-3.5 h-3.5 text-amber-500" />
         When do they gift? (hour × day-of-week)
       </div>
-      {/* 7 rows × 24 cols, ~14px squares. Pull the scroll container
-          to the section's edges with negative margins so it escapes
-          the `p-4` padding on narrow viewports — otherwise the grid
-          gets clipped by the inner padding instead of becoming
-          horizontally scrollable. */}
-      <div className="-mx-4 px-4 overflow-x-auto">
-        <div className="inline-grid gap-[2px]"
-             style={{ gridTemplateColumns: 'auto repeat(24, 14px)' }}>
-          {/* Header row: hour numbers. */}
-          <div />
-          {Array.from({ length: 24 }, (_, h) => (
-            <div
-              key={`h-${h}`}
-              className="text-[8px] text-gray-400 font-mono text-center"
-            >
-              {h % 6 === 0 ? h : ''}
-            </div>
-          ))}
-          {/* 7 rows. */}
-          {DOW_LABELS.map((label, dow) => (
-            <RowFragment
-              key={label}
-              dow={dow}
-              label={label}
-              byKey={byKey}
-              levelFor={levelFor}
-              LEVEL_COLOR={LEVEL_COLOR}
-              onPickHour={onPickHour}
-            />
-          ))}
-        </div>
+      {/* 7 rows × 24 cols. Each row stretches to fill the section's
+          full width via 24 equal `1fr` columns (`minmax(0, 1fr)` so
+          they shrink uniformly under their content), with the label
+          gutter at `auto`. Cells get tall enough (h-6) to fit the
+          compact diamond count in-cell — no separate tooltip read
+          needed for the headline number. */}
+      <div
+        className="grid gap-[2px] w-full"
+        style={{ gridTemplateColumns: 'auto repeat(24, minmax(0, 1fr))' }}
+      >
+        {/* Header row: hour numbers. */}
+        <div />
+        {Array.from({ length: 24 }, (_, h) => (
+          <div
+            key={`h-${h}`}
+            className="text-[8px] text-gray-400 font-mono text-center"
+          >
+            {h % 6 === 0 ? h : ''}
+          </div>
+        ))}
+        {/* 7 rows. */}
+        {DOW_LABELS.map((label, dow) => (
+          <RowFragment
+            key={label}
+            dow={dow}
+            label={label}
+            byKey={byKey}
+            levelFor={levelFor}
+            LEVEL_COLOR={LEVEL_COLOR}
+            onPickHour={onPickHour}
+          />
+        ))}
       </div>
       {/* Legend. */}
       <div className="mt-2 flex items-center gap-1.5 text-[10px] font-mono text-gray-500">
@@ -2480,25 +2538,41 @@ function RowFragment({
           ? `${label} ${h}:00 — ${cell.gifts} gifts · ${cell.diamonds.toLocaleString()} 💎\nClick to drill into Network feed`
           : `${label} ${h}:00 — no activity`;
         const hasActivity = !!cell;
+        // In-cell diamond count — compact so a 24-col row stays
+        // readable down to ~600px wide. Below ~3-digit diamonds we
+        // show the raw number; above we collapse to k/M with one
+        // decimal where useful.
+        const cellLabel = cell ? compactCount(cell.diamonds) : '';
+        // On the darker amber levels (3-5), the gray-700 default
+        // washes out against the saturated background — flip to
+        // amber-900 (light mode) / amber-50 (dark mode) for contrast.
+        const textTone = lvl >= 3
+          ? 'text-amber-900 dark:text-amber-50'
+          : 'text-gray-700';
         // Cells with activity are clickable: hand the (dow, hour)
         // pair up so the modal can pivot to the Network tab pre-
         // filtered to that hour band. Empty cells stay non-clickable
         // so we don't trap the user in a "no events" state.
+        const cellClass = `h-6 min-w-0 rounded-[2px] ${LEVEL_COLOR[lvl]} border border-gray-200/60 dark:border-white/10 flex items-center justify-center text-[9px] font-mono tabular-nums leading-none overflow-hidden ${textTone}`;
         return hasActivity && onPickHour ? (
           <button
             type="button"
             key={`c-${dow}-${h}`}
             onClick={() => onPickHour(dow, h)}
-            className={`w-[14px] h-[14px] rounded-[2px] ${LEVEL_COLOR[lvl]} border border-gray-200/60 dark:border-white/10 hover:ring-2 hover:ring-primary-400 transition-shadow cursor-pointer`}
+            className={`${cellClass} hover:ring-2 hover:ring-primary-400 transition-shadow cursor-pointer`}
             title={title}
             aria-label={title}
-          />
+          >
+            {cellLabel}
+          </button>
         ) : (
           <div
             key={`c-${dow}-${h}`}
-            className={`w-[14px] h-[14px] rounded-[2px] ${LEVEL_COLOR[lvl]} border border-gray-200/60 dark:border-white/10`}
+            className={cellClass}
             title={title}
-          />
+          >
+            {cellLabel}
+          </div>
         );
       })}
     </>
@@ -2716,6 +2790,12 @@ function CommentsTab({
   userId: string | null;
   tz: string;
 }) {
+  // Audience-aware API. The parent modal already gates data-loading
+  // on admin, but the CommentsTab can theoretically be reached with
+  // audience=public if a future entry-point bypasses that gate —
+  // resolving through context here keeps this tab safe to mount
+  // standalone too.
+  const tiktokApi = useTikTokApi();
   const PAGE_SIZES = [25, 50, 100, 250];
   const [hostFilter, setHostFilter] = useState<string>('all');
   const [q, setQ] = useState('');
@@ -2999,6 +3079,10 @@ function NetworkTab({
   seed?: NetworkSeed | null;
   onSeedConsumed?: () => void;
 }) {
+  // Audience-aware API. Same reasoning as the sibling tabs: parent
+  // gates data load on admin, but `useTikTokApi()` here keeps this
+  // tab self-contained.
+  const tiktokApi = useTikTokApi();
   // Filter state for the activity feed. When all chips are inactive
   // and `q` is empty, we render the 100 events that came on the
   // detail payload (free, no extra round-trip). Any active filter

@@ -113,10 +113,10 @@ or Turnstile) gates the login + register flows when configured.
 ### Typed config (the Configuration feature)
 
 Three layers:
-1. `domain/entities/config_registry.py` — `CONFIG_REGISTRY` (108 keys
-   across 16 namespaces) + `ENV_MAP` (key → PHOVEU_-prefixed env var
-   name). Each `ConfigKeyDef` carries `value_type`, `default`,
-   `sensitive`, `readonly`, `bootstrap` flags.
+1. `domain/entities/config_registry.py` — `CONFIG_REGISTRY` (116 keys
+   across 17 namespaces, TikTok included) + `ENV_MAP` (key →
+   PHOVEU_-prefixed env var name). Each `ConfigKeyDef` carries
+   `value_type`, `default`, `sensitive`, `readonly`, `bootstrap` flags.
 2. `domain/services/config_service.py` — `ConfigService`. Resolution
    chain for non-bootstrap keys is **DB → env → default**. Bootstrap
    keys (`DATABASE_URL`, `REDIS_URL`, `DB_*_POOL_*`) are env-only —

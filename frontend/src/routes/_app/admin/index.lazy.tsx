@@ -1,6 +1,6 @@
 import { createLazyFileRoute } from '@tanstack/react-router'
-import { AppConfig } from '@admin/pages/AppConfig'
+import { Dashboard } from '@/components/Dashboard'
 
 export const Route = createLazyFileRoute('/_app/admin/')({
-  component: AppConfig,
+  component: Dashboard,
 })

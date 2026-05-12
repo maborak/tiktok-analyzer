@@ -18,22 +18,28 @@ ticket_service = None
 
 @router.get("/tickets/{file_path:path}",
             responses={
-                401: {"description": "Authentication required — pass JWT via `?token=` query param or `Authorization: Bearer` header"},
+                401: {"description": "Authentication required — pass JWT via `Authorization: Bearer` header"},
                 400: {"description": "Invalid file path"},
                 404: {"description": "File not found"},
             })
 async def get_ticket_media(
     file_path: str,
     request: Request,
-    token: str = Query(None),
     auth_service: AuthService = Depends(get_auth_service)
 ):
-    """Serve a ticket attachment. Requires authentication via query token or Authorization header."""
-    # Extract token from header if not in query
-    if not token:
-        auth_header = request.headers.get("Authorization")
-        if auth_header and auth_header.startswith("Bearer "):
-            token = auth_header.split(" ")[1]
+    """Serve a ticket attachment. Requires JWT via the `Authorization:
+    Bearer` header. The legacy `?token=<JWT>` query parameter has been
+    removed — it leaked JWTs into webserver access logs, the Referer
+    header on any outbound link from the viewer page, browser history,
+    and autocomplete. Frontend should fetch the file via XHR with the
+    Authorization header and render the result as a blob URL (see
+    `secureDownload()` / `<AuthImage>` in the frontend)."""
+    auth_header = request.headers.get("Authorization")
+    token = (
+        auth_header.split(" ", 1)[1]
+        if auth_header and auth_header.startswith("Bearer ")
+        else None
+    )
 
     if not token:
         raise HTTPException(status_code=401, detail="Authentication required")
@@ -73,21 +79,25 @@ async def get_ticket_media(
 
 @router.get("/livechat/{file_path:path}",
             responses={
-                401: {"description": "Authentication required — pass JWT via `?token=` or `?session_token=` query param, or `Authorization: Bearer` header"},
+                401: {"description": "Authentication required — JWT via `Authorization: Bearer` header (operators), or guest session token via `?session_token=` (anonymous chat guests)"},
                 400: {"description": "Invalid file path"},
                 404: {"description": "File not found"},
             })
 async def get_livechat_media(
     file_path: str,
     request: Request,
-    token: Optional[str] = Query(None, description="JWT access token"),
-    session_token: Optional[str] = Query(None, description="Livechat session token"),
+    session_token: Optional[str] = Query(None, description="Livechat session token (anonymous guests only)"),
     auth_service: AuthService = Depends(get_auth_service)
 ):
     """
     Serve a livechat attachment with dual-auth.
-    Authenticated users pass JWT via ?token= or Authorization header.
-    Anonymous guests pass their livechat session token via ?session_token=.
+    Operators pass their JWT via the `Authorization: Bearer` header.
+    Anonymous guests pass their livechat session token via
+    `?session_token=` — that token is bound to a single chat session
+    so the residual leak risk is bounded to that session's lifetime.
+
+    The legacy `?token=<JWT>` query parameter has been removed; see the
+    docstring on `get_ticket_media` for the rationale.
     """
     # Path traversal protection
     if ".." in file_path or file_path.startswith("/") or "\x00" in file_path:
@@ -102,12 +112,13 @@ async def get_livechat_media(
     if not attachment:
         raise HTTPException(status_code=404, detail="File not found")
 
-    # Auth check 1: JWT token (query param or Authorization header)
-    jwt_token = token
-    if not jwt_token:
-        auth_header = request.headers.get("Authorization")
-        if auth_header and auth_header.startswith("Bearer "):
-            jwt_token = auth_header.split(" ")[1]
+    # Auth check 1: JWT in Authorization header (operator path).
+    auth_header = request.headers.get("Authorization")
+    jwt_token = (
+        auth_header.split(" ", 1)[1]
+        if auth_header and auth_header.startswith("Bearer ")
+        else None
+    )
 
     authorized = False
 
@@ -120,7 +131,7 @@ async def get_livechat_media(
         except Exception:
             pass  # JWT invalid — fall through to session token check
 
-    # Auth check 2: Livechat session token
+    # Auth check 2: Livechat session token (anonymous guest path).
     if not authorized and session_token:
         session = ticket_service.get_chat_session(attachment.session_id)
         if session and session.session_token:

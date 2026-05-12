@@ -1,5 +1,6 @@
 import { useCallback } from 'react';
 import { facebookConfig } from '@/config/env';
+import { startOAuthFlow } from '@/utils/oauthState';
 
 /**
  * Facebook Sign-In button using the full-redirect OAuth flow.
@@ -7,9 +8,14 @@ import { facebookConfig } from '@/config/env';
  * Clicking redirects to Facebook's authorization page. After the user authorizes,
  * Facebook redirects back to /auth/facebook/callback with a ?code= parameter.
  * The FacebookCallbackPage handles the code exchange.
+ *
+ * Embeds a CSPRNG `state` parameter that the callback verifies against
+ * sessionStorage. Defends against login-CSRF / account-fixation per
+ * audit FE-CRITICAL #2.
  */
 export function FacebookSignInButton() {
   const handleClick = useCallback(() => {
+    const state = startOAuthFlow('facebook', { intent: 'signin' });
     const redirectUri = `${window.location.origin}/auth/facebook/callback`;
     const params = new URLSearchParams({
       client_id: facebookConfig.appId,
@@ -17,6 +23,7 @@ export function FacebookSignInButton() {
       scope: 'email,public_profile',
       response_type: 'code',
       auth_type: 'rerequest',
+      state,
     });
     window.location.href = `https://www.facebook.com/v21.0/dialog/oauth?${params.toString()}`;
   }, []);

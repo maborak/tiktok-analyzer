@@ -55,9 +55,18 @@ function formatDefault(n: number): string {
 }
 
 function tickEvery<T>(arr: T[], maxTicks = 6): T[] {
-  if (arr.length <= maxTicks) return arr;
+  if (arr.length <= maxTicks) return Array.from(new Set(arr));
   const step = Math.ceil(arr.length / maxTicks);
-  return arr.filter((_, i) => i % step === 0);
+  const picked = arr.filter((_, i) => i % step === 0);
+  // Dedupe: upstream data sometimes carries two rows for the same
+  // bucket boundary (e.g. the per-broadcast stats endpoint can emit
+  // overlapping minute buckets when a session straddles the boundary).
+  // Two ticks with the same `t` produce two Recharts <ForwardRef>
+  // children with identical React keys (`tick-{label}-{x}-{x}`),
+  // which React DEV mode flags as a duplicate-key error. Set dedupe
+  // works because `t` is always a primitive (number / formatted-time
+  // string) here.
+  return Array.from(new Set(picked));
 }
 
 // Custom tooltip styling — matches the framework's mono treatment.

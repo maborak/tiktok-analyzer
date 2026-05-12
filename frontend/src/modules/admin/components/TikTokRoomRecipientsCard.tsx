@@ -1,10 +1,8 @@
 import { useEffect, useState } from 'react';
 import { Loader2, Users } from 'lucide-react';
 
-import {
-  type TikTokRoomRecipient,
-  tiktokApi,
-} from '@admin/services/tiktok';
+import { type TikTokRoomRecipient } from '@admin/services/tiktok';
+import { useTikTokApi } from '@admin/contexts/TikTokApiContext';
 
 interface Props {
   roomId: string | null;
@@ -30,6 +28,7 @@ export function TikTokRoomRecipientsCard({
   refreshKey,
   onSelectUser,
 }: Props) {
+  const tiktokApi = useTikTokApi();
   const [items, setItems] = useState<TikTokRoomRecipient[]>([]);
   const [totalDiamonds, setTotalDiamonds] = useState(0);
   const [loading, setLoading] = useState(false);

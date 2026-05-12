@@ -50,6 +50,13 @@ class Subscription:
     id: int | None
     unique_id: str           # the TikTok @handle (without leading @)
     enabled: bool = True
+    # When True the live is opted into the public `/public/tiktok/lives`
+    # endpoint — unauthenticated viewers see a sanitized subset (handle,
+    # nickname, avatar, follower count, live status + viewer count,
+    # session diamonds, started_at, hourly buckets). Operators flip this
+    # explicitly per-handle; default is False so adding a sub never
+    # accidentally exposes it.
+    is_public: bool = False
     # Cached public-profile fields (populated by the periodic refresher).
     profile_user_id: int | None = None
     sec_uid: str | None = None
@@ -60,8 +67,6 @@ class Subscription:
     private: bool | None = None
     follower_count: int | None = None
     following_count: int | None = None
-    video_count: int | None = None
-    like_count: int | None = None
     profile_refreshed_at: datetime | None = None
     # Centralized live-status cache fields.
     is_live: bool | None = None

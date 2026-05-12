@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react';
 import { useNavigate } from '@tanstack/react-router';
 import { useAuth } from '@/contexts/AuthContext';
 import { userRepository } from '@user/index';
+import { consumeOAuthFlow } from '@/utils/oauthState';
 import toast from 'react-hot-toast';
 import { Loader2 } from 'lucide-react';
 
@@ -10,6 +11,10 @@ import { Loader2 } from 'lucide-react';
  *
  * Facebook redirects here with ?code=... after the user authorizes.
  * We send the code + redirect_uri to the backend for token exchange.
+ *
+ * Verifies the CSPRNG `state` parameter we set when starting the
+ * flow. Mismatch rejects the callback — defends against login-CSRF /
+ * account-fixation per audit FE-CRITICAL #2.
  */
 export function FacebookCallback() {
   const searchParams = new URLSearchParams(window.location.search);
@@ -22,6 +27,7 @@ export function FacebookCallback() {
 
     const code = searchParams.get('code');
     const error = searchParams.get('error');
+    const returnedState = searchParams.get('state');
 
     if (error) {
       if (error === 'access_denied') {
@@ -41,14 +47,19 @@ export function FacebookCallback() {
       return;
     }
 
+    // State verification — see GitHubCallback for rationale.
+    const flow = consumeOAuthFlow('facebook', returnedState);
+    if (!flow) {
+      toast.error('Facebook sign-in rejected — invalid state. Please try again from the sign-in page.');
+      navigate({ to: '/login', replace: true });
+      return;
+    }
+
     processedRef.current = true;
 
     const redirectUri = `${window.location.origin}/auth/facebook/callback`;
 
-    // Check if this is a link-from-account-settings flow
-    const linkIntent = sessionStorage.getItem('oauth_link_intent');
-    if (linkIntent) {
-      sessionStorage.removeItem('oauth_link_intent');
+    if (flow.intent === 'link') {
       userRepository.linkOAuthProvider('facebook', code, redirectUri)
         .then((res) => {
           if (res.success) {

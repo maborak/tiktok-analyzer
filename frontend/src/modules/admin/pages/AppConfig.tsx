@@ -485,8 +485,8 @@ export function AppConfig() {
             }
           />
         ) : (
-          <div className="overflow-x-auto">
-            <table className="min-w-full divide-y divide-gray-200">
+          <>
+            <table className="hidden md:table min-w-full divide-y divide-gray-200">
               <thead>
                 <tr className="bg-gray-50">
                   <th className="auth-mono-label px-4 py-3 text-left">
@@ -551,7 +551,52 @@ export function AppConfig() {
                 ))}
               </tbody>
             </table>
-          </div>
+
+            {/* Mobile: card list — one card per config entry. */}
+            <ul className="md:hidden flex flex-col gap-2 p-2">
+              {entries.map(entry => (
+                <li
+                  key={entry.id}
+                  className="rounded-md border border-gray-200 bg-white dark:bg-white/[0.03] px-3 py-2.5"
+                >
+                  <div className="flex items-start justify-between gap-2 mb-2">
+                    <div className="min-w-0 flex-1 text-sm font-medium text-gray-900 font-mono break-all">
+                      {entry.key}
+                    </div>
+                    <div className="shrink-0 flex items-center gap-1">
+                      {renderScopeBadge(entry)}
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => setDeleteTarget(entry)}
+                        className="text-red-500 hover:text-red-700 hover:bg-red-50"
+                      >
+                        <Trash2 size={14} />
+                      </Button>
+                    </div>
+                  </div>
+                  <div className="mb-2">
+                    {renderValueCell(entry)}
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <div className="text-[10px] uppercase tracking-wider text-gray-400">Type</div>
+                      <span className="inline-flex items-center px-2 py-0.5 rounded bg-gray-100 text-gray-600 font-mono text-xs mt-0.5">
+                        {entry.value_type}
+                      </span>
+                    </div>
+                    <div>
+                      <div className="text-[10px] uppercase tracking-wider text-gray-400">Updated</div>
+                      <div className="text-xs text-gray-500 tabular-nums">{formatDate(entry.updated_at)}</div>
+                      {entry.updated_by && (
+                        <div className="text-[10px] text-gray-400">by {entry.updated_by}</div>
+                      )}
+                    </div>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </>
         )}
       </div>
 

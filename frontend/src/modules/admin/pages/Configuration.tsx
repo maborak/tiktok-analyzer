@@ -236,6 +236,155 @@ function ConfigKeyRow({ meta, pendingValue, onChange, onClear, onBooleanWrite }:
   );
 }
 
+// ─── Key card (mobile) ─────────────────────────────────────────────────────
+
+function ConfigKeyCard({ meta, pendingValue, onChange, onClear, onBooleanWrite }: ConfigKeyRowProps) {
+  const isLocked = meta.bootstrap || meta.readonly;
+  const hasPending = pendingValue !== undefined;
+  const displayValue = hasPending ? pendingValue : meta.value;
+  const isSensitiveMasked = meta.sensitive && meta.value === '***';
+
+  const renderInput = () => {
+    if (meta.value_type === 'boolean') {
+      const checked = Boolean(displayValue);
+      return (
+        <Switch
+          checked={checked}
+          onCheckedChange={async next => {
+            await onBooleanWrite(meta.key, next);
+          }}
+          disabled={isLocked}
+          size="sm"
+        />
+      );
+    }
+    if (meta.value_type === 'int' || meta.value_type === 'float') {
+      return (
+        <Input
+          type="number"
+          step={meta.value_type === 'float' ? 'any' : '1'}
+          value={rawString(displayValue, meta.value_type)}
+          onChange={e => onChange(meta.key, e.target.value)}
+          disabled={isLocked}
+          className="w-full font-mono text-sm"
+        />
+      );
+    }
+    if (meta.value_type === 'json') {
+      return (
+        <textarea
+          value={rawString(displayValue, meta.value_type)}
+          onChange={e => onChange(meta.key, e.target.value)}
+          disabled={isLocked}
+          rows={3}
+          className="w-full font-mono text-xs px-2 py-1.5 rounded border border-gray-300 dark:border-gray-700 bg-white text-gray-800 focus:outline-none focus:ring-1 focus:ring-primary-500"
+        />
+      );
+    }
+    const inputValue = rawString(displayValue, meta.value_type);
+    return (
+      <Input
+        type={meta.sensitive ? 'password' : 'text'}
+        value={inputValue}
+        onChange={e => onChange(meta.key, e.target.value)}
+        placeholder={isSensitiveMasked ? '••• masked — type to overwrite •••' : meta.default || ''}
+        disabled={isLocked}
+        className="w-full font-mono text-sm"
+      />
+    );
+  };
+
+  const lockTitle = meta.bootstrap
+    ? `Bootstrap key — must be set via env (${meta.env_var ?? 'env var'}); requires restart`
+    : meta.readonly
+    ? 'Readonly — startup-only, requires restart'
+    : '';
+
+  return (
+    <li
+      className={cn(
+        'rounded-md border border-gray-200 bg-white dark:bg-white/[0.03] px-3 py-2.5',
+        isLocked && 'border-l-2 border-l-gray-300 dark:border-l-gray-700',
+        hasPending && 'bg-amber-50/40 dark:bg-amber-500/5',
+      )}
+    >
+      <div className="flex items-start justify-between gap-2 mb-2">
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2 flex-wrap">
+            {isLocked && (
+              <span title={lockTitle} aria-label={lockTitle} className="inline-flex shrink-0">
+                <Lock size={12} className="text-gray-400 dark:text-gray-500" />
+              </span>
+            )}
+            <span className="font-mono text-xs font-semibold text-gray-900 break-all">
+              {meta.key}
+            </span>
+          </div>
+          <div className="flex items-center gap-1 flex-wrap mt-1">
+            <SourceBadge source={meta.source} />
+            {meta.sensitive && (
+              <FlagPill
+                icon={<ShieldAlert size={10} />}
+                label="SENSITIVE"
+                tone="bg-rose-50 text-rose-700 dark:bg-rose-500/10 dark:text-rose-300"
+              />
+            )}
+            {hasPending && (
+              <FlagPill
+                icon={<AlertTriangle size={10} />}
+                label="PENDING"
+                tone="bg-amber-100 text-amber-800 dark:bg-amber-500/15 dark:text-amber-200"
+              />
+            )}
+          </div>
+        </div>
+      </div>
+      {meta.description && (
+        <p className="text-xs text-gray-500 dark:text-gray-400 mb-2">{meta.description}</p>
+      )}
+      {meta.examples && (
+        <p className="text-xs text-gray-400 dark:text-gray-500 mb-2">e.g. {meta.examples}</p>
+      )}
+      <div className="flex items-start gap-2 mb-1">
+        <div className="flex-1 min-w-0">{renderInput()}</div>
+        {hasPending && meta.value_type !== 'boolean' && (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => onClear(meta.key)}
+            title="Discard this change"
+          >
+            <Undo2 size={14} />
+          </Button>
+        )}
+      </div>
+      {meta.env_var && (
+        <p className="text-xs text-gray-400 dark:text-gray-500 font-mono mb-2">
+          env: {meta.env_var}
+        </p>
+      )}
+      <div className="grid grid-cols-2 gap-2 pt-2 border-t border-gray-100">
+        <div>
+          <div className="text-[10px] uppercase tracking-wider text-gray-400">Updated by</div>
+          {meta.updated_by ? (
+            <div className="font-mono text-xs text-gray-700 truncate">{meta.updated_by}</div>
+          ) : (
+            <span className="text-gray-300 dark:text-gray-600 text-xs">—</span>
+          )}
+        </div>
+        <div>
+          <div className="text-[10px] uppercase tracking-wider text-gray-400">At</div>
+          {meta.updated_at ? (
+            <div className="text-xs text-gray-500 tabular-nums">{formatDate(meta.updated_at)}</div>
+          ) : (
+            <span className="text-gray-300 dark:text-gray-600 text-xs">—</span>
+          )}
+        </div>
+      </div>
+    </li>
+  );
+}
+
 // ─── Preview Modal ──────────────────────────────────────────────────────────
 
 interface PreviewModalProps {
@@ -873,8 +1022,8 @@ export function Configuration() {
               description="No keys are registered for this namespace."
             />
           ) : (
-            <div className="overflow-x-auto">
-              <table className="min-w-full">
+            <>
+              <table className="hidden md:table min-w-full">
                 <thead>
                   <tr className="bg-gray-50 dark:bg-gray-100/30 border-b border-gray-200 dark:border-gray-700">
                     <th className="auth-mono-label px-4 py-3 text-left">Key</th>
@@ -895,7 +1044,21 @@ export function Configuration() {
                   ))}
                 </tbody>
               </table>
-            </div>
+
+              {/* Mobile: card list — one card per config key. */}
+              <ul className="md:hidden flex flex-col gap-2 p-2">
+                {keys.map(meta => (
+                  <ConfigKeyCard
+                    key={meta.key}
+                    meta={meta}
+                    pendingValue={pending[meta.key]}
+                    onChange={handleChange}
+                    onClear={handleClear}
+                    onBooleanWrite={handleBooleanWrite}
+                  />
+                ))}
+              </ul>
+            </>
           )}
         </div>
       </div>

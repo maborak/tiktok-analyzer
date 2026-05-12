@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 
@@ -57,6 +58,7 @@ def _sub_to_dataclass(m: SubscriptionModel) -> Subscription:
         id=m.id,
         unique_id=m.unique_id,
         enabled=bool(m.enabled),
+        is_public=bool(getattr(m, "is_public", False) or False),
         profile_user_id=getattr(m, "profile_user_id", None),
         sec_uid=getattr(m, "sec_uid", None),
         nickname=getattr(m, "nickname", None),
@@ -66,8 +68,6 @@ def _sub_to_dataclass(m: SubscriptionModel) -> Subscription:
         private=getattr(m, "private", None),
         follower_count=getattr(m, "follower_count", None),
         following_count=getattr(m, "following_count", None),
-        video_count=getattr(m, "video_count", None),
-        like_count=getattr(m, "like_count", None),
         profile_refreshed_at=getattr(m, "profile_refreshed_at", None),
         profile_error=getattr(m, "profile_error", None),
         is_live=getattr(m, "is_live", None),
@@ -166,10 +166,42 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
             s.refresh(row)
             return _sub_to_dataclass(row)
 
+    def set_subscription_public(self, unique_id: str, is_public: bool) -> bool:
+        """Flip the `is_public` flag for the given handle.
+
+        Returns True when a row was found + updated, False otherwise so
+        the route can convert that to a 404. Independent of `enabled` —
+        a paused (enabled=False) public sub stays in the public list,
+        but `is_live` will of course read False until the listener
+        reconnects.
+        """
+        with self._get_session() as s:
+            row = s.query(SubscriptionModel).filter_by(unique_id=unique_id).one_or_none()
+            if row is None:
+                return False
+            row.is_public = bool(is_public)
+            s.commit()
+            return True
+
+    def list_public_subscriptions(self) -> list[Subscription]:
+        """Return only subscriptions marked public, ordered by handle.
+
+        Used by `get_public_lives_summary` to build the handle list for
+        the unauthenticated endpoint. Ordered for deterministic output
+        so the in-process TTL cache key (sorted tuple) stays stable.
+        """
+        with self._get_session() as s:
+            rows = (
+                s.query(SubscriptionModel)
+                .filter(SubscriptionModel.is_public.is_(True))
+                .order_by(SubscriptionModel.unique_id)
+                .all()
+            )
+            return [_sub_to_dataclass(r) for r in rows]
+
     _PROFILE_FIELDS = (
         "profile_user_id", "sec_uid", "nickname", "avatar_url", "bio",
         "verified", "private", "follower_count", "following_count",
-        "video_count", "like_count",
     )
 
     def list_subscriptions_with_stale_profiles(
@@ -1276,12 +1308,35 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
             })
         return out
 
+    def get_match_ids_by_battle_id(
+        self,
+        battle_id: int,
+        *,
+        exclude_match_id: int | None = None,
+    ) -> list[int]:
+        """Every `tiktok_matches.id` row sharing the same TikTok PK
+        `battle_id`. A single TikTok battle generates ONE row per
+        monitored host whose room observed it (each WS sub writes its
+        own match row), so a 1v1 between two monitored creators
+        produces two rows with the same `battle_id`. Used to merge
+        events across sibling match rows when both anchors are
+        tracked."""
+        with self._get_session() as s:
+            q = s.query(TikTokMatchModel.id).filter(
+                TikTokMatchModel.battle_id == int(battle_id)
+            )
+            if exclude_match_id is not None:
+                q = q.filter(TikTokMatchModel.id != int(exclude_match_id))
+            return [int(r[0]) for r in q.all()]
+
     def get_match_gifters_by_side(
         self,
         match_id: int,
         *,
         host_unique_id: str,
         opponents: list[dict[str, Any]],
+        sibling_match_ids: list[int] | None = None,
+        public_only: bool = False,
     ) -> dict[str, Any]:
         """Top gifters during a battle, split by whether each gift's
         `to_user.user_id` matched the host or one of the opponents.
@@ -1289,7 +1344,17 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
         `opponents` is the match row's `opponents` JSON — each entry
         carries `user_id` (string or int) and `unique_id` for the
         guest TikTok account. We match against `to_user.user_id`
-        first (most reliable, BigInt) and fall back to `unique_id`."""
+        first (most reliable, BigInt) and fall back to `unique_id`.
+
+        `sibling_match_ids` are the IDs of `tiktok_matches` rows that
+        represent the SAME TikTok PK battle from another monitored
+        host's room (same `battle_id`, different `match_id`). Each
+        sibling row carries the events that streamed in through the
+        opponent's WebSocket subscription. Their gifts default to the
+        "opponent" side from THIS host's perspective — they came in
+        via the rival's broadcast, so the recipient by default is the
+        opponent. `to_user` overrides still apply (e.g. a cross-room
+        gift directed back at the current host stays on "host")."""
         host_handle_norm = (host_unique_id or "").lstrip("@").lower()
         # Build sets of identifiers for fast classification.
         opp_user_ids: set[int] = set()
@@ -1307,13 +1372,76 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
             if handle and handle != host_handle_norm:
                 opp_unique_ids.add(handle)
 
+        # Build the full set of match_ids whose events to merge. The
+        # primary id is the match row tied to the current page's host;
+        # siblings are the parallel rows from each other monitored
+        # host whose room observed the SAME PK. Without merging, the
+        # "Top donors · this battle" panel only sees gifts that
+        # flowed through the current host's WS subscription — the
+        # rival's gifters stay invisible even though both anchors are
+        # being tracked.
+        match_id_int = int(match_id)
+        sibling_ids = {int(m) for m in (sibling_match_ids or []) if m is not None}
+        sibling_ids.discard(match_id_int)
+        all_match_ids = [match_id_int, *sorted(sibling_ids)]
+
+        # Resolve each sibling match's `room_id` once, up front. The
+        # frontend uses the resulting set to widen the gifter-detail
+        # modal's per-room scope: clicking an opponent-side donor in
+        # the match modal needs to see their gifts in the rival's room
+        # (which is exactly the sibling match's room_id), not just
+        # the current page's room. Without this, the gifter modal
+        # shows "no gifts" for any donor whose activity sits entirely
+        # in the rival's broadcast.
+        #
+        # When `public_only=True` (the public mirror at
+        # /public/tiktok/matches/{id}/gifters_by_side), we filter the
+        # sibling list down to rooms whose host has opted into the
+        # public surface. Without this, a PK between a public host
+        # and a tracked-but-private host leaks the private host's
+        # room_id (and the gift events would be merged into the public
+        # response, exposing the private viewer base for that battle).
+        # The `match_id IN (...)` filter for the gift query is rebuilt
+        # from the filtered sibling set too, so per-event side
+        # classification only sees rows the public viewer is allowed
+        # to know about.
+        sibling_room_ids: list[str] = []
+        if sibling_ids:
+            with self._get_session() as s:
+                q = (
+                    s.query(TikTokMatchModel.id, TikTokMatchModel.room_id)
+                    .filter(TikTokMatchModel.id.in_(sorted(sibling_ids)))
+                )
+                if public_only:
+                    q = (
+                        q.join(
+                            RoomModel,
+                            RoomModel.room_id == TikTokMatchModel.room_id,
+                        )
+                        .join(
+                            SubscriptionModel,
+                            SubscriptionModel.unique_id == RoomModel.host_unique_id,
+                        )
+                        .filter(SubscriptionModel.is_public.is_(True))
+                    )
+                kept_sibling_ids: set[int] = set()
+                for sib_id, room_id in q.all():
+                    if room_id is None:
+                        continue
+                    kept_sibling_ids.add(int(sib_id))
+                    sibling_room_ids.append(str(int(room_id)))
+                if public_only:
+                    sibling_ids = kept_sibling_ids
+                    all_match_ids = [match_id_int, *sorted(sibling_ids)]
+
         with self._get_session() as s:
             rows = (
                 s.query(
                     TikTokEventModel.user_id,
                     TikTokEventModel.payload,
+                    TikTokEventModel.match_id,
                 )
-                .filter(TikTokEventModel.match_id == int(match_id))
+                .filter(TikTokEventModel.match_id.in_(all_match_ids))
                 .filter(TikTokEventModel.type == "gift")
                 .all()
             )
@@ -1324,7 +1452,7 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
             "opponent": {},
             "unknown": {},
         }
-        for user_id, payload in rows:
+        for user_id, payload, event_match_id in rows:
             if user_id is None:
                 continue
             p = _coerce_payload(payload)
@@ -1345,17 +1473,21 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
             # the *host's* WebSocket subscription. By definition, the
             # gift was sent in the host's broadcast. Opponent-side
             # gifts happen in the opponent's separate room that we
-            # don't subscribe to. So the safe default for an unfilled
-            # recipient (`to_user.user_id == 0` / empty unique_id —
-            # the lib's "no specific target" sentinel for solo PKs)
-            # is "host", not "unknown".
+            # don't subscribe to UNLESS that opponent is ALSO a
+            # monitored host — in which case we have a parallel
+            # `tiktok_matches` row for the same battle_id and its
+            # events flow in through THAT host's WS. Those sibling
+            # rows are passed in via `sibling_match_ids`; their gifts
+            # default to "opponent" from the current host's POV.
             #
-            # We only override to "opponent" when `to_user` carries a
-            # *real* identifier that matches the opponents list —
-            # i.e. multi-guest live where the gifter explicitly
-            # picked a guest other than the host.
+            # We only override the default when `to_user` carries a
+            # *real* identifier that matches the opposite side — i.e.
+            # multi-guest live where the gifter explicitly picked a
+            # guest other than the host, OR a cross-room gift in the
+            # rival's broadcast directed back at the current host.
             to_user = p.get("to_user") if isinstance(p, dict) else None
-            side = "host"  # default — see above
+            from_sibling = event_match_id is not None and int(event_match_id) in sibling_ids
+            side = "opponent" if from_sibling else "host"
             if isinstance(to_user, dict):
                 to_uid_raw = to_user.get("user_id")
                 to_handle = (to_user.get("unique_id") or "").lstrip("@").lower()
@@ -1373,9 +1505,13 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                     elif to_handle and to_handle in opp_unique_ids:
                         side = "opponent"
                     # Recipient has a real id but matches neither —
-                    # default-bias to host (data quality fallback).
+                    # fall back to the room-of-origin default (host
+                    # for current-match events, opponent for sibling-
+                    # match events). Without the `from_sibling` flag
+                    # this used to hard-code "host", which mis-tagged
+                    # every cross-room gift in the rival's broadcast.
                     else:
-                        side = "host"
+                        side = "opponent" if from_sibling else "host"
                 elif to_handle:
                     if to_handle in opp_unique_ids:
                         side = "opponent"
@@ -1433,6 +1569,21 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                 "opponent_diamonds":sum(r["diamonds"] for r in buckets["opponent"].values()),
                 "opponent_gifts":   sum(r["gifts"]    for r in buckets["opponent"].values()),
                 "unknown_diamonds": sum(r["diamonds"] for r in buckets["unknown"].values()),
+                # Number of sibling `tiktok_matches` rows whose events were
+                # merged in — i.e. how many other monitored hosts'
+                # WebSocket streams contributed to the opponent side. The
+                # frontend uses this to flip the "we don't subscribe to
+                # opponent's stream" disclaimer copy: when ≥1, opponent
+                # gifts ARE being captured (just possibly under-counted
+                # vs TikTok's authoritative PK score).
+                "siblings_merged": len(sibling_ids),
+                # Room IDs of those sibling matches. The frontend passes
+                # them as `extraRoomIds` when opening the gifter detail
+                # modal for an opponent-side donor — without it the
+                # modal's per-room searchEvents call only hits the
+                # current host's room and the donor's history appears
+                # empty.
+                "sibling_room_ids": sibling_room_ids,
             },
         }
 
@@ -2552,8 +2703,8 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                 FROM per_user pu
                 LEFT JOIN tiktok_viewers v ON v.user_id = pu.user_id
                 WHERE :q_is_null OR
-                      COALESCE(v.nickname,'')  ILIKE :needle OR
-                      COALESCE(v.unique_id,'') ILIKE :needle
+                      v.nickname  ILIKE :needle OR
+                      v.unique_id ILIKE :needle
                 ORDER BY pu.diamonds DESC
                 LIMIT :limit OFFSET :offset
             """), {
@@ -2623,10 +2774,176 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                 FROM per_user pu
                 LEFT JOIN tiktok_viewers v ON v.user_id = pu.user_id
                 WHERE :q_is_null OR
-                      COALESCE(v.nickname,'')  ILIKE :needle OR
-                      COALESCE(v.unique_id,'') ILIKE :needle
+                      v.nickname  ILIKE :needle OR
+                      v.unique_id ILIKE :needle
             """), {
                 "min_hosts": int(min_hosts),
+                "q_is_null": q is None or not q.strip(),
+                "needle": f"%{(q or '').strip()}%",
+            }).scalar()
+            return int(n or 0)
+
+    def cross_live_gifters_for_host(
+        self,
+        host_unique_id: str,
+        *,
+        min_other_hosts: int = 1,
+        limit: int = 25,
+        offset: int = 0,
+        q: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Cross-live gifters scoped to a single host: viewers who
+        gifted to `host_unique_id` AND to at least `min_other_hosts`
+        other hosts we track.
+
+        Same data source as `common_gifters` (the always-live
+        `tiktok_user_host_summary` table), but the leaderboard is
+        filtered to users with a row for this host AND additional
+        rows for >= min_other_hosts other hosts. Returns a per-user
+        row carrying:
+
+          - `diamonds_here` / `gifts_here` — totals on THIS host.
+          - `diamonds_elsewhere` / `gifts_elsewhere` — totals on
+            every OTHER host this user has gifted to.
+          - `host_count` — total distinct hosts (incl. this one).
+          - `other_hosts` — list of `{host, diamonds, gifts}` for
+            every host EXCEPT this one, sorted by diamonds desc, so
+            the UI can render a "also active on @X, @Y" pill strip.
+        """
+        if min_other_hosts < 1:
+            min_other_hosts = 1
+        h = (host_unique_id or "").lstrip("@").strip()
+        if not h:
+            return []
+        with self._get_session() as s:
+            # Filter to users who have a row for THIS host AND total
+            # host_count >= 1 + min_other_hosts. The HAVING clause
+            # uses an explicit COUNT(DISTINCT) so we don't double-
+            # count if the summary ever holds duplicate rows.
+            page_rows = s.execute(text("""
+                WITH per_user AS (
+                    SELECT
+                        s.user_id,
+                        COUNT(*)::int                AS host_count,
+                        SUM(s.diamonds)::bigint      AS diamonds_total,
+                        SUM(s.gifts)::bigint         AS gifts_total
+                    FROM tiktok_user_host_summary s
+                    WHERE EXISTS (
+                        SELECT 1
+                        FROM tiktok_user_host_summary s2
+                        WHERE s2.user_id = s.user_id
+                          AND s2.host_unique_id = :host
+                    )
+                    GROUP BY s.user_id
+                    HAVING COUNT(*) >= :min_total_hosts
+                )
+                SELECT
+                    pu.user_id,
+                    pu.host_count,
+                    pu.diamonds_total,
+                    pu.gifts_total,
+                    v.unique_id,
+                    v.nickname,
+                    v.avatar_url
+                FROM per_user pu
+                LEFT JOIN tiktok_viewers v ON v.user_id = pu.user_id
+                WHERE :q_is_null OR
+                      v.nickname  ILIKE :needle OR
+                      v.unique_id ILIKE :needle
+                ORDER BY pu.diamonds_total DESC
+                LIMIT :limit OFFSET :offset
+            """), {
+                "host": h,
+                "min_total_hosts": int(min_other_hosts) + 1,
+                "q_is_null": q is None or not q.strip(),
+                "needle": f"%{(q or '').strip()}%",
+                "limit": int(limit),
+                "offset": int(offset),
+            }).mappings().all()
+
+            uids = [int(r["user_id"]) for r in page_rows]
+            if not uids:
+                return []
+
+            # Per-host breakdown for the page (all hosts incl. this
+            # one). The caller / view will split into here-vs-other.
+            breakdowns = s.execute(text("""
+                SELECT user_id, host_unique_id AS host, diamonds, gifts
+                FROM tiktok_user_host_summary
+                WHERE user_id = ANY(:uids)
+                ORDER BY user_id, diamonds DESC
+            """), {"uids": uids}).mappings().all()
+            host_map: dict[int, list[dict[str, Any]]] = {}
+            for br in breakdowns:
+                host_map.setdefault(int(br["user_id"]), []).append({
+                    "host": br["host"],
+                    "diamonds": int(br["diamonds"] or 0),
+                    "gifts": int(br["gifts"] or 0),
+                })
+
+            out: list[dict[str, Any]] = []
+            for r in page_rows:
+                uid = int(r["user_id"])
+                all_hosts = host_map.get(uid, [])
+                here = next(
+                    (x for x in all_hosts if x["host"] == h), None
+                )
+                others = [x for x in all_hosts if x["host"] != h]
+                d_here = int(here["diamonds"]) if here else 0
+                g_here = int(here["gifts"]) if here else 0
+                d_other = sum(int(x["diamonds"]) for x in others)
+                g_other = sum(int(x["gifts"]) for x in others)
+                out.append({
+                    "user_id": uid,
+                    "unique_id": r["unique_id"],
+                    "nickname": r["nickname"],
+                    "avatar_url": r["avatar_url"],
+                    "host_count": int(r["host_count"] or 0),
+                    "diamonds_here": d_here,
+                    "gifts_here": g_here,
+                    "diamonds_elsewhere": d_other,
+                    "gifts_elsewhere": g_other,
+                    "other_hosts": others,
+                })
+            return out
+
+    def count_cross_live_gifters_for_host(
+        self,
+        host_unique_id: str,
+        *,
+        min_other_hosts: int = 1,
+        q: str | None = None,
+    ) -> int:
+        """Total of `cross_live_gifters_for_host` for pagination.
+        Same source / filter as the listing query."""
+        if min_other_hosts < 1:
+            min_other_hosts = 1
+        h = (host_unique_id or "").lstrip("@").strip()
+        if not h:
+            return 0
+        with self._get_session() as s:
+            n = s.execute(text("""
+                WITH per_user AS (
+                    SELECT s.user_id
+                    FROM tiktok_user_host_summary s
+                    WHERE EXISTS (
+                        SELECT 1
+                        FROM tiktok_user_host_summary s2
+                        WHERE s2.user_id = s.user_id
+                          AND s2.host_unique_id = :host
+                    )
+                    GROUP BY s.user_id
+                    HAVING COUNT(*) >= :min_total_hosts
+                )
+                SELECT COUNT(*)
+                FROM per_user pu
+                LEFT JOIN tiktok_viewers v ON v.user_id = pu.user_id
+                WHERE :q_is_null OR
+                      v.nickname  ILIKE :needle OR
+                      v.unique_id ILIKE :needle
+            """), {
+                "host": h,
+                "min_total_hosts": int(min_other_hosts) + 1,
                 "q_is_null": q is None or not q.strip(),
                 "needle": f"%{(q or '').strip()}%",
             }).scalar()
@@ -2638,6 +2955,7 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
         *,
         rooms_per_host: int = 5,
         gifts_per_host: int = 5,
+        public_only: bool = False,
     ) -> dict[str, Any]:
         """Deep-analysis payload for a single viewer's gifting across
         every host we track. Fanned out into a few small queries:
@@ -2648,9 +2966,39 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
           5. Per-host comment count (so the modal can show "comments
              on this host's broadcasts" alongside the gift stats).
         Returns an empty `hosts` list when the user has never gifted.
+
+        `public_only=True` is set by the public-mirror route
+        (`/public/tiktok/common-gifters/{user_id}/detail`). When set,
+        every field that emits a host_unique_id (`hosts`, `whale_sessions`,
+        `daily_series`, `intensity.biggest_session`, `recent_activity`,
+        `identity_progression`, `recipients_per_host`,
+        `recipient_partisanship`, `loyalty.top_host`) is filtered to
+        the subset of hosts with `is_public=True`. Totals at the top
+        level recompute against the filtered subset. Without this
+        filter, anonymous callers with any active viewer's `user_id`
+        could enumerate the operator's full set of monitored hosts —
+        including hosts the operator never opted into the public
+        surface.
         """
         with self._get_session() as s:
             is_pg = self._is_postgres()
+            # Resolve the public-host allowlist once for downstream
+            # filtering. `None` means "no filtering" (admin path).
+            public_host_set: frozenset[str] | None = None
+            if public_only:
+                pubs = (
+                    s.query(SubscriptionModel.unique_id)
+                    .filter(SubscriptionModel.is_public.is_(True))
+                    .all()
+                )
+                public_host_set = frozenset(p[0] for p in pubs if p[0])
+
+            def _allow_host(h: str | None) -> bool:
+                if public_host_set is None:
+                    return True
+                if not h:
+                    return False
+                return h in public_host_set
             payload = TikTokEventModel.payload
             diamond_per = func.coalesce(
                 cast(payload.op("->>")("diamond_count"), Integer), 0
@@ -2826,6 +3174,8 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
 
             hosts_payload: list[dict[str, Any]] = []
             for r in host_totals:
+                if not _allow_host(r.host):
+                    continue
                 first = r.first_seen_at
                 last = r.last_seen_at
                 hosts_payload.append({
@@ -2902,6 +3252,8 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                     ORDER BY day
                 """), {"uid": int(user_id)}).all()
                 for r in ds:
+                    if not _allow_host(r[1]):
+                        continue
                     daily_series.append({
                         "day": r[0].isoformat() if r[0] else None,
                         "host": r[1],
@@ -2925,7 +3277,7 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                     GROUP BY e.room_id, r.host_unique_id, r.title
                     ORDER BY d DESC LIMIT 1
                 """), {"uid": int(user_id)}).first()
-                if bs:
+                if bs and _allow_host(bs[1]):
                     intensity["biggest_session"] = {
                         "room_id": str(bs[0]) if bs[0] else None,
                         "host": bs[1],
@@ -3006,6 +3358,8 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                     LIMIT 100
                 """), {"uid": int(user_id)}).all()
                 for r in ra:
+                    if not _allow_host(r[3]):
+                        continue
                     pl = _coerce_payload(r[5]) if r[5] is not None else {}
                     item: dict[str, Any] = {
                         "id": int(r[0]),
@@ -3228,6 +3582,8 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                     LIMIT 5
                 """), {"uid": int(user_id)}).all()
                 for r in ws:
+                    if not _allow_host(r[1]):
+                        continue
                     user_d = int(r[4] or 0)
                     room_d = int(r[6] or 0)
                     whale_sessions.append({
@@ -3310,6 +3666,8 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                 """), {"uid": int(user_id)}).all()
                 for row in rcp:
                     host_handle = row[0]
+                    if not _allow_host(host_handle):
+                        continue
                     to_uid = row[1]
                     bucket = recipients_per_host.setdefault(host_handle, [])
                     bucket.append({
@@ -3365,6 +3723,8 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                     ORDER BY day
                 """), {"uid": int(user_id)}).all()
                 for row in ip:
+                    if not _allow_host(row[1]):
+                        continue
                     identity_progression.append({
                         "day": row[0].isoformat() if row[0] else None,
                         "host": row[1],
@@ -3708,41 +4068,50 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
         self._week_calendar_cache[key] = (now, result)
         return result
 
-    def get_lives_summary(self, handles: list[str]) -> dict[str, dict[str, Any]]:
-        """Returns `{handle: {...}}` keyed by lowercased handle.
+    # ── Per-section helpers for `get_lives_summary`.  ────────────
+    #
+    # The original `get_lives_summary` ran ~22 sequential SQL queries
+    # in one session — well-indexed individually, but the
+    # round-trip latency dominated wall-clock (~1.3 s for 72 handles
+    # on a warm DB).  These helpers split the work so the orchestrator
+    # can fan them out across a ThreadPoolExecutor.
+    #
+    # Hexagonal-architecture note: this stays inside the persistence
+    # adapter — no change in the port surface, no leakage of threading
+    # into the service layer.  The service still sees a single sync
+    # `get_lives_summary(handles) -> dict` call.
+    #
+    # Session lifecycle: each helper opens its **own** session via
+    # `self._get_session()`.  When called from a worker thread,
+    # `get_current_session()` returns `None` (ContextVars don't
+    # propagate into `ThreadPoolExecutor` workers by default), so the
+    # `else` branch hits `self.SessionLocal()` and the helper gets a
+    # private connection from the pool.  No two helpers ever share a
+    # session — one connection, one in-flight query is the SQLAlchemy
+    # rule.  Pool size is 20; the orchestrator caps fan-out at 8.
+    #
+    # Merging strategy: each helper returns its own dict slice
+    # `{host: {field: value, ...}}`.  The orchestrator merges
+    # sequentially after `.result()` (Python-level work, cheap).  No
+    # locks, no shared mutation — easiest correctness story possible.
+    # ──────────────────────────────────────────────────────────────
 
-        Per-handle keys:
-          - active_room_id  (str | None)
-          - live_started_at (iso | None) — derived from current room's first_seen_at
-          - viewer_count    (int | None) — most recent viewer_count event
-          - diamonds_session (int) — sum of diamond_count*repeat_count for
-                                     gifts since the active room started
-          - hourly_buckets (int[60]) — diamonds per minute, last 60 minutes
-          - daily_buckets  (int[24]) — events per hour, last 24h (any type)
-          - top_gifter     ({...} | None) — top diamond contributor in
-                                            current session
-          - active_match   ({...} | None) — battle_id + opponents+scores
-          - last_broadcasts (list[{started_at, ended_at, duration_min,
-                                   diamonds}]) — last 3 rooms ever
-          - avg_duration_min (float | None) — across last 30 days
-          - avg_diamonds     (float | None) — across last 30 days
-          - momentum_label   ('heating'|'cooling'|'steady'|'silent'|None)
+    def _lives_summary_active_rooms(
+        self, norm: list[str]
+    ) -> tuple[dict[str, tuple[int, datetime]], dict[str, dict[str, Any]]]:
+        """Step 1 — anchor query.  Active room per host (last_seen_at
+        within 5 min, no ended_at).  first_seen_at = session start; we
+        use it for both 'duration' and 'session window for top
+        gifter / diamonds_session'.
 
-        All numeric ids stringified for JS BigInt safety.
+        Returns `(active_by_host, slice)`.  `active_by_host` is the
+        keyed lookup every room-scoped helper needs.  `slice` carries
+        the `active_room_id` / `live_started_at` fields that get
+        merged into the final `out`.
         """
-        if not handles:
-            return {}
-        if not self._is_postgres():
-            return {h: {} for h in handles}
-
-        norm = [h.lstrip("@").lower() for h in handles if h]
-        out: dict[str, dict[str, Any]] = {h: {} for h in norm}
-
+        active_by_host: dict[str, tuple[int, datetime]] = {}
+        slice_: dict[str, dict[str, Any]] = {}
         with self._get_session() as s:
-            # ── 1. Active room per host (last_seen_at within 5 min,
-            #     no ended_at). first_seen_at = session start; we use
-            #     it for both "duration" and "session window for top
-            #     gifter / diamonds_session". ──
             active_rooms = s.execute(text("""
                 SELECT host_unique_id, room_id, first_seen_at, ended_at
                 FROM tiktok_rooms
@@ -3750,86 +4119,97 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                   AND ended_at IS NULL
                   AND last_seen_at > NOW() - INTERVAL '5 minutes'
             """), {"hs": norm}).all()
-            active_by_host: dict[str, tuple[int, datetime]] = {}
-            for r in active_rooms:
-                active_by_host[r[0]] = (int(r[1]), r[2])
-                out.setdefault(r[0], {})
-                out[r[0]]["active_room_id"] = str(r[1])
-                out[r[0]]["live_started_at"] = r[2].isoformat() if r[2] else None
+        for r in active_rooms:
+            active_by_host[r[0]] = (int(r[1]), r[2])
+            slice_.setdefault(r[0], {})["active_room_id"] = str(r[1])
+            slice_[r[0]]["live_started_at"] = r[2].isoformat() if r[2] else None
+        return active_by_host, slice_
 
-            # ── 2. Latest viewer_count per active room + last-30-min
-            #     per-minute trend. One scan with DISTINCT ON keyed by
-            #     (room_id, minute_bin) — Postgres returns the most-
-            #     recent viewer_count within each minute. We then sort
-            #     and zero-fill in Python so the sparkline array is
-            #     always a stable 30-element strip (oldest → newest). ──
-            if active_by_host:
-                room_ids = [v[0] for v in active_by_host.values()]
-                vc = s.execute(text("""
-                    SELECT DISTINCT ON (e.room_id, date_trunc('minute', e.ts))
-                           r.host_unique_id,
-                           date_trunc('minute', e.ts) AS minute_bin,
-                           (e.payload->>'total')::int AS viewers
-                    FROM tiktok_events e
-                    JOIN tiktok_rooms r ON r.room_id = e.room_id
-                    WHERE e.room_id = ANY(:rids)
-                      AND e.type = 'viewer_count'
-                      AND e.ts > NOW() - INTERVAL '30 minutes'
-                    ORDER BY e.room_id, date_trunc('minute', e.ts) DESC, e.id DESC
-                """), {"rids": room_ids}).all()
-                # Bucket per host, keyed by minutes-ago (0..29). The
-                # query already pre-deduped to one row per (room, minute);
-                # we just translate the absolute minute_bin into a
-                # relative offset and stash. Latest viewer_count = bucket 0.
-                from datetime import datetime as _dt, timezone as _tz
-                _now = _dt.now(_tz.utc).replace(second=0, microsecond=0)
-                vh_by_host: dict[str, list[int | None]] = {}
-                for h, mb, v in vc:
-                    if v is None:
-                        continue
-                    age_min = int((_now - mb).total_seconds() // 60)
-                    if not (0 <= age_min < 30):
-                        continue
-                    arr = vh_by_host.setdefault(h, [None] * 30)
-                    # bucket 29 = most recent minute, bucket 0 = 30 min ago.
-                    arr[29 - age_min] = int(v)
-                for h, arr in vh_by_host.items():
-                    # Forward-fill so dropouts in the WS feed don't
-                    # produce zero-dips on the sparkline. Last-known-
-                    # value carries forward; leading None's stay None
-                    # and the renderer skips them.
-                    last: int | None = None
-                    filled: list[int] = []
-                    for v in arr:
-                        if v is not None:
-                            last = v
-                        if last is not None:
-                            filled.append(last)
-                    out.setdefault(h, {})
-                    out[h]["viewer_history"] = filled
-                    out[h]["viewer_count"] = filled[-1] if filled else None
+    def _lives_summary_viewer_counts(
+        self, room_ids: list[int]
+    ) -> dict[str, dict[str, Any]]:
+        """Step 2 — latest viewer_count per active room + last-30-min
+        per-minute trend.  One scan with DISTINCT ON keyed by
+        (room_id, minute_bin) — Postgres returns the most-recent
+        viewer_count within each minute.  We then sort and zero-fill
+        in Python so the sparkline array is always a stable
+        30-element strip (oldest → newest)."""
+        slice_: dict[str, dict[str, Any]] = {}
+        with self._get_session() as s:
+            vc = s.execute(text("""
+                SELECT DISTINCT ON (e.room_id, date_trunc('minute', e.ts))
+                       r.host_unique_id,
+                       date_trunc('minute', e.ts) AS minute_bin,
+                       (e.payload->>'total')::int AS viewers
+                FROM tiktok_events e
+                JOIN tiktok_rooms r ON r.room_id = e.room_id
+                WHERE e.room_id = ANY(:rids)
+                  AND e.type = 'viewer_count'
+                  AND e.ts > NOW() - INTERVAL '30 minutes'
+                ORDER BY e.room_id, date_trunc('minute', e.ts) DESC, e.id DESC
+            """), {"rids": room_ids}).all()
+        # Bucket per host, keyed by minutes-ago (0..29).  The query
+        # already pre-deduped to one row per (room, minute); we just
+        # translate the absolute minute_bin into a relative offset
+        # and stash.  Latest viewer_count = bucket 0.
+        _now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        vh_by_host: dict[str, list[int | None]] = {}
+        for h, mb, v in vc:
+            if v is None:
+                continue
+            age_min = int((_now - mb).total_seconds() // 60)
+            if not (0 <= age_min < 30):
+                continue
+            arr = vh_by_host.setdefault(h, [None] * 30)
+            # bucket 29 = most recent minute, bucket 0 = 30 min ago.
+            arr[29 - age_min] = int(v)
+        for h, arr in vh_by_host.items():
+            # Forward-fill so dropouts in the WS feed don't produce
+            # zero-dips on the sparkline.  Last-known-value carries
+            # forward; leading None's stay None and the renderer
+            # skips them.
+            last: int | None = None
+            filled: list[int] = []
+            for v in arr:
+                if v is not None:
+                    last = v
+                if last is not None:
+                    filled.append(last)
+            slice_.setdefault(h, {})["viewer_history"] = filled
+            slice_[h]["viewer_count"] = filled[-1] if filled else None
+        return slice_
 
-            # ── 3. Diamonds in the active session per host. Bounded
-            #     by (room_id, ts >= session start). ──
-            if active_by_host:
-                ds = s.execute(text("""
-                    SELECT r.host_unique_id,
-                           SUM(COALESCE((e.payload->>'diamond_count')::int, 0)
-                               * COALESCE((e.payload->>'repeat_count')::int, 1)) AS d
-                    FROM tiktok_events e
-                    JOIN tiktok_rooms r ON r.room_id = e.room_id
-                    WHERE r.host_unique_id = ANY(:hs)
-                      AND e.type = 'gift'
-                      AND e.room_id = ANY(:rids)
-                    GROUP BY r.host_unique_id
-                """), {"hs": list(active_by_host.keys()), "rids": room_ids}).all()
-                for r in ds:
-                    out.setdefault(r[0], {})
-                    out[r[0]]["diamonds_session"] = int(r[1] or 0)
+    def _lives_summary_session_diamonds(
+        self,
+        active_by_host: dict[str, tuple[int, datetime]],
+        room_ids: list[int],
+    ) -> dict[str, dict[str, Any]]:
+        """Step 3 — diamonds in the active session per host.  Bounded
+        by (room_id, ts >= session start)."""
+        slice_: dict[str, dict[str, Any]] = {}
+        with self._get_session() as s:
+            ds = s.execute(text("""
+                SELECT r.host_unique_id,
+                       SUM(COALESCE((e.payload->>'diamond_count')::int, 0)
+                           * COALESCE((e.payload->>'repeat_count')::int, 1)) AS d
+                FROM tiktok_events e
+                JOIN tiktok_rooms r ON r.room_id = e.room_id
+                WHERE r.host_unique_id = ANY(:hs)
+                  AND e.type = 'gift'
+                  AND e.room_id = ANY(:rids)
+                GROUP BY r.host_unique_id
+            """), {"hs": list(active_by_host.keys()), "rids": room_ids}).all()
+        for r in ds:
+            slice_.setdefault(r[0], {})["diamonds_session"] = int(r[1] or 0)
+        return slice_
 
-            # ── 4. Hourly buckets: diamonds per minute, last 60 min.
-            #     Uses generate_series + LEFT JOIN so empty minutes
-            #     come back as zero (sparkline needs the gaps). ──
+    def _lives_summary_hourly(
+        self, norm: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Step 4 — hourly buckets: diamonds per minute, last 60 min.
+        Uses generate_series + LEFT JOIN so empty minutes come back
+        as zero (sparkline needs the gaps)."""
+        with self._get_session() as s:
             hourly = s.execute(text("""
                 WITH minute_bins AS (
                     SELECT generate_series(0, 59) AS bin
@@ -3848,409 +4228,450 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                 )
                 SELECT host, bin, d FROM gifts
             """), {"hs": norm}).all()
-            hourly_by_host: dict[str, list[int]] = {h: [0] * 60 for h in norm}
-            for h, b, d in hourly:
-                if h in hourly_by_host and 0 <= int(b) < 60:
-                    # bin 0 = most recent minute; flip so the array
-                    # reads oldest → newest (left → right on chart).
-                    hourly_by_host[h][59 - int(b)] = int(d or 0)
-            for h, arr in hourly_by_host.items():
-                out.setdefault(h, {})["hourly_buckets"] = arr
+        hourly_by_host: dict[str, list[int]] = {h: [0] * 60 for h in norm}
+        for h, b, d in hourly:
+            if h in hourly_by_host and 0 <= int(b) < 60:
+                # bin 0 = most recent minute; flip so the array reads
+                # oldest → newest (left → right on chart).
+                hourly_by_host[h][59 - int(b)] = int(d or 0)
+        return {h: {"hourly_buckets": arr} for h, arr in hourly_by_host.items()}
 
-            # ── 5. Daily buckets: ANY-type event count per hour,
-            #     last 24h. Drives the rhythm strip.
-            #
-            #     This query alone scans ~1.7M event rows in the 24h
-            #     window (the cost is data volume, not the JOIN — the
-            #     `(room_id, ts)` index is already optimal). Cache it
-            #     for 60s: the rhythm only shifts at minute resolution,
-            #     so 60s staleness is invisible at human scale and
-            #     saves ~700ms on every poll within the TTL window. ──
-            daily_by_host = self._daily_buckets_cached(norm)
-            for h, arr in daily_by_host.items():
-                out.setdefault(h, {})["daily_buckets"] = arr
-
-            # ── 6. Top 3 gifters per host (the "group-up" signal —
-            #     who's warming up, not just who's #1). One pass: per-
-            #     gifter sum, then ROW_NUMBER() to keep top 3 per host. ──
-            if active_by_host:
-                tg = s.execute(text("""
-                    WITH per_gifter AS (
-                        SELECT r.host_unique_id AS host,
-                               e.user_id,
-                               SUM(COALESCE((e.payload->>'diamond_count')::int, 0)
-                                   * COALESCE((e.payload->>'repeat_count')::int, 1)) AS diamonds,
-                               SUM(COALESCE((e.payload->>'repeat_count')::int, 1)) AS gifts
-                        FROM tiktok_events e
-                        JOIN tiktok_rooms r ON r.room_id = e.room_id
-                        WHERE e.room_id = ANY(:rids)
-                          AND e.type = 'gift'
-                          AND e.user_id IS NOT NULL
-                        GROUP BY r.host_unique_id, e.user_id
-                    ),
-                    ranked AS (
-                        SELECT host, user_id, diamonds, gifts,
-                               ROW_NUMBER() OVER (
-                                   PARTITION BY host ORDER BY diamonds DESC
-                               ) AS rn
-                        FROM per_gifter
-                    )
-                    SELECT r.host, r.user_id, r.diamonds, r.gifts,
-                           v.unique_id, v.nickname, v.avatar_url
-                    FROM ranked r
-                    LEFT JOIN tiktok_viewers v ON v.user_id = r.user_id
-                    WHERE r.rn <= 3
-                    ORDER BY r.host, r.rn
-                """), {"rids": room_ids}).all()
-                # Bucket by host so we can attach as a list and keep
-                # the legacy top_gifter field for backward compat.
-                top_by_host: dict[str, list[dict[str, Any]]] = {}
-                for h, uid, d, gifts, uniq, nick, av in tg:
-                    top_by_host.setdefault(h, []).append({
-                        "user_id":   str(uid) if uid is not None else None,
-                        "diamonds":  int(d or 0),
-                        "gifts":     int(gifts or 0),
-                        "unique_id": uniq,
-                        "nickname":  nick,
-                        "avatar_url":av,
-                    })
-                for h, lst in top_by_host.items():
-                    out.setdefault(h, {})["top_gifters"] = lst
-                    out[h]["top_gifter"] = lst[0] if lst else None
-
-            # ── 6a. Unique gifters this session + first-time-tonight
-            #     count (cross-reference user_host_summary). ──
-            if active_by_host:
-                ug = s.execute(text("""
-                    SELECT r.host_unique_id,
-                           COUNT(DISTINCT e.user_id) AS uniq,
-                           COUNT(DISTINCT e.user_id) FILTER (
-                               WHERE NOT EXISTS (
-                                   SELECT 1 FROM tiktok_user_host_summary u
-                                   WHERE u.user_id = e.user_id
-                                     AND u.host_unique_id = r.host_unique_id
-                                     AND u.first_seen_at < r.first_seen_at
-                               )
-                           ) AS first_time
+    def _lives_summary_top_gifters(
+        self, room_ids: list[int]
+    ) -> dict[str, dict[str, Any]]:
+        """Step 6 — top 3 gifters per host (the 'group-up' signal —
+        who's warming up, not just who's #1).  One pass: per-gifter
+        sum, then ROW_NUMBER() to keep top 3 per host."""
+        slice_: dict[str, dict[str, Any]] = {}
+        with self._get_session() as s:
+            tg = s.execute(text("""
+                WITH per_gifter AS (
+                    SELECT r.host_unique_id AS host,
+                           e.user_id,
+                           SUM(COALESCE((e.payload->>'diamond_count')::int, 0)
+                               * COALESCE((e.payload->>'repeat_count')::int, 1)) AS diamonds,
+                           SUM(COALESCE((e.payload->>'repeat_count')::int, 1)) AS gifts
                     FROM tiktok_events e
                     JOIN tiktok_rooms r ON r.room_id = e.room_id
                     WHERE e.room_id = ANY(:rids)
                       AND e.type = 'gift'
                       AND e.user_id IS NOT NULL
-                    GROUP BY r.host_unique_id
-                """), {"rids": room_ids}).all()
-                for h, uniq, first_time in ug:
-                    out.setdefault(h, {})["n_unique_gifters"] = int(uniq or 0)
-                    out[h]["n_first_time_gifters"] = int(first_time or 0)
+                    GROUP BY r.host_unique_id, e.user_id
+                ),
+                ranked AS (
+                    SELECT host, user_id, diamonds, gifts,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY host ORDER BY diamonds DESC
+                           ) AS rn
+                    FROM per_gifter
+                )
+                SELECT r.host, r.user_id, r.diamonds, r.gifts,
+                       v.unique_id, v.nickname, v.avatar_url
+                FROM ranked r
+                LEFT JOIN tiktok_viewers v ON v.user_id = r.user_id
+                WHERE r.rn <= 3
+                ORDER BY r.host, r.rn
+            """), {"rids": room_ids}).all()
+        # Bucket by host so we can attach as a list and keep the
+        # legacy top_gifter field for backward compat.
+        top_by_host: dict[str, list[dict[str, Any]]] = {}
+        for h, uid, d, gifts, uniq, nick, av in tg:
+            top_by_host.setdefault(h, []).append({
+                "user_id":   str(uid) if uid is not None else None,
+                "diamonds":  int(d or 0),
+                "gifts":     int(gifts or 0),
+                "unique_id": uniq,
+                "nickname":  nick,
+                "avatar_url":av,
+            })
+        for h, lst in top_by_host.items():
+            slice_.setdefault(h, {})["top_gifters"] = lst
+            slice_[h]["top_gifter"] = lst[0] if lst else None
+        return slice_
 
-            # ── 6b/6b'/6c MERGED. Single scan over `tiktok_events` per
-            #     active room produces:
-            #       • session scoreboard counters (comments, gifts, …)
-            #       • silence detector ages (last gift / comment / any)
-            #       • comment cadence (cpm_recent 5-min, cpm_baseline 60-min)
-            #     Postgres reads each row once and computes every FILTER
-            #     in parallel — much cheaper than three separate scans
-            #     of the same row range. Saves ~150ms on the hot path
-            #     for typical live counts (~11 active rooms, ~170k events). ──
-            if active_by_host:
-                merged = s.execute(text("""
-                    SELECT r.host_unique_id,
-                           COUNT(*) FILTER (WHERE e.type = 'comment')   AS n_comments,
-                           COUNT(*) FILTER (WHERE e.type = 'gift')      AS n_gifts,
-                           COUNT(*) FILTER (WHERE e.type = 'like')      AS n_likes,
-                           COUNT(*) FILTER (WHERE e.type = 'join')      AS n_joins,
-                           COUNT(*) FILTER (WHERE e.type = 'follow')    AS n_follows,
-                           COUNT(*) FILTER (WHERE e.type = 'share')     AS n_shares,
-                           COUNT(DISTINCT e.user_id) FILTER (WHERE e.type = 'comment') AS n_commenters,
-                           COALESCE(MAX(
-                               CASE WHEN e.type = 'gift'
-                                    THEN COALESCE((e.payload->>'diamond_count')::int, 0)
-                                       * COALESCE((e.payload->>'repeat_count')::int, 1)
-                               END
-                           ), 0) AS largest_gift,
-                           EXTRACT(EPOCH FROM (NOW() - MAX(e.ts) FILTER (WHERE e.type = 'gift')))::int    AS gift_age,
-                           EXTRACT(EPOCH FROM (NOW() - MAX(e.ts) FILTER (WHERE e.type = 'comment')))::int AS comment_age,
-                           EXTRACT(EPOCH FROM (NOW() - MAX(e.ts)))::int                                  AS any_age,
-                           COUNT(*) FILTER (
-                               WHERE e.type = 'comment' AND e.ts > NOW() - INTERVAL '5 minutes'
-                           ) / 5.0  AS cpm_recent,
-                           COUNT(*) FILTER (
-                               WHERE e.type = 'comment' AND e.ts > NOW() - INTERVAL '60 minutes'
-                           ) / 60.0 AS cpm_baseline
-                    FROM tiktok_events e
-                    JOIN tiktok_rooms r ON r.room_id = e.room_id
-                    WHERE e.room_id = ANY(:rids)
-                    GROUP BY r.host_unique_id
-                """), {"rids": room_ids}).all()
-                for row in merged:
-                    h, nc, ng, nl, nj, nf, nsh, ncom, lg, ga, ca, anya, cpm_r, cpm_b = row
-                    out.setdefault(h, {})["session_stats"] = {
-                        "n_comments":          int(nc or 0),
-                        "n_gifts":             int(ng or 0),
-                        "n_likes":             int(nl or 0),
-                        "n_joins":             int(nj or 0),
-                        "n_follows":           int(nf or 0),
-                        "n_shares":            int(nsh or 0),
-                        "n_unique_commenters": int(ncom or 0),
-                        "largest_gift_diamonds": int(lg or 0),
-                    }
-                    out[h]["last_gift_age_s"]    = int(ga) if ga is not None else None
-                    out[h]["last_comment_age_s"] = int(ca) if ca is not None else None
-                    out[h]["last_event_age_s"]   = int(anya) if anya is not None else None
-                    out[h]["comments_per_min_recent"]   = round(float(cpm_r or 0), 1)
-                    out[h]["comments_per_min_baseline"] = round(float(cpm_b or 0), 1)
+    def _lives_summary_unique_and_session_stats(
+        self, room_ids: list[int]
+    ) -> dict[str, dict[str, Any]]:
+        """Steps 6a + 6b — unique-gifter / first-time count AND the
+        merged session-stats scan (scoreboard counters + silence ages
+        + comment cadence).
 
-            # ── 6b''. Battles played + host's W-L-D in the active
-            #     session. Resolves the host's team in each match the
-            #     same way the rest of the codebase does (team_id or
-            #     user_id mismatch with the opponents list, then
-            #     opponents[].score fallback). One query per active
-            #     room — Python computes the W-L. ──
-            if active_by_host:
-                br = s.execute(text("""
-                    SELECT r.host_unique_id, m.id, m.ended_at,
-                           m.opponents, m.scores
-                    FROM tiktok_matches m
-                    JOIN tiktok_rooms r ON r.room_id = m.room_id
-                    WHERE m.room_id = ANY(:rids)
-                """), {"rids": room_ids}).all()
-                tally_by_host: dict[str, dict[str, int]] = {}
-                for h, _mid, ended, opps_raw, scores_raw in br:
-                    tally = tally_by_host.setdefault(h, {
-                        "n_battles": 0, "w": 0, "l": 0, "d": 0,
-                    })
-                    tally["n_battles"] += 1
-                    if ended is None:
-                        # In-progress matches don't count toward W/L/D.
+        We keep these two queries paired in one helper for a
+        different reason than the others: both are wide scans over
+        the active-room event window.  Running them on the same
+        connection avoids two simultaneous heavy scans against the
+        same hot rows (the room-events index would otherwise
+        contend).  Functionally each is independent, so the order
+        here doesn't matter.
+        """
+        slice_: dict[str, dict[str, Any]] = {}
+        with self._get_session() as s:
+            # 6a — unique gifters + first-time-tonight count
+            # (cross-reference user_host_summary).
+            ug = s.execute(text("""
+                SELECT r.host_unique_id,
+                       COUNT(DISTINCT e.user_id) AS uniq,
+                       COUNT(DISTINCT e.user_id) FILTER (
+                           WHERE NOT EXISTS (
+                               SELECT 1 FROM tiktok_user_host_summary u
+                               WHERE u.user_id = e.user_id
+                                 AND u.host_unique_id = r.host_unique_id
+                                 AND u.first_seen_at < r.first_seen_at
+                           )
+                       ) AS first_time
+                FROM tiktok_events e
+                JOIN tiktok_rooms r ON r.room_id = e.room_id
+                WHERE e.room_id = ANY(:rids)
+                  AND e.type = 'gift'
+                  AND e.user_id IS NOT NULL
+                GROUP BY r.host_unique_id
+            """), {"rids": room_ids}).all()
+            for h, uniq, first_time in ug:
+                slice_.setdefault(h, {})["n_unique_gifters"] = int(uniq or 0)
+                slice_[h]["n_first_time_gifters"] = int(first_time or 0)
+
+            # 6b/6b'/6c MERGED — single scan over `tiktok_events` per
+            # active room produces:
+            #   • session scoreboard counters (comments, gifts, …)
+            #   • silence detector ages (last gift / comment / any)
+            #   • comment cadence (cpm_recent 5-min, cpm_baseline 60-min)
+            # Postgres reads each row once and computes every FILTER
+            # in parallel — much cheaper than three separate scans of
+            # the same row range.  Saves ~150ms on the hot path for
+            # typical live counts (~11 active rooms, ~170k events).
+            merged = s.execute(text("""
+                SELECT r.host_unique_id,
+                       COUNT(*) FILTER (WHERE e.type = 'comment')   AS n_comments,
+                       COUNT(*) FILTER (WHERE e.type = 'gift')      AS n_gifts,
+                       COUNT(*) FILTER (WHERE e.type = 'like')      AS n_likes,
+                       COUNT(*) FILTER (WHERE e.type = 'join')      AS n_joins,
+                       COUNT(*) FILTER (WHERE e.type = 'follow')    AS n_follows,
+                       COUNT(*) FILTER (WHERE e.type = 'share')     AS n_shares,
+                       COUNT(DISTINCT e.user_id) FILTER (WHERE e.type = 'comment') AS n_commenters,
+                       COALESCE(MAX(
+                           CASE WHEN e.type = 'gift'
+                                THEN COALESCE((e.payload->>'diamond_count')::int, 0)
+                                   * COALESCE((e.payload->>'repeat_count')::int, 1)
+                           END
+                       ), 0) AS largest_gift,
+                       EXTRACT(EPOCH FROM (NOW() - MAX(e.ts) FILTER (WHERE e.type = 'gift')))::int    AS gift_age,
+                       EXTRACT(EPOCH FROM (NOW() - MAX(e.ts) FILTER (WHERE e.type = 'comment')))::int AS comment_age,
+                       EXTRACT(EPOCH FROM (NOW() - MAX(e.ts)))::int                                  AS any_age,
+                       COUNT(*) FILTER (
+                           WHERE e.type = 'comment' AND e.ts > NOW() - INTERVAL '5 minutes'
+                       ) / 5.0  AS cpm_recent,
+                       COUNT(*) FILTER (
+                           WHERE e.type = 'comment' AND e.ts > NOW() - INTERVAL '60 minutes'
+                       ) / 60.0 AS cpm_baseline
+                FROM tiktok_events e
+                JOIN tiktok_rooms r ON r.room_id = e.room_id
+                WHERE e.room_id = ANY(:rids)
+                GROUP BY r.host_unique_id
+            """), {"rids": room_ids}).all()
+        for row in merged:
+            h, nc, ng, nl, nj, nf, nsh, ncom, lg, ga, ca, anya, cpm_r, cpm_b = row
+            slice_.setdefault(h, {})["session_stats"] = {
+                "n_comments":          int(nc or 0),
+                "n_gifts":             int(ng or 0),
+                "n_likes":             int(nl or 0),
+                "n_joins":             int(nj or 0),
+                "n_follows":           int(nf or 0),
+                "n_shares":            int(nsh or 0),
+                "n_unique_commenters": int(ncom or 0),
+                "largest_gift_diamonds": int(lg or 0),
+            }
+            slice_[h]["last_gift_age_s"]    = int(ga) if ga is not None else None
+            slice_[h]["last_comment_age_s"] = int(ca) if ca is not None else None
+            slice_[h]["last_event_age_s"]   = int(anya) if anya is not None else None
+            slice_[h]["comments_per_min_recent"]   = round(float(cpm_r or 0), 1)
+            slice_[h]["comments_per_min_baseline"] = round(float(cpm_b or 0), 1)
+        return slice_
+
+    def _lives_summary_battles(
+        self, room_ids: list[int]
+    ) -> dict[str, dict[str, Any]]:
+        """Step 6b'' — battles played + host's W-L-D in the active
+        session.  Resolves the host's team in each match the same way
+        the rest of the codebase does (team_id or user_id mismatch
+        with the opponents list, then opponents[].score fallback).
+        One query per active room — Python computes the W-L."""
+        with self._get_session() as s:
+            br = s.execute(text("""
+                SELECT r.host_unique_id, m.id, m.ended_at,
+                       m.opponents, m.scores
+                FROM tiktok_matches m
+                JOIN tiktok_rooms r ON r.room_id = m.room_id
+                WHERE m.room_id = ANY(:rids)
+            """), {"rids": room_ids}).all()
+        tally_by_host: dict[str, dict[str, int]] = {}
+        for h, _mid, ended, opps_raw, scores_raw in br:
+            tally = tally_by_host.setdefault(h, {
+                "n_battles": 0, "w": 0, "l": 0, "d": 0,
+            })
+            tally["n_battles"] += 1
+            if ended is None:
+                # In-progress matches don't count toward W/L/D.
+                continue
+            opps = _coerce_payload(opps_raw) if opps_raw is not None else []
+            if not isinstance(opps, list):
+                opps = []
+            scores = _coerce_payload(scores_raw) if scores_raw is not None else {}
+            # Resolve host_score vs opp_score (same multi-shape logic
+            # frontend uses).  Path 1: scores keyed by team_id or
+            # user_id.  Path 2: opponents[].score.
+            host_handle = h.lstrip("@").lower()
+            host_score: int | None = None
+            opp_score:  int | None = None
+            host_keys: set[str] = set()
+            opp_keys:  set[str] = set()
+            for o in opps:
+                if not isinstance(o, dict):
+                    continue
+                is_opp = (o.get("unique_id") or "").lstrip("@").lower() != host_handle
+                if o.get("team_id") is not None:
+                    (opp_keys if is_opp else host_keys).add(str(o.get("team_id")))
+                if o.get("user_id") is not None:
+                    (opp_keys if is_opp else host_keys).add(str(o.get("user_id")))
+            if isinstance(scores, dict):
+                for k, v in scores.items():
+                    try:
+                        sc_i = int(v)
+                    except (TypeError, ValueError):
                         continue
-                    opps = _coerce_payload(opps_raw) if opps_raw is not None else []
-                    if not isinstance(opps, list):
-                        opps = []
-                    scores = _coerce_payload(scores_raw) if scores_raw is not None else {}
-                    # Resolve host_score vs opp_score (same multi-shape
-                    # logic frontend uses). Path 1: scores keyed by
-                    # team_id or user_id. Path 2: opponents[].score.
-                    host_handle = h.lstrip("@").lower()
-                    host_score: int | None = None
-                    opp_score:  int | None = None
-                    host_keys: set[str] = set()
-                    opp_keys:  set[str] = set()
-                    for o in opps:
-                        if not isinstance(o, dict):
-                            continue
-                        is_opp = (o.get("unique_id") or "").lstrip("@").lower() != host_handle
-                        if o.get("team_id") is not None:
-                            (opp_keys if is_opp else host_keys).add(str(o.get("team_id")))
-                        if o.get("user_id") is not None:
-                            (opp_keys if is_opp else host_keys).add(str(o.get("user_id")))
-                    if isinstance(scores, dict):
-                        for k, v in scores.items():
-                            try:
-                                sc_i = int(v)
-                            except (TypeError, ValueError):
-                                continue
-                            if str(k) in host_keys and host_score is None:
-                                host_score = sc_i
-                            elif str(k) in opp_keys and opp_score is None:
-                                opp_score = sc_i
-                    if host_score is None or opp_score is None:
-                        for o in opps:
-                            if not isinstance(o, dict):
-                                continue
-                            handle = (o.get("unique_id") or "").lstrip("@").lower()
-                            sc = o.get("score")
-                            if sc is None:
-                                continue
-                            try:
-                                sc_i = int(sc)
-                            except (TypeError, ValueError):
-                                continue
-                            if handle == host_handle and host_score is None:
-                                host_score = sc_i
-                            elif handle and handle != host_handle and opp_score is None:
-                                opp_score = sc_i
-                    if host_score is None or opp_score is None:
+                    if str(k) in host_keys and host_score is None:
+                        host_score = sc_i
+                    elif str(k) in opp_keys and opp_score is None:
+                        opp_score = sc_i
+            if host_score is None or opp_score is None:
+                for o in opps:
+                    if not isinstance(o, dict):
                         continue
-                    if host_score > opp_score:
-                        tally["w"] += 1
-                    elif host_score < opp_score:
-                        tally["l"] += 1
-                    else:
-                        tally["d"] += 1
-                for h, t in tally_by_host.items():
-                    sst = out.setdefault(h, {}).setdefault("session_stats", {})
-                    sst["n_battles"] = int(t["n_battles"])
-                    sst["session_w"] = int(t["w"])
-                    sst["session_l"] = int(t["l"])
-                    sst["session_d"] = int(t["d"])
+                    handle = (o.get("unique_id") or "").lstrip("@").lower()
+                    sc = o.get("score")
+                    if sc is None:
+                        continue
+                    try:
+                        sc_i = int(sc)
+                    except (TypeError, ValueError):
+                        continue
+                    if handle == host_handle and host_score is None:
+                        host_score = sc_i
+                    elif handle and handle != host_handle and opp_score is None:
+                        opp_score = sc_i
+            if host_score is None or opp_score is None:
+                continue
+            if host_score > opp_score:
+                tally["w"] += 1
+            elif host_score < opp_score:
+                tally["l"] += 1
+            else:
+                tally["d"] += 1
+        # Return as a slice that the orchestrator merges into
+        # `session_stats`.  We use a sentinel key
+        # `_battles_into_session_stats` so the merger knows to push
+        # into the nested dict instead of replacing it.
+        slice_: dict[str, dict[str, Any]] = {}
+        for h, t in tally_by_host.items():
+            slice_[h] = {
+                "_battles_into_session_stats": {
+                    "n_battles": int(t["n_battles"]),
+                    "session_w": int(t["w"]),
+                    "session_l": int(t["l"]),
+                    "session_d": int(t["d"]),
+                }
+            }
+        return slice_
 
-            # ── 6c MERGED into 6b/6b'. See above. ──
+    def _lives_summary_envelopes(
+        self, room_ids: list[int]
+    ) -> dict[str, dict[str, Any]]:
+        """Step 6g — envelope stats per active session.  Red-envelope
+        promo drops are separate from regular gifts but also carry
+        `diamond_count` (sometimes 0 for free-promo, sometimes 20-120+
+        for tipped envelopes).  Operators want to see this volume
+        distinct from `diamonds_session` so the gift-cell sub-line
+        can flag envelope activity."""
+        slice_: dict[str, dict[str, Any]] = {}
+        with self._get_session() as s:
+            en = s.execute(text("""
+                SELECT r.host_unique_id,
+                       COUNT(*) AS n,
+                       COALESCE(SUM((e.payload->>'diamond_count')::int), 0) AS d
+                FROM tiktok_events e
+                JOIN tiktok_rooms r ON r.room_id = e.room_id
+                WHERE e.room_id = ANY(:rids)
+                  AND e.type = 'envelope'
+                GROUP BY r.host_unique_id
+            """), {"rids": room_ids}).all()
+        for h, n, d in en:
+            slice_.setdefault(h, {})["n_envelopes_session"] = int(n or 0)
+            slice_[h]["envelope_diamonds_session"] = int(d or 0)
+        return slice_
 
-            # ── 6h removed — caption capture disabled (rationale in
-            #     tiktok_live_client.py, near the disabled handlers).
-
-            # ── 6g. Envelope stats per active session — red-envelope
-            #     promo drops are separate from regular gifts but also
-            #     carry `diamond_count` (sometimes 0 for free-promo,
-            #     sometimes 20-120+ for tipped envelopes). Operators
-            #     want to see this volume distinct from `diamonds_session`
-            #     so the gift-cell sub-line can flag envelope activity. ──
-            if active_by_host:
-                en = s.execute(text("""
-                    SELECT r.host_unique_id,
-                           COUNT(*) AS n,
-                           COALESCE(SUM((e.payload->>'diamond_count')::int), 0) AS d
-                    FROM tiktok_events e
-                    JOIN tiktok_rooms r ON r.room_id = e.room_id
-                    WHERE e.room_id = ANY(:rids)
-                      AND e.type = 'envelope'
-                    GROUP BY r.host_unique_id
-                """), {"rids": room_ids}).all()
-                for h, n, d in en:
-                    out.setdefault(h, {})["n_envelopes_session"] = int(n or 0)
-                    out[h]["envelope_diamonds_session"] = int(d or 0)
-
-            # ── 6f. Active poll. TikTok fires `poll` events with
-            #     `message_type=2` repeatedly while a poll is open
-            #     (every 1–20s) and `message_type=1` once on close.
-            #     "Active poll right now" = latest poll event for the
-            #     room is mt=2 AND fresh (last 60s, since updates can
-            #     gap to 20s+ on a slow stream). One DISTINCT-ON scan
-            #     gets us the latest event per room. ──
-            if active_by_host:
-                ap = s.execute(text("""
-                    SELECT DISTINCT ON (e.room_id)
-                           r.host_unique_id,
-                           e.payload->>'title'        AS title,
-                           e.payload->>'poll_id'      AS poll_id,
-                           e.payload->>'message_type' AS mt,
-                           EXTRACT(EPOCH FROM (NOW() - e.ts))::int AS age_s
-                    FROM tiktok_events e
-                    JOIN tiktok_rooms r ON r.room_id = e.room_id
-                    WHERE e.room_id = ANY(:rids)
-                      AND e.type = 'poll'
-                      AND e.ts > NOW() - INTERVAL '5 minutes'
-                    ORDER BY e.room_id, e.id DESC
-                """), {"rids": room_ids}).all()
-                for h, title, poll_id, mt, age in ap:
-                    # Only surface OPEN polls (mt=2) within the freshness
-                    # window. mt=1 events mean closed; mt=0 is unknown
-                    # (only 6 ever observed). Stale polls (>60s without
-                    # an update) are presumed dead even if mt=2.
-                    if str(mt) == "2" and (age or 0) <= 60:
-                        out.setdefault(h, {})["active_poll"] = {
-                            "title":    title or "",
-                            "poll_id":  str(poll_id) if poll_id else None,
-                            "fresh_age_s": int(age or 0),
-                        }
-
-            # ── 6e. Pause stats per active session. TikTok emits
-            #     `LivePauseEvent` when the creator/moderator pauses
-            #     the stream (camera off, intermission, etc.). Note:
-            #     `LiveUnpauseEvent` does fire on the lib but is not
-            #     emitted by TikTok in practice for our hosts (0
-            #     captured vs ~200 pauses), so we surface count +
-            #     last-pause-age and treat duration as unknowable. ──
-            if active_by_host:
-                pp = s.execute(text("""
-                    SELECT r.host_unique_id,
-                           COUNT(*) FILTER (WHERE e.type = 'live_pause') AS n_pauses,
-                           EXTRACT(EPOCH FROM (NOW() - MAX(e.ts) FILTER (WHERE e.type = 'live_pause')))::int AS last_pause_age
-                    FROM tiktok_events e
-                    JOIN tiktok_rooms r ON r.room_id = e.room_id
-                    WHERE e.room_id = ANY(:rids)
-                      AND e.type = 'live_pause'
-                    GROUP BY r.host_unique_id
-                """), {"rids": room_ids}).all()
-                for h, n, age in pp:
-                    out.setdefault(h, {})["n_pauses"] = int(n or 0)
-                    out[h]["last_pause_age_s"] = int(age) if age is not None else None
-
-            # ── 6d. Favourite gifters present in the room (any
-            #     event type, last 5 minutes). Pre-gift presence is
-            #     the actual edge — drop in before they tip. ──
-            if active_by_host:
-                fp = s.execute(text("""
-                    SELECT DISTINCT ON (r.host_unique_id, e.user_id)
-                           r.host_unique_id AS host, e.user_id,
-                           v.unique_id, v.nickname, v.avatar_url,
-                           EXTRACT(EPOCH FROM (NOW() - e.ts))::int AS seen_age_s
-                    FROM tiktok_events e
-                    JOIN tiktok_rooms r ON r.room_id = e.room_id
-                    JOIN tiktok_favorite_gifters f ON f.user_id = e.user_id
-                    LEFT JOIN tiktok_viewers v ON v.user_id = e.user_id
-                    WHERE e.room_id = ANY(:rids)
-                      AND e.ts > NOW() - INTERVAL '5 minutes'
-                    ORDER BY r.host_unique_id, e.user_id, e.ts DESC
-                """), {"rids": room_ids}).all()
-                fp_by_host: dict[str, list[dict[str, Any]]] = {}
-                for h, uid, uniq, nick, av, age in fp:
-                    fp_by_host.setdefault(h, []).append({
-                        "user_id":   str(uid) if uid is not None else None,
-                        "unique_id": uniq,
-                        "nickname":  nick,
-                        "avatar_url":av,
-                        "seen_age_s": int(age or 0),
-                    })
-                for h, lst in fp_by_host.items():
-                    out.setdefault(h, {})["favorites_in_room"] = lst[:8]
-
-            # ── 7. Active match per host (PK chip). ──
-            if active_by_host:
-                ams = s.execute(text("""
-                    SELECT r.host_unique_id, m.id, m.battle_id, m.opponents, m.settings
-                    FROM tiktok_matches m
-                    JOIN tiktok_rooms r ON r.room_id = m.room_id
-                    WHERE r.host_unique_id = ANY(:hs)
-                      AND m.ended_at IS NULL
-                      AND m.last_seen_at > NOW() - INTERVAL '2 minutes'
-                """), {"hs": list(active_by_host.keys())}).all()
-                for h, mid, bid, opps_raw, settings_raw in ams:
-                    opps = _coerce_payload(opps_raw) if opps_raw is not None else []
-                    if not isinstance(opps, list):
-                        opps = []
-                    settings = _coerce_payload(settings_raw) if settings_raw else {}
-                    if not isinstance(settings, dict):
-                        settings = {}
-                    # PK countdown: settings.end_time_ms is unix ms.
-                    countdown_s: int | None = None
-                    end_ms = settings.get("end_time_ms")
-                    if end_ms:
-                        try:
-                            from time import time as _now_secs
-                            countdown_s = max(0, int(int(end_ms) / 1000 - _now_secs()))
-                        except (TypeError, ValueError):
-                            countdown_s = None
-                    serial = []
-                    for o in opps:
-                        if isinstance(o, dict):
-                            serial.append({
-                                "user_id":   str(o.get("user_id")) if o.get("user_id") is not None else None,
-                                "unique_id": o.get("unique_id"),
-                                "nickname":  o.get("nickname"),
-                                "avatar_url":o.get("avatar_url"),
-                                "score":     int(o.get("score") or 0),
-                            })
-                    out.setdefault(h, {})["active_match"] = {
-                        "match_id":  int(mid),
-                        "battle_id": str(bid) if bid else None,
-                        "countdown_s": countdown_s,
-                        "opponents": serial,
+    def _lives_summary_polls_pauses_favs(
+        self, room_ids: list[int]
+    ) -> dict[str, dict[str, Any]]:
+        """Steps 6f + 6e + 6d — polls, pauses, favourite gifters
+        present.  Three small queries that share a room-scoped time
+        window; bundling them in one helper keeps the helper count
+        manageable and the queries are cheap (each <50ms typically).
+        """
+        slice_: dict[str, dict[str, Any]] = {}
+        with self._get_session() as s:
+            # 6f — active poll.  TikTok fires `poll` events with
+            # `message_type=2` repeatedly while a poll is open
+            # (every 1–20s) and `message_type=1` once on close.
+            # "Active poll right now" = latest poll event for the
+            # room is mt=2 AND fresh (last 60s, since updates can
+            # gap to 20s+ on a slow stream).  One DISTINCT-ON scan
+            # gets us the latest event per room.
+            ap = s.execute(text("""
+                SELECT DISTINCT ON (e.room_id)
+                       r.host_unique_id,
+                       e.payload->>'title'        AS title,
+                       e.payload->>'poll_id'      AS poll_id,
+                       e.payload->>'message_type' AS mt,
+                       EXTRACT(EPOCH FROM (NOW() - e.ts))::int AS age_s
+                FROM tiktok_events e
+                JOIN tiktok_rooms r ON r.room_id = e.room_id
+                WHERE e.room_id = ANY(:rids)
+                  AND e.type = 'poll'
+                  AND e.ts > NOW() - INTERVAL '5 minutes'
+                ORDER BY e.room_id, e.id DESC
+            """), {"rids": room_ids}).all()
+            for h, title, poll_id, mt, age in ap:
+                # Only surface OPEN polls (mt=2) within the freshness
+                # window.  mt=1 events mean closed; mt=0 is unknown
+                # (only 6 ever observed).  Stale polls (>60s without
+                # an update) are presumed dead even if mt=2.
+                if str(mt) == "2" and (age or 0) <= 60:
+                    slice_.setdefault(h, {})["active_poll"] = {
+                        "title":    title or "",
+                        "poll_id":  str(poll_id) if poll_id else None,
+                        "fresh_age_s": int(age or 0),
                     }
 
-            # ── 8. Last 3 broadcasts per host. Window-fn LIMIT-per-
-            #     group via row_number(). Cheap with the
-            #     (host_unique_id, first_seen_at) index.
-            #
-            #     `ended_at` is rarely populated in our data (the
-            #     listener doesn't always mark a clean shutdown, so
-            #     it stays NULL when the WS just dropped). Surface
-            #     `last_seen_at` as a fallback so the offline-card
-            #     UI can still answer "when did this last stream
-            #     wrap" + compute a duration. The active-room check
-            #     (Section 1) still keys on `ended_at IS NULL AND
-            #     last_seen_at > NOW() - 5min` — that's authoritative
-            #     for liveness; the fallback here only feeds display.
+            # 6e — pause stats per active session.  TikTok emits
+            # `LivePauseEvent` when the creator/moderator pauses the
+            # stream (camera off, intermission, etc.).  Note:
+            # `LiveUnpauseEvent` does fire on the lib but is not
+            # emitted by TikTok in practice for our hosts (0
+            # captured vs ~200 pauses), so we surface count +
+            # last-pause-age and treat duration as unknowable.
+            pp = s.execute(text("""
+                SELECT r.host_unique_id,
+                       COUNT(*) FILTER (WHERE e.type = 'live_pause') AS n_pauses,
+                       EXTRACT(EPOCH FROM (NOW() - MAX(e.ts) FILTER (WHERE e.type = 'live_pause')))::int AS last_pause_age
+                FROM tiktok_events e
+                JOIN tiktok_rooms r ON r.room_id = e.room_id
+                WHERE e.room_id = ANY(:rids)
+                  AND e.type = 'live_pause'
+                GROUP BY r.host_unique_id
+            """), {"rids": room_ids}).all()
+            for h, n, age in pp:
+                slice_.setdefault(h, {})["n_pauses"] = int(n or 0)
+                slice_[h]["last_pause_age_s"] = int(age) if age is not None else None
+
+            # 6d — favourite gifters present in the room (any event
+            # type, last 5 minutes).  Pre-gift presence is the actual
+            # edge — drop in before they tip.
+            fp = s.execute(text("""
+                SELECT DISTINCT ON (r.host_unique_id, e.user_id)
+                       r.host_unique_id AS host, e.user_id,
+                       v.unique_id, v.nickname, v.avatar_url,
+                       EXTRACT(EPOCH FROM (NOW() - e.ts))::int AS seen_age_s
+                FROM tiktok_events e
+                JOIN tiktok_rooms r ON r.room_id = e.room_id
+                JOIN tiktok_favorite_gifters f ON f.user_id = e.user_id
+                LEFT JOIN tiktok_viewers v ON v.user_id = e.user_id
+                WHERE e.room_id = ANY(:rids)
+                  AND e.ts > NOW() - INTERVAL '5 minutes'
+                ORDER BY r.host_unique_id, e.user_id, e.ts DESC
+            """), {"rids": room_ids}).all()
+        fp_by_host: dict[str, list[dict[str, Any]]] = {}
+        for h, uid, uniq, nick, av, age in fp:
+            fp_by_host.setdefault(h, []).append({
+                "user_id":   str(uid) if uid is not None else None,
+                "unique_id": uniq,
+                "nickname":  nick,
+                "avatar_url":av,
+                "seen_age_s": int(age or 0),
+            })
+        for h, lst in fp_by_host.items():
+            slice_.setdefault(h, {})["favorites_in_room"] = lst[:8]
+        return slice_
+
+    def _lives_summary_active_match(
+        self, active_hosts: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Step 7 — active match per host (PK chip)."""
+        slice_: dict[str, dict[str, Any]] = {}
+        with self._get_session() as s:
+            ams = s.execute(text("""
+                SELECT r.host_unique_id, m.id, m.battle_id, m.opponents, m.settings
+                FROM tiktok_matches m
+                JOIN tiktok_rooms r ON r.room_id = m.room_id
+                WHERE r.host_unique_id = ANY(:hs)
+                  AND m.ended_at IS NULL
+                  AND m.last_seen_at > NOW() - INTERVAL '2 minutes'
+            """), {"hs": active_hosts}).all()
+        for h, mid, bid, opps_raw, settings_raw in ams:
+            opps = _coerce_payload(opps_raw) if opps_raw is not None else []
+            if not isinstance(opps, list):
+                opps = []
+            settings = _coerce_payload(settings_raw) if settings_raw else {}
+            if not isinstance(settings, dict):
+                settings = {}
+            # PK countdown: settings.end_time_ms is unix ms.
+            countdown_s: int | None = None
+            end_ms = settings.get("end_time_ms")
+            if end_ms:
+                try:
+                    from time import time as _now_secs
+                    countdown_s = max(0, int(int(end_ms) / 1000 - _now_secs()))
+                except (TypeError, ValueError):
+                    countdown_s = None
+            serial = []
+            for o in opps:
+                if isinstance(o, dict):
+                    serial.append({
+                        "user_id":   str(o.get("user_id")) if o.get("user_id") is not None else None,
+                        "unique_id": o.get("unique_id"),
+                        "nickname":  o.get("nickname"),
+                        "avatar_url":o.get("avatar_url"),
+                        "score":     int(o.get("score") or 0),
+                    })
+            slice_.setdefault(h, {})["active_match"] = {
+                "match_id":  int(mid),
+                "battle_id": str(bid) if bid else None,
+                "countdown_s": countdown_s,
+                "opponents": serial,
+            }
+        return slice_
+
+    def _lives_summary_last_broadcasts(
+        self, norm: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Step 8 — last 3 broadcasts per host.
+
+        Three queries fused into one helper because they form a
+        natural pipeline (the room-ids feed the two stats scans).
+        Splitting them would require returning intermediate state
+        between threads — not worth the complexity.
+
+        Window-fn LIMIT-per-group via row_number().  Cheap with the
+        (host_unique_id, first_seen_at) index.
+
+        `ended_at` is rarely populated in our data (the listener
+        doesn't always mark a clean shutdown, so it stays NULL when
+        the WS just dropped).  Surface `last_seen_at` as a fallback
+        so the offline-card UI can still answer "when did this last
+        stream wrap" + compute a duration.  The active-room check
+        (Section 1) still keys on `ended_at IS NULL AND last_seen_at
+        > NOW() - 5min` — that's authoritative for liveness; the
+        fallback here only feeds display.
+        """
+        with self._get_session() as s:
             last_rooms = s.execute(text("""
                 WITH ranked AS (
                     SELECT r.host_unique_id, r.room_id, r.first_seen_at,
@@ -4329,37 +4750,47 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                         "n_comments":    0,
                         "peak_viewers":  0,
                     }
-            broadcasts_by_host: dict[str, list[dict[str, Any]]] = {h: [] for h in norm}
-            for h, rid, started, ended, last_seen in last_rooms:
-                if h not in broadcasts_by_host:
-                    continue
-                # Fall back to last_seen_at when ended_at is NULL — see
-                # the rationale above. `effective_end` is the timestamp
-                # used for both the display "ended_at" and the duration
-                # calc, with a flag so the UI can mark it inferred.
-                effective_end = ended or last_seen
-                inferred = ended is None and last_seen is not None
-                duration_min: int | None = None
-                if started and effective_end:
-                    duration_min = max(0, int((effective_end - started).total_seconds() / 60))
-                room_stats = stats_by_room.get(int(rid), {})
-                broadcasts_by_host[h].append({
-                    "room_id":      str(rid),
-                    "started_at":   started.isoformat() if started else None,
-                    "ended_at":     effective_end.isoformat() if effective_end else None,
-                    "ended_inferred": inferred or None,
-                    "duration_min": duration_min,
-                    "diamonds":     int(room_stats.get("diamonds", 0)),
-                    "n_gifts":      int(room_stats.get("n_gifts", 0)),
-                    "n_comments":   int(room_stats.get("n_comments", 0)),
-                    "peak_viewers": int(room_stats.get("peak_viewers", 0)),
-                })
-            for h, arr in broadcasts_by_host.items():
-                # ranked DESC by first_seen_at; preserve that order.
-                arr.sort(key=lambda x: x.get("started_at") or "", reverse=True)
-                out.setdefault(h, {})["last_broadcasts"] = arr
+        broadcasts_by_host: dict[str, list[dict[str, Any]]] = {h: [] for h in norm}
+        for h, rid, started, ended, last_seen in last_rooms:
+            if h not in broadcasts_by_host:
+                continue
+            # Fall back to last_seen_at when ended_at is NULL — see
+            # the rationale above.  `effective_end` is the timestamp
+            # used for both the display "ended_at" and the duration
+            # calc, with a flag so the UI can mark it inferred.
+            effective_end = ended or last_seen
+            inferred = ended is None and last_seen is not None
+            duration_min: int | None = None
+            if started and effective_end:
+                duration_min = max(0, int((effective_end - started).total_seconds() / 60))
+            room_stats = stats_by_room.get(int(rid), {})
+            broadcasts_by_host[h].append({
+                "room_id":      str(rid),
+                "started_at":   started.isoformat() if started else None,
+                "ended_at":     effective_end.isoformat() if effective_end else None,
+                "ended_inferred": inferred or None,
+                "duration_min": duration_min,
+                "diamonds":     int(room_stats.get("diamonds", 0)),
+                "n_gifts":      int(room_stats.get("n_gifts", 0)),
+                "n_comments":   int(room_stats.get("n_comments", 0)),
+                "peak_viewers": int(room_stats.get("peak_viewers", 0)),
+            })
+        slice_: dict[str, dict[str, Any]] = {}
+        for h, arr in broadcasts_by_host.items():
+            # ranked DESC by first_seen_at; preserve that order.
+            arr.sort(key=lambda x: x.get("started_at") or "", reverse=True)
+            slice_[h] = {"last_broadcasts": arr}
+        return slice_
 
-            # ── 9. Averages over the last 30 days. ──
+    def _lives_summary_30d_averages(
+        self, norm: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Step 9 — averages over the last 30 days.  Two queries
+        (duration + diamonds) bundled because the diamond average
+        depends on the same room set; running them on one connection
+        keeps that mental model clean and the queries are cheap."""
+        avgs_by_host: dict[str, dict[str, Any]] = {}
+        with self._get_session() as s:
             avgs = s.execute(text("""
                 SELECT r.host_unique_id,
                        AVG(EXTRACT(EPOCH FROM (r.ended_at - r.first_seen_at)) / 60.0) AS avg_min,
@@ -4370,14 +4801,13 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                   AND r.first_seen_at > NOW() - INTERVAL '30 days'
                 GROUP BY r.host_unique_id
             """), {"hs": norm}).all()
-            avgs_by_host: dict[str, dict[str, Any]] = {}
             for h, avg_min, n in avgs:
                 avgs_by_host[h] = {
                     "avg_duration_min": round(float(avg_min), 1) if avg_min else None,
                     "n_rooms_30d": int(n or 0),
                 }
-            # Avg diamonds per live (last 30 days). One scan keyed on
-            # the rooms' room_id. We could merge with #8 but keeping
+            # Avg diamonds per live (last 30 days).  One scan keyed on
+            # the rooms' room_id.  We could merge with #8 but keeping
             # them separate lets the 30-day window stay independent.
             avg_d = s.execute(text("""
                 WITH host_rooms AS (
@@ -4395,61 +4825,75 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                 LEFT JOIN tiktok_events e ON e.room_id = hr.room_id AND e.type = 'gift'
                 GROUP BY hr.host_unique_id
             """), {"hs": norm}).all()
-            for h, total_d, n in avg_d:
-                if h in avgs_by_host:
-                    n_rooms = int(n or 0)
-                    avgs_by_host[h]["avg_diamonds"] = (
-                        round(float(total_d or 0) / n_rooms, 0) if n_rooms else None
-                    )
-                else:
-                    avgs_by_host[h] = {
-                        "avg_duration_min": None,
-                        "avg_diamonds": (
-                            round(float(total_d or 0) / int(n or 1), 0) if n else None
-                        ),
-                        "n_rooms_30d": int(n or 0),
-                    }
-            for h, a in avgs_by_host.items():
-                out.setdefault(h, {}).update(a)
+        for h, total_d, n in avg_d:
+            if h in avgs_by_host:
+                n_rooms = int(n or 0)
+                avgs_by_host[h]["avg_diamonds"] = (
+                    round(float(total_d or 0) / n_rooms, 0) if n_rooms else None
+                )
+            else:
+                avgs_by_host[h] = {
+                    "avg_duration_min": None,
+                    "avg_diamonds": (
+                        round(float(total_d or 0) / int(n or 1), 0) if n else None
+                    ),
+                    "n_rooms_30d": int(n or 0),
+                }
+        return avgs_by_host
 
-            # ── 9b. Diamonds-vs-typical multiplier: how does the
-            #     active session's diamonds compare to this creator's
-            #     median per-live over the last 30 days? Median is
-            #     resistant to whale-skew that ruins the avg-based
-            #     comparison. >1 = above typical (rocket), <1 = below
-            #     (slow). Computed only for hosts that are live AND
-            #     have ≥3 closed historical rooms to compare against. ──
-            if active_by_host:
-                med = s.execute(text("""
-                    WITH per_room AS (
-                        SELECT r.host_unique_id AS host, e.room_id,
-                               SUM(COALESCE((e.payload->>'diamond_count')::int, 0)
-                                   * COALESCE((e.payload->>'repeat_count')::int, 1)) AS d
-                        FROM tiktok_rooms r
-                        LEFT JOIN tiktok_events e ON e.room_id = r.room_id AND e.type = 'gift'
-                        WHERE r.host_unique_id = ANY(:hs)
-                          AND r.ended_at IS NOT NULL
-                          AND r.first_seen_at > NOW() - INTERVAL '30 days'
-                        GROUP BY r.host_unique_id, e.room_id
-                    )
-                    SELECT host,
-                           PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY d)::bigint AS median_d,
-                           COUNT(*) AS n
-                    FROM per_room
-                    GROUP BY host
-                    HAVING COUNT(*) >= 3
-                """), {"hs": list(active_by_host.keys())}).all()
-                for h, med_d, _n in med:
-                    cur = int(out.get(h, {}).get("diamonds_session") or 0)
-                    median = int(med_d or 0)
-                    if median > 0:
-                        out.setdefault(h, {})["diamonds_vs_typical"] = round(cur / median, 2)
-                        out[h]["median_diamonds_30d"] = median
+    def _lives_summary_median_diamonds(
+        self, active_hosts: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Step 9b — diamonds-vs-typical multiplier: how does the
+        active session's diamonds compare to this creator's median
+        per-live over the last 30 days?  Median is resistant to
+        whale-skew that ruins the avg-based comparison.  >1 = above
+        typical (rocket), <1 = below (slow).  Computed only for hosts
+        that are live AND have ≥3 closed historical rooms to compare
+        against.
 
-            # ── 9c. Listener health: reconnect count for this handle
-            #     in the last hour. Worker writes audit rows to
-            #     tiktok_worker_log keyed on the host handle. ──
-            try:
+        Returns `{host: {"median_diamonds_30d": int}}`.  The
+        `diamonds_vs_typical` multiplier is computed in the merger
+        because it needs the per-host `diamonds_session` from
+        `_lives_summary_session_diamonds` — splitting that across
+        threads would couple the two helpers.
+        """
+        slice_: dict[str, dict[str, Any]] = {}
+        with self._get_session() as s:
+            med = s.execute(text("""
+                WITH per_room AS (
+                    SELECT r.host_unique_id AS host, e.room_id,
+                           SUM(COALESCE((e.payload->>'diamond_count')::int, 0)
+                               * COALESCE((e.payload->>'repeat_count')::int, 1)) AS d
+                    FROM tiktok_rooms r
+                    LEFT JOIN tiktok_events e ON e.room_id = r.room_id AND e.type = 'gift'
+                    WHERE r.host_unique_id = ANY(:hs)
+                      AND r.ended_at IS NOT NULL
+                      AND r.first_seen_at > NOW() - INTERVAL '30 days'
+                    GROUP BY r.host_unique_id, e.room_id
+                )
+                SELECT host,
+                       PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY d)::bigint AS median_d,
+                       COUNT(*) AS n
+                FROM per_room
+                GROUP BY host
+                HAVING COUNT(*) >= 3
+            """), {"hs": active_hosts}).all()
+        for h, med_d, _n in med:
+            median = int(med_d or 0)
+            if median > 0:
+                slice_.setdefault(h, {})["median_diamonds_30d"] = median
+        return slice_
+
+    def _lives_summary_reconnects(
+        self, norm: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Step 9c — listener health: reconnect count for this handle
+        in the last hour.  Worker writes audit rows to
+        tiktok_worker_log keyed on the host handle."""
+        slice_: dict[str, dict[str, Any]] = {}
+        try:
+            with self._get_session() as s:
                 rec = s.execute(text("""
                     SELECT detail->>'host' AS host, COUNT(*)::int AS n
                     FROM tiktok_worker_log
@@ -4458,47 +4902,195 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                       AND detail->>'host' = ANY(:hs)
                     GROUP BY detail->>'host'
                 """), {"hs": norm}).all()
-                for h, n in rec:
-                    if h:
-                        out.setdefault(h, {})["reconnects_1h"] = int(n or 0)
-            except Exception:
-                # Worker log table may not exist on legacy installs;
-                # missing recon count is non-fatal.
-                pass
+            for h, n in rec:
+                if h:
+                    slice_.setdefault(h, {})["reconnects_1h"] = int(n or 0)
+        except Exception:
+            # Worker log table may not exist on legacy installs;
+            # missing recon count is non-fatal.
+            pass
+        return slice_
 
-            # ── 9d. Last-7-days per-host calendar. Drives the
-            #     7-cell heatmap strip on the /admin/tiktok lives
-            #     index. Heavy (7 days × all hosts × event scan)
-            #     so cached for 60 s — daily totals shift on the
-            #     minute scale at worst, invisible staleness.
-            week_by_host = self._week_calendar_cached(norm)
+    def get_lives_summary(self, handles: list[str]) -> dict[str, dict[str, Any]]:
+        """Returns `{handle: {...}}` keyed by lowercased handle.
+
+        Per-handle keys:
+          - active_room_id  (str | None)
+          - live_started_at (iso | None) — derived from current room's first_seen_at
+          - viewer_count    (int | None) — most recent viewer_count event
+          - diamonds_session (int) — sum of diamond_count*repeat_count for
+                                     gifts since the active room started
+          - hourly_buckets (int[60]) — diamonds per minute, last 60 minutes
+          - daily_buckets  (int[24]) — events per hour, last 24h (any type)
+          - top_gifter     ({...} | None) — top diamond contributor in
+                                            current session
+          - active_match   ({...} | None) — battle_id + opponents+scores
+          - last_broadcasts (list[{started_at, ended_at, duration_min,
+                                   diamonds}]) — last 3 rooms ever
+          - avg_duration_min (float | None) — across last 30 days
+          - avg_diamonds     (float | None) — across last 30 days
+          - momentum_label   ('heating'|'cooling'|'steady'|'silent'|None)
+
+        All numeric ids stringified for JS BigInt safety.
+
+        ── Execution shape ──────────────────────────────────────────
+        The body is split into ~13 helper methods, each opening its
+        own session.  They fan out across a `ThreadPoolExecutor` so
+        round-trip latency stops being the bottleneck (was ~1.3 s
+        sequential on 72 handles; the queries themselves are well-
+        indexed).
+
+        Two phases:
+          • Phase 0 — anchor + everything that only needs `handles`
+            (hourly buckets, last broadcasts, 30-day averages,
+            reconnects, daily buckets, week calendar).  These race.
+          • Phase 1 — everything room-scoped (viewer counts, session
+            diamonds, top gifters, session stats, battles, envelopes,
+            polls/pauses/favs, active match, median diamonds).
+            Submitted only after Phase 0's anchor result resolves.
+
+        Cap is `max_workers=8` so we never starve the pool (default
+        pool size 20).  Each helper returns its own dict slice;
+        merging is sequential Python after `gather` so no shared-state
+        locks are needed.
+        """
+        if not handles:
+            return {}
+        if not self._is_postgres():
+            return {h: {} for h in handles}
+
+        norm = [h.lstrip("@").lower() for h in handles if h]
+        out: dict[str, dict[str, Any]] = {h: {} for h in norm}
+
+        def _merge(slice_: dict[str, dict[str, Any]]) -> None:
+            """Merge a helper's slice into the shared `out` dict.
+
+            We do this sequentially after each Future resolves —
+            cheap Python work, no threading concerns.  Two special
+            cases:
+              • `_battles_into_session_stats` (from the battles
+                helper) merges into the nested `session_stats` dict
+                produced by the unique-and-session-stats helper.
+                Pop it before the per-key copy.
+              • Everything else: a flat per-key `update` into the
+                per-host slot.
+            """
+            for h, fields in slice_.items():
+                target = out.setdefault(h, {})
+                battles_sub = fields.pop("_battles_into_session_stats", None)
+                if battles_sub:
+                    target.setdefault("session_stats", {}).update(battles_sub)
+                target.update(fields)
+
+        with ThreadPoolExecutor(
+            max_workers=8, thread_name_prefix="lives_summary"
+        ) as ex:
+            # ── Phase 0 — anchor + host-only families.  The anchor
+            # (active_rooms) feeds Phase 1; the host-only families
+            # don't need it, so they race here.  Cached helpers
+            # (`_daily_buckets_cached`, `_week_calendar_cached`)
+            # open their own sessions internally, so they're safe to
+            # submit directly. ──
+            f_active   = ex.submit(self._lives_summary_active_rooms, norm)
+            f_hourly   = ex.submit(self._lives_summary_hourly, norm)
+            f_last     = ex.submit(self._lives_summary_last_broadcasts, norm)
+            f_avgs     = ex.submit(self._lives_summary_30d_averages, norm)
+            f_recon    = ex.submit(self._lives_summary_reconnects, norm)
+            f_daily    = ex.submit(self._daily_buckets_cached, norm)
+            f_week     = ex.submit(self._week_calendar_cached, norm)
+
+            # Gate Phase 1 on the anchor result.  Everything else in
+            # Phase 0 continues running in the background while we
+            # build the Phase 1 plan.
+            active_by_host, active_slice = f_active.result()
+            _merge(active_slice)
+
+            # ── Phase 1 — room-scoped families.  Submitted only if
+            # there are active rooms (every room-scoped query is a
+            # no-op otherwise).  Each helper here opens its own
+            # session in a worker thread. ──
+            phase1_futures = []
+            if active_by_host:
+                room_ids = [v[0] for v in active_by_host.values()]
+                active_hosts = list(active_by_host.keys())
+                phase1_futures = [
+                    ex.submit(self._lives_summary_viewer_counts, room_ids),
+                    ex.submit(self._lives_summary_session_diamonds,
+                              active_by_host, room_ids),
+                    ex.submit(self._lives_summary_top_gifters, room_ids),
+                    ex.submit(self._lives_summary_unique_and_session_stats,
+                              room_ids),
+                    ex.submit(self._lives_summary_battles, room_ids),
+                    ex.submit(self._lives_summary_envelopes, room_ids),
+                    ex.submit(self._lives_summary_polls_pauses_favs,
+                              room_ids),
+                    ex.submit(self._lives_summary_active_match, active_hosts),
+                    ex.submit(self._lives_summary_median_diamonds,
+                              active_hosts),
+                ]
+
+            # Collect Phase 0 (the host-only group) — these were
+            # submitted before Phase 1 kicked off, so most should
+            # already be done by the time we reach here.
+            _merge(f_hourly.result())
+            _merge(f_last.result())
+            _merge(f_avgs.result())
+            _merge(f_recon.result())
+            daily_by_host = f_daily.result()
+            for h, arr in daily_by_host.items():
+                out.setdefault(h, {})["daily_buckets"] = arr
+            week_by_host = f_week.result()
             for h, days in week_by_host.items():
                 out.setdefault(h, {})["week_calendar"] = days
 
-            # ── 10. Momentum tag — 1h/24h ratio. Cheap derivation
-            #     from the buckets we already have, but we want a
-            #     longer-window 24h vs 7d for "heating/cooling"
-            #     framing on this page. Use SUMs from the buckets
-            #     already loaded for hourly+daily. ──
-            for h in norm:
-                hourly_total = sum(out.get(h, {}).get("hourly_buckets") or [])
-                daily_total  = sum(out.get(h, {}).get("daily_buckets") or [])
-                # rate per minute, normalize 60min vs 24h
-                rate_recent = hourly_total / 60 if hourly_total else 0
-                rate_24h    = daily_total / (24 * 60) if daily_total else 0
-                if daily_total == 0 and hourly_total == 0:
-                    label = "silent"
-                elif rate_24h == 0:
-                    # Recent activity but no 24h activity is impossible,
-                    # but guard against div/0.
-                    label = "heating"
-                elif rate_recent / rate_24h >= 2.0:
-                    label = "heating"
-                elif rate_recent / rate_24h <= 0.3:
-                    label = "cooling"
-                else:
-                    label = "steady"
-                out.setdefault(h, {})["momentum_label"] = label
+            # Collect Phase 1.  Order matters slightly for the
+            # diamonds_vs_typical post-derivation (see below) — the
+            # session-diamonds helper must merge before the
+            # median helper.  We just take results in submission
+            # order: viewer_counts, session_diamonds, top_gifters,
+            # unique_and_session_stats, battles, envelopes,
+            # polls/pauses/favs, active_match, median.  Battles must
+            # merge AFTER unique_and_session_stats (its slice pushes
+            # into `session_stats`), which is naturally true here.
+            for fut in phase1_futures:
+                _merge(fut.result())
+
+        # ── Post-merge derivations.  These are CPU-only and need
+        # the merged `out` dict, so they run sequentially after the
+        # threadpool work is done.
+
+        # 9b' — diamonds_vs_typical multiplier.  Needs both
+        # `diamonds_session` and `median_diamonds_30d` to be present
+        # in `out`, which is only true post-merge.
+        for h, fields in out.items():
+            median = int(fields.get("median_diamonds_30d") or 0)
+            if median > 0:
+                cur = int(fields.get("diamonds_session") or 0)
+                fields["diamonds_vs_typical"] = round(cur / median, 2)
+
+        # ── 10. Momentum tag — 1h/24h ratio.  Cheap derivation from
+        # the buckets we already have, but we want a longer-window
+        # 24h vs 7d for "heating/cooling" framing on this page.  Use
+        # SUMs from the buckets already loaded for hourly+daily. ──
+        for h in norm:
+            hourly_total = sum(out.get(h, {}).get("hourly_buckets") or [])
+            daily_total  = sum(out.get(h, {}).get("daily_buckets") or [])
+            # rate per minute, normalize 60min vs 24h
+            rate_recent = hourly_total / 60 if hourly_total else 0
+            rate_24h    = daily_total / (24 * 60) if daily_total else 0
+            if daily_total == 0 and hourly_total == 0:
+                label = "silent"
+            elif rate_24h == 0:
+                # Recent activity but no 24h activity is impossible,
+                # but guard against div/0.
+                label = "heating"
+            elif rate_recent / rate_24h >= 2.0:
+                label = "heating"
+            elif rate_recent / rate_24h <= 0.3:
+                label = "cooling"
+            else:
+                label = "steady"
+            out.setdefault(h, {})["momentum_label"] = label
 
         return out
 
@@ -4866,8 +5458,8 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                 LEFT JOIN per_user pu ON pu.user_id = f.user_id
                 LEFT JOIN tiktok_viewers v ON v.user_id = f.user_id
                 WHERE :q_is_null OR
-                      COALESCE(v.nickname,'')  ILIKE :needle OR
-                      COALESCE(v.unique_id,'') ILIKE :needle
+                      v.nickname  ILIKE :needle OR
+                      v.unique_id ILIKE :needle
                 ORDER BY f.added_at DESC
                 LIMIT :limit OFFSET :offset
             """), {
@@ -4895,8 +5487,8 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                 SELECT COUNT(*) FROM tiktok_favorite_gifters f
                 LEFT JOIN tiktok_viewers v ON v.user_id = f.user_id
                 WHERE :q_is_null OR
-                      COALESCE(v.nickname,'')  ILIKE :needle OR
-                      COALESCE(v.unique_id,'') ILIKE :needle
+                      v.nickname  ILIKE :needle OR
+                      v.unique_id ILIKE :needle
             """), {
                 "q_is_null": q is None or not q.strip(),
                 "needle": f"%{(q or '').strip()}%",

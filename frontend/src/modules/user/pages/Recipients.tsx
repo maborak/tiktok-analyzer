@@ -467,6 +467,45 @@ export function Recipients() {
                 onSearchSubmit={handleSearchSubmit}
                 filters={filterConfigs}
                 rowActions={rowActions}
+                onRowClick={(r) => handleEditOpen(r)}
+                mobileCard={(r) => (
+                    <div className="px-4 py-3 space-y-2">
+                        <div className="flex items-start justify-between gap-2">
+                            <div className="min-w-0 flex-1">
+                                <div className="text-sm font-medium text-gray-900 truncate">{r.name || '—'}</div>
+                                <div className="flex items-center gap-1.5 mt-0.5">
+                                    <Mail className="w-3.5 h-3.5 text-gray-400 shrink-0" />
+                                    <span className="text-xs text-gray-600 truncate">{r.value}</span>
+                                </div>
+                            </div>
+                            <span className="shrink-0">
+                                {r.isVerified ? (
+                                    <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium bg-success-50 text-success-700">
+                                        <CheckCircle className="w-2.5 h-2.5 mr-0.5" />
+                                        Verified
+                                    </span>
+                                ) : (
+                                    <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium bg-warning-50 text-warning-700">
+                                        <AlertCircle className="w-2.5 h-2.5 mr-0.5" />
+                                        Pending
+                                    </span>
+                                )}
+                            </span>
+                        </div>
+                        {!r.isVerified && (
+                            <div className="pt-1">
+                                <button
+                                    onClick={(e) => { e.stopPropagation(); handleOpenResendModal(r); }}
+                                    className="text-xs text-primary-600 hover:underline flex items-center gap-1"
+                                    title="Resend verification email"
+                                >
+                                    <Send className="w-3 h-3" />
+                                    Resend verification
+                                </button>
+                            </div>
+                        )}
+                    </div>
+                )}
                 sortBy={sortBy}
                 sortOrder={sortOrder}
                 onSort={(key) => {

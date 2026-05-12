@@ -11,6 +11,7 @@ from fastapi import APIRouter
 
 from . import general, auth, user, media, webhooks, billing
 from . import admin
+from . import public_tiktok
 
 
 
@@ -76,6 +77,17 @@ def setup_routes(
         config_service_instance=config_service,
         tiktok_service_instance=tiktok_service,
     )
+    # Public TikTok routes — same TikTokService instance, but exposed
+    # via a no-auth router. Without this assignment the unauthenticated
+    # endpoint 503s.
+    if tiktok_service is not None:
+        public_tiktok.tiktok_service = tiktok_service
+    # `/public/tiktok/runtime-config` reads a 3-key slice of typed
+    # config (poll interval + WS modes) and serves it to both admin
+    # and public frontends so they can adapt their polling cadence
+    # and stream/poll choice without a rebuild.
+    if config_service is not None:
+        public_tiktok.config_service = config_service
     if payment_service:
         webhooks.payment_service = payment_service
         billing.payment_service = payment_service
@@ -106,5 +118,11 @@ def create_main_router():
     main_router.include_router(livechat.router, prefix="/livechat", tags=["LiveChat"])
     main_router.include_router(media.router, prefix="/media", tags=["Media"])
     main_router.include_router(contact.router, prefix="/contact", tags=["Contact"])
+
+    # Public (unauthenticated) routes. Mounted at /public/* so admin
+    # tooling can blanket-allow that prefix on the rate limiter and
+    # firewall. NO auth dependency — endpoints inside must be safe to
+    # serve to anonymous users.
+    main_router.include_router(public_tiktok.router, prefix="/public", tags=["Public"])
 
     return main_router

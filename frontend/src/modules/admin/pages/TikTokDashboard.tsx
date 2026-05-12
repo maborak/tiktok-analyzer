@@ -187,62 +187,113 @@ function TikTokDashboardBody() {
           Most active creators
         </h2>
         {data && data.creators.length > 0 ? (
-          <div className="overflow-x-auto">
-          <table className="w-full text-sm min-w-[640px]">
-            <thead>
-              <tr className="border-b border-gray-200">
-                <th className="text-left py-2 auth-mono-label">Creator</th>
-                <th className="text-right py-2 auth-mono-label">Comments</th>
-                <th className="text-right py-2 auth-mono-label">Gifts</th>
-                <th className="text-right py-2 auth-mono-label">Likes</th>
-                <th className="text-right py-2 auth-mono-label">Total</th>
-                <th />
-              </tr>
-            </thead>
-            <tbody>
-              {data.creators.map((c, i) => (
-                <tr key={c.host_unique_id} className="border-b border-gray-100">
-                  <td className="py-2">
-                    <span
-                      className="inline-block w-2.5 h-2.5 rounded-sm mr-2 align-middle"
-                      style={{ backgroundColor: PALETTE[i % PALETTE.length] }}
-                      aria-hidden
-                    />
-                    <Link
-                      to="/admin/tiktok/$handle"
-                      params={{ handle: c.host_unique_id }}
-                      className="font-mono text-primary-600 hover:underline"
-                    >
-                      @{c.host_unique_id}
-                    </Link>
-                  </td>
-                  <td className="text-right py-2 font-mono tabular-nums">
-                    {c.by_type.comment ?? 0}
-                  </td>
-                  <td className="text-right py-2 font-mono tabular-nums">
-                    <span style={{ color: eventColor('gift') }}>{c.by_type.gift ?? 0}</span>
-                  </td>
-                  <td className="text-right py-2 font-mono tabular-nums">
-                    {c.by_type.like ?? 0}
-                  </td>
-                  <td className="text-right py-2 font-mono tabular-nums font-semibold">
-                    {c.total}
-                  </td>
-                  <td className="py-2 text-right">
-                    <Link
-                      to="/admin/tiktok/$handle"
-                      params={{ handle: c.host_unique_id }}
-                      className="text-gray-400 hover:text-gray-600"
-                      aria-label="Drill in"
-                    >
-                      <ChevronRight className="w-4 h-4 inline" />
-                    </Link>
-                  </td>
+          <>
+            {/* Desktop: 6-column table (md+). */}
+            <table className="hidden md:table w-full text-sm">
+              <thead>
+                <tr className="border-b border-gray-200">
+                  <th className="text-left py-2 auth-mono-label">Creator</th>
+                  <th className="text-right py-2 auth-mono-label">Comments</th>
+                  <th className="text-right py-2 auth-mono-label">Gifts</th>
+                  <th className="text-right py-2 auth-mono-label">Likes</th>
+                  <th className="text-right py-2 auth-mono-label">Total</th>
+                  <th />
                 </tr>
+              </thead>
+              <tbody>
+                {data.creators.map((c, i) => (
+                  <tr key={c.host_unique_id} className="border-b border-gray-100">
+                    <td className="py-2">
+                      <span
+                        className="inline-block w-2.5 h-2.5 rounded-sm mr-2 align-middle"
+                        style={{ backgroundColor: PALETTE[i % PALETTE.length] }}
+                        aria-hidden
+                      />
+                      <Link
+                        to="/admin/tiktok/$handle"
+                        params={{ handle: c.host_unique_id }}
+                        className="font-mono text-primary-600 hover:underline"
+                      >
+                        @{c.host_unique_id}
+                      </Link>
+                    </td>
+                    <td className="text-right py-2 font-mono tabular-nums">
+                      {c.by_type.comment ?? 0}
+                    </td>
+                    <td className="text-right py-2 font-mono tabular-nums">
+                      <span style={{ color: eventColor('gift') }}>{c.by_type.gift ?? 0}</span>
+                    </td>
+                    <td className="text-right py-2 font-mono tabular-nums">
+                      {c.by_type.like ?? 0}
+                    </td>
+                    <td className="text-right py-2 font-mono tabular-nums font-semibold">
+                      {c.total}
+                    </td>
+                    <td className="py-2 text-right">
+                      <Link
+                        to="/admin/tiktok/$handle"
+                        params={{ handle: c.host_unique_id }}
+                        className="text-gray-400 hover:text-gray-600"
+                        aria-label="Drill in"
+                      >
+                        <ChevronRight className="w-4 h-4 inline" />
+                      </Link>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+
+            {/* Mobile: card per creator (below md). Palette dot +
+                handle on header row, 4 stats in a grid below. The
+                whole card links to the creator's detail page. */}
+            <ul className="md:hidden flex flex-col gap-2">
+              {data.creators.map((c, i) => (
+                <li
+                  key={c.host_unique_id}
+                  className="rounded-md border border-gray-200 bg-white dark:bg-white/[0.03] px-3 py-2.5"
+                >
+                  <Link
+                    to="/admin/tiktok/$handle"
+                    params={{ handle: c.host_unique_id }}
+                    className="block hover:bg-gray-50 dark:hover:bg-white/[0.04] -mx-3 -my-2.5 px-3 py-2.5 rounded-md transition-colors"
+                  >
+                    <div className="flex items-center justify-between gap-2 mb-2">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <span
+                          className="inline-block w-2.5 h-2.5 rounded-sm shrink-0"
+                          style={{ backgroundColor: PALETTE[i % PALETTE.length] }}
+                          aria-hidden
+                        />
+                        <span className="font-mono text-primary-600 truncate">
+                          @{c.host_unique_id}
+                        </span>
+                      </div>
+                      <span className="shrink-0 font-mono tabular-nums font-semibold text-sm">
+                        {c.total}
+                      </span>
+                    </div>
+                    <div className="pt-2 border-t border-gray-100 grid grid-cols-3 gap-2 text-[11px] font-mono">
+                      <div className="flex flex-col">
+                        <span className="text-[10px] uppercase tracking-wider text-gray-400">Comments</span>
+                        <span className="tabular-nums text-gray-700">{c.by_type.comment ?? 0}</span>
+                      </div>
+                      <div className="flex flex-col">
+                        <span className="text-[10px] uppercase tracking-wider text-gray-400">Gifts</span>
+                        <span className="tabular-nums" style={{ color: eventColor('gift') }}>
+                          {c.by_type.gift ?? 0}
+                        </span>
+                      </div>
+                      <div className="flex flex-col text-right">
+                        <span className="text-[10px] uppercase tracking-wider text-gray-400">Likes</span>
+                        <span className="tabular-nums text-gray-700">{c.by_type.like ?? 0}</span>
+                      </div>
+                    </div>
+                  </Link>
+                </li>
               ))}
-            </tbody>
-          </table>
-          </div>
+            </ul>
+          </>
         ) : (
           <p className="text-sm text-gray-500 py-4 text-center">
             {loading ? 'Loading…' : 'No data yet — subscribe to a creator on the Lives page.'}

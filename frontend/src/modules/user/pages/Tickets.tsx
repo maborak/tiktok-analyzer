@@ -284,39 +284,90 @@ export function Tickets() {
                         )}
                     </div>
                 ) : (
-                    <div className="overflow-x-auto text-sm w-full divide-y divide-gray-200">
-                        {tickets.map((ticket) => (
-                            <div
-                                key={ticket.id}
-                                className="flex flex-col sm:flex-row p-4 gap-4 hover:bg-gray-50 transition-colors cursor-pointer items-start sm:items-center"
-                                onClick={() => navigate({ to: routes.account.ticketDetail(ticket.id) })}
-                            >
-                                <div className="flex-1 min-w-0">
-                                    <div className="flex items-center gap-2 mb-1">
-                                        <StatusBadge status={ticket.status} className="text-[10px]" />
-                                        <span className="text-xs text-gray-400 font-mono">#{ticket.id.split('-')[0]}</span>
-                                        {ticket.category_name && (
-                                            <span className="text-[10px] text-gray-400">{ticket.category_name}</span>
-                                        )}
+                    <>
+                        {/* Desktop: table layout. Hidden below md where the
+                            column count would force horizontal scroll. */}
+                        <table className="hidden md:table w-full text-sm">
+                            <thead>
+                                <tr className="border-b border-gray-200">
+                                    <th className="auth-mono-label px-4 py-3 text-left">Ticket</th>
+                                    <th className="auth-mono-label px-4 py-3 text-left">Activity</th>
+                                    <th className="auth-mono-label px-4 py-3 text-left">Priority</th>
+                                    <th className="auth-mono-label px-4 py-3 text-right">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {tickets.map((ticket) => (
+                                    <tr
+                                        key={ticket.id}
+                                        className="border-b border-gray-100 hover:bg-gray-50 transition-colors cursor-pointer"
+                                        onClick={() => navigate({ to: routes.account.ticketDetail(ticket.id) })}
+                                    >
+                                        <td className="px-4 py-3 align-top">
+                                            <div className="flex items-center gap-2 mb-1">
+                                                <StatusBadge status={ticket.status} className="text-[10px]" />
+                                                <span className="text-xs text-gray-400 font-mono">#{ticket.id.split('-')[0]}</span>
+                                                {ticket.category_name && (
+                                                    <span className="text-[10px] text-gray-400">{ticket.category_name}</span>
+                                                )}
+                                            </div>
+                                            <h4 className="font-semibold text-gray-900 truncate pr-4 text-base">{ticket.subject}</h4>
+                                        </td>
+                                        <td className="px-4 py-3 align-top text-xs text-gray-500">
+                                            <div className="flex flex-col gap-1">
+                                                <span>{ticket.reply_count ?? 0} {(ticket.reply_count ?? 0) === 1 ? 'reply' : 'replies'}</span>
+                                                {ticket.last_message_at && (
+                                                    <span>Last activity {new Date(ticket.last_message_at).toLocaleDateString()}</span>
+                                                )}
+                                                {ticket.has_agent_reply && (
+                                                    <span className="text-success-600 font-medium">Agent replied</span>
+                                                )}
+                                            </div>
+                                        </td>
+                                        <td className="px-4 py-3 align-top">
+                                            <PriorityBadge priority={ticket.priority} />
+                                        </td>
+                                        <td className="px-4 py-3 align-top text-right">
+                                            <Button variant="secondary" size="sm" onClick={(e) => { e.stopPropagation(); navigate({ to: routes.account.ticketDetail(ticket.id) }); }}>View Thread</Button>
+                                        </td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+
+                        {/* Mobile: card list — one row per ticket, no
+                            horizontal scroll. Only renders below md. */}
+                        <ul className="md:hidden flex flex-col gap-2 p-3">
+                            {tickets.map((ticket) => (
+                                <li
+                                    key={ticket.id}
+                                    className="rounded-md border border-gray-200 bg-white dark:bg-white/[0.03] px-3 py-2.5 hover:bg-gray-50 transition-colors cursor-pointer"
+                                    onClick={() => navigate({ to: routes.account.ticketDetail(ticket.id) })}
+                                >
+                                    <div className="flex items-start justify-between gap-2 mb-1">
+                                        <h4 className="min-w-0 flex-1 font-semibold text-gray-900 truncate text-sm">{ticket.subject}</h4>
+                                        <StatusBadge status={ticket.status} className="text-[10px] shrink-0" />
                                     </div>
-                                    <h4 className="font-semibold text-gray-900 truncate pr-4 text-base">{ticket.subject}</h4>
-                                    <div className="text-gray-500 text-xs mt-1 flex items-center gap-3 flex-wrap">
-                                        <span>{ticket.reply_count ?? 0} {(ticket.reply_count ?? 0) === 1 ? 'reply' : 'replies'}</span>
-                                        {ticket.last_message_at && (
-                                            <span>Last activity {new Date(ticket.last_message_at).toLocaleDateString()}</span>
-                                        )}
-                                        {ticket.has_agent_reply && (
-                                            <span className="text-success-600 font-medium">Agent replied</span>
-                                        )}
+                                    <div className="flex items-center justify-between gap-2 text-xs text-gray-500">
+                                        <div className="min-w-0 flex items-center gap-2 flex-wrap">
+                                            <span className="font-mono text-[10px] text-gray-400">#{ticket.id.split('-')[0]}</span>
+                                            {ticket.category_name && (
+                                                <span className="text-[10px] text-gray-400">{ticket.category_name}</span>
+                                            )}
+                                            <span>{ticket.reply_count ?? 0} {(ticket.reply_count ?? 0) === 1 ? 'reply' : 'replies'}</span>
+                                            {ticket.last_message_at && (
+                                                <span>· {new Date(ticket.last_message_at).toLocaleDateString()}</span>
+                                            )}
+                                            {ticket.has_agent_reply && (
+                                                <span className="text-success-600 font-medium">Agent replied</span>
+                                            )}
+                                        </div>
                                         <PriorityBadge priority={ticket.priority} />
                                     </div>
-                                </div>
-                                <div>
-                                    <Button variant="secondary" className="w-full sm:w-auto">View Thread</Button>
-                                </div>
-                            </div>
-                        ))}
-                    </div>
+                                </li>
+                            ))}
+                        </ul>
+                    </>
                 )}
             </div>
 

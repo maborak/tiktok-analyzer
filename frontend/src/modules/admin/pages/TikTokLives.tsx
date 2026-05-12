@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from '@tanstack/react-router';
-import { Activity, Globe, Plus, RefreshCw, RotateCcw, Search, Star, Trash2, Power, PowerOff, Send, Radio, BarChart3, Users, X } from 'lucide-react';
+import { Globe, Plus, RefreshCw, RotateCcw, Search, Star, Trash2, Power, PowerOff, Send, Radio, BarChart3, Users, X } from 'lucide-react';
 import toast from 'react-hot-toast';
 
 import { Button } from '@/components/ui/Button';
@@ -14,10 +14,14 @@ import {
   type TikTokLivesTotals,
 } from '@admin/services/tiktok';
 import { TikTokAddLiveModal } from '@admin/components/TikTokAddLiveModal';
-import { TikTokGifterModal } from '@admin/components/TikTokGifterModal';
+import { TikTokGifterDetailModal } from '@admin/components/TikTokGifterDetailModal';
 import { TikTokCommonGiftersTable } from '@admin/components/TikTokCommonGiftersTable';
 import { TikTokFavoriteGiftersTable } from '@admin/components/TikTokFavoriteGiftersTable';
-import { TikTokListenerStatusCard } from '@admin/components/TikTokListenerStatusCard';
+import { TikTokRealtimeIndicator } from '@admin/components/TikTokRealtimeIndicator';
+import {
+  TikTokRuntimeConfigProvider,
+  useTikTokRuntimeConfig,
+} from '@admin/contexts/TikTokRuntimeConfigContext';
 
 const STATE_TONE: Record<string, string> = {
   CONNECTED: 'bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300',
@@ -29,6 +33,25 @@ const STATE_TONE: Record<string, string> = {
 };
 
 export function TikTokLives() {
+  // `audience="admin"` → hits `/admin/tiktok/runtime-config` so this
+  // page reads the full typed-config set (poll cadence + admin
+  // realtime mode + public realtime mode). The public mirror only
+  // returns the trimmed slice; the admin endpoint is the truth.
+  return (
+    <TikTokRuntimeConfigProvider audience="admin">
+      <TikTokLivesBody />
+    </TikTokRuntimeConfigProvider>
+  );
+}
+
+function TikTokLivesBody() {
+  // Runtime config — poll cadence applied to the lives summary +
+  // totals interval below; admin-realtime mode would gate WS opens
+  // here too if this page held any (it doesn't; the WS lives in
+  // TikTokLiveDetail). `pollIntervalMs` is the operator-configured
+  // value from typed config (default 30000), clamped server-side
+  // to [1000, 600000] so a misconfig can't DDOS our own backend.
+  const { pollIntervalMs } = useTikTokRuntimeConfig();
   const [subs, setSubs] = useState<TikTokSubscription[]>([]);
   const [loading, setLoading] = useState(true);
   const [adding, setAdding] = useState(false);
@@ -42,9 +65,15 @@ export function TikTokLives() {
   // change. `replaceState` on tab change avoids polluting history
   // with each click; popstate keeps state in sync if the user
   // back-buttons.
-  type TabKey = 'lives' | 'worker' | 'common' | 'global' | 'favorites';
+  //
+  // NOTE: `settings` and `worker` are NOT tabs here — both live
+  // inside the consolidated Settings page at /admin/tiktok/settings
+  // (Worker is a sub-tab; Sign Engine is another). Keeping them out
+  // of TabKey forbids any code path from accidentally re-introducing
+  // them as tabs.
+  type TabKey = 'lives' | 'common' | 'global' | 'favorites';
   const ALLOWED_TABS: ReadonlySet<TabKey> = new Set([
-    'lives', 'worker', 'common', 'global', 'favorites',
+    'lives', 'common', 'global', 'favorites',
   ]);
   const readTabFromUrl = (): TabKey => {
     if (typeof window === 'undefined') return 'lives';
@@ -68,12 +97,9 @@ export function TikTokLives() {
     return () => window.removeEventListener('popstate', onPop);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-  // Bumped by the page-header refresh when the Worker tab is active —
-  // forwards the click into the listener-status card.
-  const [workerRefreshKey, setWorkerRefreshKey] = useState(0);
-  // Same pattern for the Common Gifters tab — bumped by page-header
-  // refresh so the table refetches without remounting (preserves
-  // search input and page state).
+  // Per-tab refresh keys — page-header Refresh forwards into the
+  // currently-active tab's component so its data refetches without
+  // remounting (preserves search input + pagination).
   const [commonRefreshKey, setCommonRefreshKey] = useState(0);
   const [globalRefreshKey, setGlobalRefreshKey] = useState(0);
   const [favoritesRefreshKey, setFavoritesRefreshKey] = useState(0);
@@ -170,21 +196,22 @@ export function TikTokLives() {
   };
 
   useEffect(() => {
+    // Only the `lives` tab renders the subscription table; the other
+    // tabs (worker, common, global, favorites) read their own data
+    // sources and never display `subs`. Without this gate, deep-
+    // linking to `?tab=worker` etc. would still fire `listLives()`
+    // and the summary+totals poll below for data those tabs ignore.
+    if (tab !== 'lives') return;
     refresh();
-    // Recent-events tail used to live at the bottom of this page;
-    // it kept a `*`-subscribed WebSocket open continuously, growing a
-    // 50-element buffer on every event. Removed because: (a) the
-    // notifications drawer at the admin shell already covers the
-    // "what just fired" use case, (b) the favourites watcher already
-    // owns the global `*` subscription, and (c) high-traffic creators
-    // produced ~100 events/sec each, leaking memory in long-running
-    // tabs.
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab]);
 
-  // Per-host summary + page-level totals. Polls every 30 s while the
-  // tab is visible — long enough not to hammer the API, short enough
-  // that a sparkline / "live" pill catches up within half a minute.
+  // Per-host summary + page-level totals. Same tab-scoped gating as
+  // above: the other tabs don't render these and shouldn't pay the
+  // poll cost. `lives/summary` is the single most expensive endpoint
+  // in this page's call graph.
   useEffect(() => {
+    if (tab !== 'lives') return;
     let cancelled = false;
     const fetchOnce = () => {
       Promise.all([
@@ -204,7 +231,7 @@ export function TikTokLives() {
     let interval: ReturnType<typeof setInterval> | null = null;
     const start = () => {
       if (interval == null && document.visibilityState === 'visible') {
-        interval = setInterval(fetchOnce, 30_000);
+        interval = setInterval(fetchOnce, pollIntervalMs);
       }
     };
     const stop = () => {
@@ -228,7 +255,7 @@ export function TikTokLives() {
       stop();
       document.removeEventListener('visibilitychange', onVis);
     };
-  }, []);
+  }, [tab, pollIntervalMs]);
 
   // ── actions ───────────────────────────────────────────────────────
 
@@ -299,6 +326,34 @@ export function TikTokLives() {
     }
   };
 
+  // Toggle whether this subscription appears on the public `/` page.
+  // Optimistic local flip so the button visual snaps immediately —
+  // revert + toast on failure. We don't `refresh()` on success to
+  // avoid flicker; the persisted value will surface on the next poll.
+  const onSetPublic = async (s: TikTokSubscription) => {
+    const next = !s.is_public;
+    setSubs((prev) =>
+      prev.map((row) =>
+        row.unique_id === s.unique_id ? { ...row, is_public: next } : row,
+      ),
+    );
+    try {
+      await tiktokApi.setLivePublic(s.unique_id, next);
+      toast.success(
+        next ? `@${s.unique_id} is now public` : `@${s.unique_id} hidden from public`,
+      );
+    } catch (e) {
+      console.error(e);
+      toast.error('Failed to update visibility');
+      // Revert the optimistic flip.
+      setSubs((prev) =>
+        prev.map((row) =>
+          row.unique_id === s.unique_id ? { ...row, is_public: !next } : row,
+        ),
+      );
+    }
+  };
+
   const onElectronLogin = async () => {
     if (!window.api?.login) return;
     try {
@@ -337,37 +392,37 @@ export function TikTokLives() {
             : 'Subscribe to TikTok creators and gather their live events. Posting is read-only here — open in the desktop client to send chat.'
         }
         actions={
-          <Button
-            variant="ghost"
-            onClick={() => {
-              if (tab === 'worker') setWorkerRefreshKey((k) => k + 1);
-              else if (tab === 'common') setCommonRefreshKey((k) => k + 1);
-              else if (tab === 'global') setGlobalRefreshKey((k) => k + 1);
-              else if (tab === 'favorites') setFavoritesRefreshKey((k) => k + 1);
-              else refresh();
-            }}
-            disabled={tab === 'lives' && loading}
-            title={
-              tab === 'worker'
-                ? 'Refresh worker status'
-                : tab === 'common'
+          <div className="flex items-center gap-2">
+            <TikTokRealtimeIndicator audience="admin" />
+            <Button
+              variant="ghost"
+              onClick={() => {
+                if (tab === 'common') setCommonRefreshKey((k) => k + 1);
+                else if (tab === 'global') setGlobalRefreshKey((k) => k + 1);
+                else if (tab === 'favorites') setFavoritesRefreshKey((k) => k + 1);
+                else refresh();
+              }}
+              disabled={tab === 'lives' && loading}
+              title={
+                tab === 'common'
                   ? 'Refresh common gifters'
                   : tab === 'global'
                     ? 'Refresh global gifters'
                     : tab === 'favorites'
                       ? 'Refresh favourites'
                       : 'Refresh subscriptions'
-            }
-          >
-            <RefreshCw className={loading && tab === 'lives' ? 'animate-spin w-4 h-4' : 'w-4 h-4'} />
-          </Button>
+              }
+            >
+              <RefreshCw className={loading && tab === 'lives' ? 'animate-spin w-4 h-4' : 'w-4 h-4'} />
+            </Button>
+          </div>
         }
       />
 
-      {/* Add new subscription — page-level control, lives ABOVE the
-          tab bar so it's visible on every tab. Useful as a global
-          "go subscribe" affordance even when the admin is in Common
-          Gifters / Worker / etc. */}
+      {/* Add new subscription — page-level control, sits ABOVE the tab
+          bar so it's visible on every tab. Useful even when the admin
+          is on Common Gifters / Worker / etc. (Settings is a separate
+          sidebar page — not a tab here.) */}
       <div className="flex flex-wrap items-center gap-2">
         <Input
           placeholder="@username — add a new TikTok creator"
@@ -389,7 +444,8 @@ export function TikTokLives() {
         )}
       </div>
 
-      {/* Tabs */}
+      {/* Tab strip. Settings is intentionally absent — it has its own
+          sidebar entry + route at /admin/tiktok/settings. */}
       <div className="flex items-center gap-1 border-b border-gray-200 -mb-px overflow-x-auto">
         <PageTabButton active={tab === 'lives'} onClick={() => setTab('lives')}>
           <Radio className="w-3.5 h-3.5" />
@@ -407,17 +463,11 @@ export function TikTokLives() {
           <Star className="w-3.5 h-3.5" />
           Favourites
         </PageTabButton>
-        <PageTabButton active={tab === 'worker'} onClick={() => setTab('worker')}>
-          <Activity className="w-3.5 h-3.5" />
-          Worker
-        </PageTabButton>
       </div>
 
-      {/* `pt-4` on the tab body so the first row (search, status pill,
-          etc.) breathes from the tab-bar underline above it. Without
-          it the search input visually clamps onto the bar. */}
+      {/* Non-lives tab bodies. `pt-4` gives the first row breathing
+          room from the tab underline above. */}
       <div className="pt-4">
-        {tab === 'worker' && <TikTokListenerStatusCard refreshKey={workerRefreshKey} />}
         {tab === 'common' && <TikTokCommonGiftersTable refreshKey={commonRefreshKey} />}
         {tab === 'global' && (
           <TikTokCommonGiftersTable refreshKey={globalRefreshKey} mode="global" />
@@ -523,6 +573,7 @@ export function TikTokLives() {
                 onToggle={() => onToggle(s)}
                 onDelete={() => onDelete(s)}
                 onReconnect={() => onReconnect(s)}
+                onSetPublic={() => onSetPublic(s)}
                 onSend={(text) => onElectronSend(s.unique_id, text)}
                 onSelectGifter={setSelectedGifter}
               />
@@ -531,7 +582,13 @@ export function TikTokLives() {
         </>
       )}
 
-      {/* Add-Live preview modal */}
+        </div>
+      )}
+
+      {/* Page-level modals — the Add input above triggers
+          `pendingHandle`, the gifter chips inside SubscriptionCard
+          trigger `selectedGifter`. Both stay mounted but render
+          nothing when closed. */}
       <TikTokAddLiveModal
         isOpen={pendingHandle !== null}
         handle={pendingHandle ?? ''}
@@ -539,10 +596,7 @@ export function TikTokLives() {
         onConfirm={onConfirmAdd}
       />
 
-      {/* Gifter detail modal — opened from the per-card "👑 Top:"
-          chips. Scoped to the host's active room when present so
-          the gifts list defaults to "this session" framing. */}
-      <TikTokGifterModal
+      <TikTokGifterDetailModal
         isOpen={selectedGifter !== null}
         onClose={() => setSelectedGifter(null)}
         userId={selectedGifter?.userId ?? null}
@@ -552,10 +606,8 @@ export function TikTokLives() {
         giftsCount={selectedGifter?.gifts ?? 0}
         roomId={selectedGifter?.roomId ?? null}
         currentHandle={selectedGifter?.currentHandle}
+        defaultTab="current"
       />
-
-        </div>
-      )}
     </PageShell>
   );
 }
@@ -603,14 +655,28 @@ interface SelectedGifter {
 
 interface RowProps {
   sub: TikTokSubscription;
-  electron: boolean;
+  electron?: boolean;
   /** Server-enriched data for this host. May be empty / undefined
    *  while the first poll is in flight. */
   summary?: TikTokLiveSummary;
-  onToggle: () => void;
-  onDelete: () => void;
-  onReconnect: () => void;
-  onSend: (text: string) => void;
+  /** Read-only mode — hides every admin-side action (composer,
+   *  reconnect / pause / delete, the Stats link, the Public toggle)
+   *  and any operator-only signal (listener health dot, "checked Xm
+   *  ago" / "N reconnects/h" line). The card's avatar, identity,
+   *  scoreboard, sparkline, heatmap, top-gifter chips, and in-match
+   *  pill stay identical so a viewer on `/` gets parity with
+   *  `/admin/tiktok`. The top-gifter chip still calls
+   *  `onSelectGifter` when provided — the gifter modal sums public
+   *  signals only and is fine to expose. */
+  readOnly?: boolean;
+  onToggle?: () => void;
+  onDelete?: () => void;
+  onReconnect?: () => void;
+  /** Flips the subscription's `is_public` flag — controls whether this
+   *  host's sanitized scoreboard shows up on the unauthenticated home
+   *  page. Optimistic update happens at the page level. */
+  onSetPublic?: () => void;
+  onSend?: (text: string) => void;
   /** Lifts a click on a top-gifter chip up to the page-level modal
    *  state. Optional so the card stays usable in contexts where no
    *  modal host is available. */
@@ -622,8 +688,12 @@ interface RowProps {
  *  collapses to 1-per-row at smaller widths. The card is dense
  *  enough that the desktop user gets table-equivalent info density
  *  while gaining real estate for the activity strip, sparkline,
- *  recent broadcasts, and identity context. */
-function SubscriptionCard({ sub, electron, summary, onToggle, onDelete, onReconnect, onSend, onSelectGifter }: RowProps) {
+ *  recent broadcasts, and identity context.
+ *
+ *  Exported so the unauthenticated public page (`/`) can render the
+ *  identical visual with `readOnly` — same scoreboard, same
+ *  sparkline / heatmap / chips, just no admin-side actions. */
+export function SubscriptionCard({ sub, electron, summary, readOnly, onToggle, onDelete, onReconnect, onSetPublic, onSend, onSelectGifter }: RowProps) {
   const [composer, setComposer] = useState('');
   const [sending, setSending] = useState(false);
   const display = sub.nickname || sub.unique_id;
@@ -645,8 +715,99 @@ function SubscriptionCard({ sub, electron, summary, onToggle, onDelete, onReconn
     <div
       className={`rounded-lg border border-gray-200 ${cardAccent} bg-white dark:bg-white/5 p-3 flex flex-col gap-3 transition-shadow hover:shadow-sm`}
     >
-      {/* Top row: avatar + identity + state pill */}
+      {/* Top row: avatar + identity + state pill.
+          In readOnly (public) mode, the click target drills into the
+          unauthenticated detail page `/lives/$handle` — same React
+          tree as `/admin/tiktok/$handle` rendered with the public API
+          namespace + every admin-write affordance hidden. The previous
+          behaviour was an external link to tiktok.com itself, but the
+          user expects the click to OPEN the deep-dive view we serve. */}
       <div className="flex items-start gap-3">
+        {readOnly ? (
+          <Link
+            to="/lives/$handle"
+            params={{ handle: sub.unique_id }}
+            title={`Open @${sub.unique_id}'s live page`}
+            className="flex items-start gap-3 flex-1 min-w-0 group"
+          >
+            <div className="relative shrink-0">
+              {sub.avatar_url ? (
+                <img
+                  src={sub.avatar_url}
+                  alt=""
+                  className="w-14 h-14 rounded-full object-cover ring-2 ring-gray-100 dark:ring-white/10 group-hover:ring-primary-200 transition-shadow"
+                  referrerPolicy="no-referrer"
+                  loading="lazy"
+                />
+              ) : (
+                <div className="w-14 h-14 rounded-full bg-gray-100 text-gray-400 flex items-center justify-center text-lg font-bold">
+                  {(sub.unique_id[0] || '?').toUpperCase()}
+                </div>
+              )}
+              {isLive && (
+                <span
+                  className="absolute -bottom-1 left-1/2 -translate-x-1/2 inline-flex items-center gap-1 rounded-full bg-emerald-600 text-white text-[9px] font-bold tracking-wider px-1.5 py-0.5 ring-2 ring-white dark:ring-gray-900 shadow-sm"
+                  aria-label="Live now"
+                  title="Live now"
+                >
+                  <span className="w-1.5 h-1.5 rounded-full bg-white animate-pulse" />
+                  LIVE
+                </span>
+              )}
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="font-bold text-gray-900 group-hover:text-primary-700 truncate flex items-center gap-1.5">
+                {display}
+                {sub.verified && (
+                  <span title="Verified" className="text-primary-600 text-sm shrink-0">✓</span>
+                )}
+                {isLive && summary?.active_match && (() => {
+                  const am = summary.active_match!;
+                  const opps = am.opponents ?? [];
+                  const others = opps.filter(
+                    (o) => o.unique_id && o.unique_id !== sub.unique_id
+                  );
+                  const primary = others[0] ?? null;
+                  const extraCount = Math.max(0, others.length - 1);
+                  const extraTitle = extraCount > 0
+                    ? `Other rivals: ${others.slice(1).map((o) => '@' + o.unique_id).join(', ')}`
+                    : '';
+                  return (
+                    <span className="shrink-0 inline-flex items-center gap-1">
+                      <span
+                        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-purple-100 dark:bg-purple-500/15 text-purple-700 dark:text-purple-300 text-[9px] font-mono font-bold uppercase tracking-wider"
+                        title="Host is in a PK battle right now"
+                      >
+                        ⚔ In match
+                      </span>
+                      {primary?.unique_id && (
+                        <span
+                          className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-purple-50 dark:bg-purple-500/10 text-purple-700 dark:text-purple-300 text-[10px] font-mono"
+                          title={extraTitle || `Rival: @${primary.unique_id}`}
+                        >
+                          vs @{primary.unique_id}
+                          {extraCount > 0 && (
+                            <span className="opacity-70 tabular-nums">+{extraCount}</span>
+                          )}
+                        </span>
+                      )}
+                    </span>
+                  );
+                })()}
+              </div>
+              <div
+                className="text-xs font-mono text-gray-500 truncate"
+                title={
+                  sub.follower_count != null
+                    ? `${sub.follower_count.toLocaleString()} followers${sub.room_id ? ` · Room ${sub.room_id}` : ''}`
+                    : undefined
+                }
+              >
+                @{sub.unique_id}
+              </div>
+            </div>
+          </Link>
+        ) : (
         <Link
           to="/admin/tiktok/$handle"
           params={{ handle: sub.unique_id }}
@@ -739,19 +900,23 @@ function SubscriptionCard({ sub, electron, summary, onToggle, onDelete, onReconn
             </div>
           </div>
         </Link>
-        {/* Listener health dot replaces the verbose state pill. */}
-        <HealthDot sub={sub} summary={summary} />
+        )}
+        {/* Listener health dot replaces the verbose state pill.
+            Operator-only signal — hidden in read-only mode. */}
+        {!readOnly && <HealthDot sub={sub} summary={summary} />}
       </div>
 
       {/* Activity strip — sparkline, live stats, PK chip, top gifter,
           24h activity rhythm, recent broadcasts, 30d averages. Falls
           back gracefully if the summary hasn't loaded yet. */}
-      <ActivityStrip sub={sub} summary={summary} onSelectGifter={onSelectGifter} />
+      <ActivityStrip sub={sub} summary={summary} readOnly={readOnly} onSelectGifter={onSelectGifter} />
 
       {/* Actions row — Stats link on the left, electron composer
           fills the rest, icon buttons grouped on the right so they
           stay together when the row wraps. All hit-targets ≥ 44px
-          via the wrapper sizes for touch (audit fix). */}
+          via the wrapper sizes for touch (audit fix).
+          Entire row suppressed in read-only mode. */}
+      {!readOnly && (
       <div className="flex flex-wrap items-center gap-2 border-t border-gray-200 dark:border-white/10 pt-2">
         <Link
           to="/admin/tiktok/$handle"
@@ -762,7 +927,7 @@ function SubscriptionCard({ sub, electron, summary, onToggle, onDelete, onReconn
           <BarChart3 className="w-4 h-4" />
           <span>Stats</span>
         </Link>
-        {electron && sub.is_connected && (
+        {electron && sub.is_connected && onSend && (
           <div className="flex items-center gap-1 w-full sm:w-auto sm:flex-1 min-w-0">
             <Input
               placeholder="say something…"
@@ -799,6 +964,31 @@ function SubscriptionCard({ sub, electron, summary, onToggle, onDelete, onReconn
             min-h-[44px] meets Apple/WCAG touch-target minimum on
             mobile while staying compact on desktop. */}
         <div className="flex items-center gap-1 ml-auto">
+          {/* Public-visibility toggle — when on, this host's sanitized
+              scoreboard appears on the unauthenticated `/` page. The
+              button is `aria-pressed` so screen readers announce the
+              binary state; the emerald fill mirrors the `LIVE` accent
+              for visual continuity with "this is going out". */}
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={onSetPublic}
+            aria-pressed={!!sub.is_public}
+            className={
+              'min-w-[44px] min-h-[44px] ' +
+              (sub.is_public
+                ? 'bg-emerald-100 text-emerald-700 hover:bg-emerald-200'
+                : 'text-gray-500 hover:text-gray-700')
+            }
+            title={
+              sub.is_public
+                ? 'Public on — visible on the public home page. Click to hide.'
+                : 'Mark this live as public (visible on /home)'
+            }
+            aria-label={sub.is_public ? 'Public on' : 'Public off'}
+          >
+            <Globe className="w-4 h-4" />
+          </Button>
           <Button
             variant="ghost"
             size="sm"
@@ -836,6 +1026,7 @@ function SubscriptionCard({ sub, electron, summary, onToggle, onDelete, onReconn
           </Button>
         </div>
       </div>
+      )}
     </div>
   );
 }
@@ -913,10 +1104,17 @@ function TotalCell({
 function ActivityStrip({
   sub,
   summary,
+  readOnly,
   onSelectGifter,
 }: {
   sub: TikTokSubscription;
   summary?: TikTokLiveSummary;
+  /** When true, suppress operator-only lines (the
+   *  "checked Xm ago / N reconnects/h" detail on offline cards).
+   *  The scoreboard, last-broadcast preview, top-gifter chips,
+   *  sparkline, and heatmap still render — they're all derived from
+   *  what's already public on TikTok itself. */
+  readOnly?: boolean;
   onSelectGifter?: (g: SelectedGifter) => void;
 }) {
   // Live state truth source: `summary.active_room_id` is computed
@@ -1041,17 +1239,21 @@ function ActivityStrip({
         <div className="flex flex-col gap-1.5">
           {/* Status pill row — same as before but trimmed since the
               scoreboard below now carries the "when did this end"
-              info via the latest broadcast. */}
+              info via the latest broadcast. The "checked Xm ago" and
+              "N reconnects/h" detail leak operator-only signals
+              (scraper cadence, listener instability), so they're
+              suppressed in read-only mode — the bare `offline` pill
+              still renders so the public viewer sees the state. */}
           <div className="flex items-center gap-2 text-[11px] font-mono text-gray-500">
             <span className="inline-flex items-center px-1.5 py-0.5 rounded bg-gray-100 text-gray-600 text-[10px] uppercase tracking-wider">
               offline
             </span>
-            {sub.live_checked_at && (
+            {!readOnly && sub.live_checked_at && (
               <span className="tabular-nums">
                 checked {relTime(sub.live_checked_at)}
               </span>
             )}
-            {reconnects1h > 0 && (
+            {!readOnly && reconnects1h > 0 && (
               <span
                 className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-full bg-amber-100 dark:bg-amber-500/15 text-amber-700 dark:text-amber-300 text-[10px]"
                 title="Listener has reconnected this many times in the last hour — may be unstable."

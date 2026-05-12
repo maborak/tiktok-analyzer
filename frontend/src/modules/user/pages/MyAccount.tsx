@@ -34,6 +34,7 @@ import { ProgressBar } from '@/components/ui/ProgressBar';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { PageShell } from '@/components/ui/PageShell';
 import { googleConfig, githubConfig, facebookConfig } from '@/config/env';
+import { startOAuthFlow } from '@/utils/oauthState';
 import { useGoogleLogin } from '@react-oauth/google';
 
 // =============================================================================
@@ -520,7 +521,13 @@ export function MyAccount() {
   };
 
   const handleLinkRedirectProvider = (provider: 'github' | 'facebook') => {
-    sessionStorage.setItem('oauth_link_intent', 'true');
+    // CSPRNG state — the callback verifies it to refuse stray
+    // `?code=` deliveries. `intent: 'link'` tells the callback this
+    // came from "link from settings", so it calls linkOAuthProvider
+    // instead of signing the user in. Replaces the old
+    // `oauth_link_intent` boolean flag, which an XSS-injected setter
+    // could flip to abuse a victim's open sign-in flow as a link.
+    const state = startOAuthFlow(provider, { intent: 'link' });
     if (provider === 'github') {
       const redirectUri = `${window.location.origin}/auth/github/callback`;
       const params = new URLSearchParams({
@@ -528,6 +535,7 @@ export function MyAccount() {
         redirect_uri: redirectUri,
         scope: 'user:email',
         prompt: 'select_account',
+        state,
       });
       window.location.href = `https://github.com/login/oauth/authorize?${params.toString()}`;
     } else if (provider === 'facebook') {
@@ -538,6 +546,7 @@ export function MyAccount() {
         scope: 'email,public_profile',
         response_type: 'code',
         auth_type: 'rerequest',
+        state,
       });
       window.location.href = `https://www.facebook.com/v21.0/dialog/oauth?${params.toString()}`;
     }

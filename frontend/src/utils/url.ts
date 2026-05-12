@@ -1,19 +1,25 @@
 import { apiConfig } from '../config/env';
 
 /**
- * Resolves a URL to its full absolute form if it's relative to the API base.
- * Also appends the auth token as a query parameter if requested (for direct browser access).
- * 
- * @param url The URL or path to resolve
- * @param includeToken Whether to append the localStorage auth token
- * @returns The resolved absolute URL
+ * Resolves a URL to its full absolute form if it's relative to the
+ * API base. Never appends auth tokens — see the JWT-in-URL audit
+ * finding (2026-05-12): tokens leaked via the URL query string land
+ * in webserver access logs, the Referer header on any outbound link
+ * from the viewing page, browser history, and autocomplete. The
+ * `?token=<JWT>` codepath was removed both server- and client-side.
+ *
+ * For authenticated media (images, downloads), use the helpers in
+ * `@/components/AuthMedia` which fetch via `Authorization: Bearer`
+ * header and render the result as a blob URL (operator path), or
+ * pass a session-token via the `sessionToken` prop (bounded-blast-
+ * radius livechat-guest path).
  */
-export function resolveApiUrl(url: string | undefined | null, includeToken: boolean = false): string {
+export function resolveApiUrl(url: string | undefined | null): string {
     if (!url) return '';
 
     // If already an absolute URL (starts with http://, https://, or //)
     if (/^(https?:)?\/\//i.test(url)) {
-        return appendToken(url, includeToken);
+        return url;
     }
 
     // Ensure leading slash for relative paths
@@ -22,17 +28,7 @@ export function resolveApiUrl(url: string | undefined | null, includeToken: bool
         ? apiConfig.baseUrl.slice(0, -1)
         : apiConfig.baseUrl;
 
-    return appendToken(`${baseUrl}${path}`, includeToken);
-}
-
-function appendToken(url: string, includeToken: boolean): string {
-    if (!includeToken) return url;
-
-    const token = localStorage.getItem('auth_token');
-    if (!token) return url;
-
-    const separator = url.includes('?') ? '&' : '?';
-    return `${url}${separator}token=${token}`;
+    return `${baseUrl}${path}`;
 }
 
 /**
@@ -40,12 +36,13 @@ function appendToken(url: string, includeToken: boolean): string {
  * Use this for /media/tickets/... paths only.
  */
 export function resolveTicketMediaUrl(url: string | undefined | null): string {
-    return resolveApiUrl(url, false);
+    return resolveApiUrl(url);
 }
 
 /**
- * Securely downloads a file using Authorization header (never leaks token in URL).
- * Returns a blob URL suitable for triggering a browser download.
+ * Securely downloads a file using Authorization header (never leaks
+ * the token in URL). Returns a blob URL suitable for triggering a
+ * browser download.
  */
 export async function secureDownload(fileUrl: string, fileName: string): Promise<void> {
     const url = fileUrl.startsWith('http') ? fileUrl : `${apiConfig.baseUrl}${fileUrl}`;
@@ -61,30 +58,4 @@ export async function secureDownload(fileUrl: string, fileName: string): Promise
     a.download = fileName;
     a.click();
     URL.revokeObjectURL(blobUrl);
-}
-
-/**
- * Resolves a livechat media URL with dual-auth support.
- * Needed for inline <img src> rendering — browsers can't send Authorization headers for image tags.
- * For pure downloads, prefer secureDownload() instead.
- */
-export function resolveLivechatMediaUrl(url: string | undefined | null, sessionToken?: string | null): string {
-    if (!url) return '';
-
-    const resolved = resolveApiUrl(url, false);
-
-    // Prefer JWT if available (authenticated user)
-    const jwt = localStorage.getItem('auth_token');
-    if (jwt) {
-        const sep = resolved.includes('?') ? '&' : '?';
-        return `${resolved}${sep}token=${jwt}`;
-    }
-
-    // Fall back to session token (anonymous guest)
-    if (sessionToken) {
-        const sep = resolved.includes('?') ? '&' : '?';
-        return `${resolved}${sep}session_token=${sessionToken}`;
-    }
-
-    return resolved;
 }

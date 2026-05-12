@@ -3,7 +3,7 @@ import { Headset, X, Send, Loader2, Paperclip, FileText, TicketIcon, MessageCirc
 import { liveChatApi } from '../services/session';
 import { adminTicketsApi } from '@admin';
 import type { ChatMessageResponse, TicketCategory } from '@/types/api';
-import { resolveLivechatMediaUrl } from '@/utils/url';
+import { AuthImage, AuthLink } from '@/components/AuthMedia';
 import { useAuth } from '@/contexts/AuthContext';
 import clsx from 'clsx';
 import toast from 'react-hot-toast';
@@ -566,19 +566,20 @@ export function LiveChatWidget() {
                     {msg.attachments && msg.attachments.length > 0 && (
                         <div className="mt-2 flex flex-col gap-1.5">
                             {msg.attachments.map(att => (
-                                <a
+                                <AuthLink
                                     key={att.id}
-                                    href={resolveLivechatMediaUrl(att.file_url, sessionToken)}
-                                    target="_blank"
-                                    rel="noopener noreferrer"
+                                    href={att.file_url}
+                                    fileName={att.file_name}
+                                    sessionToken={sessionToken}
                                     className={clsx(
                                         "flex flex-col gap-1 rounded-lg overflow-hidden transition-colors",
                                         isUser ? "hover:bg-white/10" : "hover:bg-gray-50"
                                     )}
                                 >
                                     {att.content_type.startsWith('image/') ? (
-                                        <img
-                                            src={resolveLivechatMediaUrl(att.file_url, sessionToken)}
+                                        <AuthImage
+                                            src={att.file_url}
+                                            sessionToken={sessionToken}
                                             alt={att.file_name}
                                             className="max-w-full h-auto rounded-lg max-h-44 object-contain bg-black/5"
                                             loading="lazy"
@@ -592,7 +593,7 @@ export function LiveChatWidget() {
                                             <span className="truncate">{att.file_name}</span>
                                         </div>
                                     )}
-                                </a>
+                                </AuthLink>
                             ))}
                         </div>
                     )}

@@ -410,6 +410,54 @@ export function EventMonitor() {
             emptyTitle="No events registered yet"
             emptyDescription="Events will appear here as the system processes actions"
             emptyIcon={FileText}
+            onRowClick={(row) => { setDetailEvent(row); setDetailOpen(true); }}
+            mobileCard={(row) => {
+              const cat = getCategoryForEvent(row.event_type);
+              const preview = JSON.stringify(row.data);
+              const truncated = preview.length > 80 ? preview.slice(0, 80) + '...' : preview;
+              return (
+                <div className="px-4 py-3 space-y-2">
+                  <div className="flex items-start justify-between gap-2">
+                    <span className={cn('inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium shrink-0', CATEGORY_COLORS[cat])}>
+                      {formatEventType(row.event_type)}
+                    </span>
+                    <span className="text-[11px] text-gray-500 tabular-nums shrink-0">
+                      {row.created_at ? new Date(row.created_at).toLocaleString() : '—'}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-3 gap-2 text-xs">
+                    <div className="min-w-0">
+                      <div className="text-[10px] uppercase tracking-wider text-gray-400">ID</div>
+                      <div className="font-mono text-gray-600 tabular-nums truncate">{row.id}</div>
+                    </div>
+                    <div className="min-w-0">
+                      <div className="text-[10px] uppercase tracking-wider text-gray-400">Source</div>
+                      <div className="text-gray-600 truncate">{row.source || '—'}</div>
+                    </div>
+                    <div className="min-w-0">
+                      <div className="text-[10px] uppercase tracking-wider text-gray-400">Trace</div>
+                      {row.trace_id ? (
+                        <button
+                          onClick={(e) => { e.stopPropagation(); goToTrace(row.trace_id!); }}
+                          className="font-mono text-blue-600 hover:text-blue-800 dark:text-blue-400 hover:underline truncate block max-w-full"
+                          title={`View trace ${row.trace_id}`}
+                        >
+                          {row.trace_id.slice(0, 8)}...
+                        </button>
+                      ) : (
+                        <span className="text-gray-400">—</span>
+                      )}
+                    </div>
+                  </div>
+                  {truncated && truncated !== '{}' && (
+                    <div className="pt-1">
+                      <div className="text-[10px] uppercase tracking-wider text-gray-400 mb-0.5">Data</div>
+                      <div className="text-[11px] font-mono text-gray-500 break-all">{truncated}</div>
+                    </div>
+                  )}
+                </div>
+              );
+            }}
           />
         </>
       )}

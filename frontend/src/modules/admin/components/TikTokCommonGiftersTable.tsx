@@ -21,7 +21,7 @@ import {
   openTikTokWebSocket,
   tiktokApi,
 } from '@admin/services/tiktok';
-import { TikTokCommonGifterDetailModal } from '@admin/components/TikTokCommonGifterDetailModal';
+import { TikTokGifterDetailModal } from '@admin/components/TikTokGifterDetailModal';
 
 const PAGE_SIZE_OPTIONS = [10, 25, 50, 100] as const;
 const DEFAULT_PAGE_SIZE = 25;
@@ -316,13 +316,14 @@ export function TikTokCommonGiftersTable({ refreshKey = 0, mode = 'common' }: Pr
         </ul>
       )}
 
-      <TikTokCommonGifterDetailModal
+      <TikTokGifterDetailModal
         isOpen={selected !== null}
         userId={selected?.user_id ?? null}
-        initialNickname={selected?.nickname ?? null}
-        initialUniqueId={selected?.unique_id ?? null}
-        initialAvatarUrl={selected?.avatar_url ?? null}
+        nickname={selected?.nickname ?? null}
+        uniqueId={selected?.unique_id ?? null}
+        avatarUrl={selected?.avatar_url ?? null}
         onClose={() => setSelected(null)}
+        defaultTab="profile"
       />
 
       {/* Pagination footer — only when there's something to page. */}

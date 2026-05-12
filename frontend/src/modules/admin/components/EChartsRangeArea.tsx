@@ -16,17 +16,27 @@ import {
   BrushComponent,
   GridComponent,
   MarkLineComponent,
+  ToolboxComponent,
   TooltipComponent,
   VisualMapComponent,
 } from 'echarts/components';
 import { CanvasRenderer } from 'echarts/renderers';
 import ReactECharts from 'echarts-for-react/lib/core';
 
+// ECharts tree-shaken build: every component referenced from `option`
+// MUST be registered here. The chart uses `brush.toolbox: [...]` to
+// expose the lineX brush + clear buttons, which is technically the
+// toolbox component (the brush component owns the brushing behaviour
+// but the toolbox component owns the button strip that selects the
+// brush mode). Without ToolboxComponent the chart still renders but
+// emits a console warning on every mount: "[ECharts] Component
+// toolbox is used but not imported."
 echarts.use([
   LineChart,
   GridComponent,
   TooltipComponent,
   BrushComponent,
+  ToolboxComponent,
   VisualMapComponent,
   MarkLineComponent,
   CanvasRenderer,

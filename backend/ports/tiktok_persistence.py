@@ -41,6 +41,16 @@ class TikTokPersistencePort(ABC):
         """Toggle the enabled flag. Returns the updated row, or None if missing."""
 
     @abstractmethod
+    def set_subscription_public(self, unique_id: str, is_public: bool) -> bool:
+        """Toggle the `is_public` flag. Returns True if the row was found
+        and updated, False otherwise."""
+
+    @abstractmethod
+    def list_public_subscriptions(self) -> list[Subscription]:
+        """Subscriptions where `is_public=True`, ordered by `unique_id`.
+        Drives the unauthenticated /public/tiktok/lives endpoint."""
+
+    @abstractmethod
     def delete_subscription(self, unique_id: str) -> bool:
         """Hard-delete the subscription row. Returns True if a row was deleted."""
 
