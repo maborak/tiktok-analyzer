@@ -648,6 +648,31 @@ async def lifespan(app: FastAPI):
 
     warmup_task = asyncio.create_task(_warm_tiktok_caches())
 
+    # Phase 9B: clock-driven refresh of age-derived state-cache fields
+    # (`last_*_age_s` decay + `active_poll` expiry). Started only in
+    # `in_process` mode — in `worker` mode the listener process owns
+    # the tick task (see `cli/commands/system/tiktok.py:run-listener`)
+    # so age fields aren't ticked twice when both processes share Redis.
+    tick_task: asyncio.Task[Any] | None = None
+    _listener_mode_for_tick = os.getenv(
+        "PHOVEU_BACKEND_TIKTOK_LISTENER_MODE", "in_process",
+    ).strip().lower()
+    if (
+        _listener_mode_for_tick == "in_process"
+        and services.get("tiktok_service") is not None
+    ):
+        _tiktok_persistence = getattr(
+            services["tiktok_service"], "_persistence", None,
+        )
+        _state_cache = getattr(_tiktok_persistence, "_state_cache", None)
+        if _state_cache is not None:
+            from adapters.tiktok_state_ticker import run_state_tick_loop
+            tick_task = asyncio.create_task(
+                run_state_tick_loop(_state_cache),
+                name="tiktok-state-tick",
+            )
+            logger.info("✅ TikTok state-cache tick task started (in_process mode)")
+
     yield
     
     # Shutdown hooks
@@ -663,6 +688,14 @@ async def lifespan(app: FastAPI):
         warmup_task.cancel()
         try:
             await warmup_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    # Phase 9B: stop the tick task (only set when wired above).
+    if tick_task is not None and not tick_task.done():
+        tick_task.cancel()
+        try:
+            await tick_task
         except (asyncio.CancelledError, Exception):
             pass
 

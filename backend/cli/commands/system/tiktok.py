@@ -342,10 +342,53 @@ async def _main(*, reconcile_seconds: int) -> None:
     # 1. Redis for fan-out (optional but expected).
     await init_redis()
 
+    # Phase 9B: state-cache wiring. When the WS state-push flag is on,
+    # the worker is the sole writer to the per-host state cache —
+    # `_apply_state_delta` runs inline in `record_event()` here, and the
+    # API workers in worker mode are passive (no listener of their own,
+    # no writes to the cache). Redis-backed for cross-process sharing.
+    _ws_state_push = os.getenv(
+        "PHOVEU_BACKEND_TIKTOK_WS_STATE_PUSH", "off",
+    ).strip().lower()
+    state_cache = None
+    if _ws_state_push in ("shadow", "on"):
+        try:
+            import redis as _redis
+            from adapters.tiktok_state_cache_redis import TikTokStateCacheRedis
+            from utils.redis_client import get_redis
+            from config import CONFIG
+            url = CONFIG.get("REDIS_URL") or ""
+            if not url:
+                logger.warning(
+                    "ws_state_push=%s but PHOVEU_REDIS_SERVER is empty — "
+                    "state cache disabled in this worker. The API and "
+                    "this worker won't share state. Set REDIS_URL or "
+                    "set ws_state_push=off.", _ws_state_push,
+                )
+            else:
+                state_cache = TikTokStateCacheRedis(
+                    sync_client=_redis.from_url(url, decode_responses=False),
+                    async_client_getter=get_redis,
+                    public_sanitizer=None,  # wired post-service below
+                )
+                logger.info(
+                    "✅ TikTok state cache (Redis) wired in worker (ws_state_push=%s)",
+                    _ws_state_push,
+                )
+        except Exception:
+            logger.exception(
+                "Failed to wire state cache in worker — falling through "
+                "with state cache disabled.",
+            )
+
     # 2. Persistence + service.
-    persistence = TikTokPersistenceAdapter(auto_init=True)
+    persistence = TikTokPersistenceAdapter(auto_init=True, state_cache=state_cache)
     factory = TikTokLiveSessionFactory()
     service = TikTokService(persistence=persistence, session_factory=factory)
+
+    # Wire the public sanitizer now that the service exists.
+    if state_cache is not None:
+        state_cache._public_sanitizer = service.sanitize_public_patch
 
     # 3. Wire the Redis-publishing listener.
     publisher = EventPublisher()
@@ -415,12 +458,27 @@ async def _main(*, reconcile_seconds: int) -> None:
 
     reconcile_task = asyncio.create_task(_reconcile_loop(service, stop, reconcile_seconds))
 
+    # Phase 9B: state-cache tick task. Only started when the worker
+    # owns a state cache (ws_state_push=shadow|on). In in_process mode
+    # this same loop runs from `api_main.py:lifespan` instead — the
+    # boot logic ensures exactly one tick task per state-cache backing.
+    tick_task: asyncio.Task | None = None
+    if state_cache is not None:
+        from adapters.tiktok_state_ticker import run_state_tick_loop
+        tick_task = asyncio.create_task(
+            run_state_tick_loop(state_cache, stop_event=stop),
+            name="tiktok-state-tick",
+        )
+
     logger.info("Worker ready (pid=%d). Waiting for events / SIGINT.", os.getpid())
     try:
         await stop.wait()
     finally:
         logger.info("Shutting down listener pool...")
-        for t in (reconcile_task, db_heartbeat_task, stop_watcher_task):
+        _tasks_to_cancel = [reconcile_task, db_heartbeat_task, stop_watcher_task]
+        if tick_task is not None:
+            _tasks_to_cancel.append(tick_task)
+        for t in _tasks_to_cancel:
             t.cancel()
             try:
                 await t
