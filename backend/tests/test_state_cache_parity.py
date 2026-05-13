@@ -376,6 +376,122 @@ def test_parity_top_gifter_ordering(persistence_with_cache, fake_handle, fake_ro
     )
 
 
+# ── Phase 9C: bundle/summary shape with state cache wired ──────────
+
+
+def test_get_lives_summary_overlay_adds_version_only(
+    persistence_with_cache, fake_handle, fake_room_id,
+):
+    """Phase 9C contract: when the state cache is wired, the
+    `get_lives_summary` result for each handle is byte-identical to
+    the pure-SQL output EXCEPT for the new `version` field. No other
+    new keys appear. No existing keys disappear. Values for the
+    overlay-able fields stay equal because the parity oracle already
+    verifies cache == SQL on those fields.
+
+    This is the Phase 9C gate: Phase D (WS push) reads `version`
+    from this shape, and Phase F can simplify confidently knowing
+    no extra fields snuck in via the overlay."""
+    p, state_cache, s = persistence_with_cache
+
+    # Seed a small event sequence so both cache and SQL have content
+    # to report.
+    p._state_apply_live_started(fake_handle, {"room_id": fake_room_id})
+    _push_gift(p, fake_room_id, fake_handle, 401, 100)
+    _push_gift(p, fake_room_id, fake_handle, 402, 50)
+    _push_comment(p, fake_room_id, fake_handle, 501)
+
+    # Read with cache wired (path under test).
+    with_cache = s.get_lives_summary([fake_handle])
+
+    # Read again with cache forcibly disabled — simulates the
+    # `ws_state_push=off` deployment shape. Bust the service-level
+    # TTL cache so the SQL fan-out actually re-runs.
+    s._lives_summary_cache.clear()
+    p._state_cache = None
+    without_cache = s.get_lives_summary([fake_handle])
+
+    norm = fake_handle.lower()
+    with_slice = with_cache.get(norm, {})
+    without_slice = without_cache.get(norm, {})
+
+    added = set(with_slice) - set(without_slice)
+    removed = set(without_slice) - set(with_slice)
+
+    assert removed == set(), (
+        f"Phase 9C broke the bundle shape — fields disappeared: {removed}\n"
+        f"With-cache keys: {sorted(with_slice)}\n"
+        f"Without-cache keys: {sorted(without_slice)}"
+    )
+
+    # `version` is the explicit Phase 9C addition.
+    assert "version" in added, "version field missing from cache-overlaid output"
+
+    # Some fields are eagerly pre-initialized by `_state_apply_live_started`
+    # (e.g. `active_poll: None`, `viewer_count: None`, `n_envelopes_session: 0`)
+    # while the SQL output omits them when no event of that kind has
+    # fired. Frontend treats both via nullish-coalescing, so adding
+    # them with a zero-equivalent value is harmless. Flag any
+    # OTHER additions, or any value that isn't zero-equivalent.
+    _ZERO_EQUIVALENTS: tuple[Any, ...] = (None, 0, [], {})
+    other_added = added - {"version"}
+    for key in other_added:
+        v = with_slice[key]
+        assert v in _ZERO_EQUIVALENTS or v == {}, (
+            f"Phase 9C overlay added `{key}` with non-zero-equivalent "
+            f"value {v!r}; this changes the wire shape in a way the "
+            f"frontend may not handle. Either reset this field to a "
+            f"zero-equivalent in `_state_apply_live_started` or stop "
+            f"pre-initializing it."
+        )
+
+    # Version must be a non-negative int.
+    assert isinstance(with_slice["version"], int)
+    assert with_slice["version"] >= 1, (
+        f"version should advance past 0 after the live_started + 3 events; "
+        f"got {with_slice['version']}"
+    )
+
+
+def test_get_lives_summary_overlay_zero_version_when_no_cache_entry(
+    persistence_with_cache, fake_handle, fake_room_id,
+):
+    """When a host has no cache entry yet (cold start, no events
+    flowed through this host), the overlay reports `version=0`. Phase
+    D clients use this as the floor — any subsequent delta with
+    `version >= 1` is a strict advance from their viewpoint."""
+    p, state_cache, s = persistence_with_cache
+    # Don't push live_started or any event — the cache stays empty
+    # for this handle. We still expect a slice in the SQL result
+    # because the subscription + room rows exist.
+
+    result = s.get_lives_summary([fake_handle])
+    norm = fake_handle.lower()
+    slice_ = result.get(norm, {})
+    assert slice_.get("version") == 0, (
+        f"expected version=0 for cache-empty host, got {slice_.get('version')}"
+    )
+
+
+def test_get_lives_summary_off_mode_has_no_version_field(
+    persistence_with_cache, fake_handle, fake_room_id,
+):
+    """When the service's state cache is None, the overlay is
+    bypassed entirely — output is the pure SQL result. No `version`
+    field anywhere. Tests the `ws_state_push=off` shape."""
+    p, _state_cache, s = persistence_with_cache
+    p._state_cache = None  # simulate `off` mode
+    s._lives_summary_cache.clear()
+
+    result = s.get_lives_summary([fake_handle])
+    norm = fake_handle.lower()
+    slice_ = result.get(norm, {})
+    assert "version" not in slice_, (
+        f"`version` leaked into output when state cache is None: "
+        f"keys={sorted(slice_)}"
+    )
+
+
 def test_parity_first_time_gifters(persistence_with_cache, fake_handle, fake_room_id):
     """When a user has no prior `tiktok_user_host_summary` row, both
     cache and SQL count them as a first-timer for this session.

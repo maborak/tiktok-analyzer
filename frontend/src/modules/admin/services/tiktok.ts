@@ -245,6 +245,12 @@ export interface TikTokMatchHeadToHeadRow {
 }
 
 export interface TikTokLiveSummary {
+  /** Monotonic per-host version stamped by the backend's state cache.
+   *  Phase 9C onwards. Clients track `versionByHost` for gap-detect
+   *  + WS-pushed delta reconciliation in Phase 9D. Absent (zero or
+   *  undefined) when the backend's state cache isn't wired (the
+   *  `PHOVEU_BACKEND_TIKTOK_WS_STATE_PUSH=off` deployment shape). */
+  version?: number;
   active_room_id?: string | null;
   live_started_at?: string | null;
   viewer_count?: number | null;

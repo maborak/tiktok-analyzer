@@ -2542,30 +2542,128 @@ class TikTokService:
     _lives_summary_locks: dict[tuple[str, ...], threading.Lock] = {}
     _lives_summary_meta_lock = threading.Lock()
 
+    # Phase 9C: fields the state cache provably maintains in lock-step
+    # with `get_lives_summary` (per `test_state_cache_parity.py`). These
+    # are the only fields we overlay from cache onto the SQL result —
+    # everything else (historical broadcasts, time-bucketed aggregates,
+    # 30-day rollups) stays SQL-driven because the event-driven cache
+    # doesn't track them.
+    #
+    # Adding a field here means committing to: (a) the cache writes it
+    # on every relevant event, and (b) the parity oracle test covers it.
+    _CACHE_OVERLAY_FIELDS: frozenset[str] = frozenset({
+        "active_room_id",
+        "live_started_at",
+        "diamonds_session",
+        "session_stats",
+        "top_gifters",
+        "n_unique_gifters",
+        "n_first_time_gifters",
+        "viewer_count",
+        "viewer_history",
+        "n_envelopes_session",
+        "envelope_diamonds_session",
+        "n_pauses",
+        "last_pause_age_s",
+        "active_match",
+        "active_poll",
+        "last_gift_age_s",
+        "last_comment_age_s",
+        "last_event_age_s",
+    })
+
+    @property
+    def _state_cache(self) -> Any:
+        """The persistence adapter is the owner of the state-cache
+        adapter (it's wired in `api_main._build_tiktok_state_cache`
+        + passed via `TikTokPersistenceAdapter(state_cache=...)`).
+        Surface it as a service-level property so the overlay logic
+        in `get_lives_summary` doesn't need a separate constructor
+        argument or DI step. Returns None when no cache is wired
+        (`PHOVEU_BACKEND_TIKTOK_WS_STATE_PUSH=off`)."""
+        return getattr(self._persistence, "_state_cache", None)
+
     def get_lives_summary(self, handles: list[str]) -> dict[str, Any]:
+        """Returns the per-host summary dict.
+
+        SQL fan-out runs with the existing 60s TTL + singleflight (the
+        cache key is `tuple(sorted(handles))`). Phase 9C: when a state
+        cache is wired, every returned slice is overlaid with the
+        cache's session-incremental fields and tagged with a monotonic
+        `version` integer. Without a state cache, behavior is
+        identical to Phase 9A (no `version` field on slices).
+
+        The overlay is a fresh dict per call — the TTL cache stores
+        the raw SQL result so we don't poison it across calls. Overlay
+        cost is sub-ms (in-process or Redis HGET)."""
         key = tuple(sorted(handles))
         now = time.monotonic()
+        sql_result: dict[str, Any]
         hit = self._lives_summary_cache.get(key)
         if hit and (now - hit[0]) < self._LIVES_SUMMARY_TTL_S:
-            return hit[1]
+            sql_result = hit[1]
+        else:
+            # Cold miss — singleflight. Get or create the per-key lock.
+            with self._lives_summary_meta_lock:
+                lock = self._lives_summary_locks.get(key)
+                if lock is None:
+                    lock = threading.Lock()
+                    self._lives_summary_locks[key] = lock
 
-        # Cold miss — singleflight. Get or create the per-key lock.
-        with self._lives_summary_meta_lock:
-            lock = self._lives_summary_locks.get(key)
-            if lock is None:
-                lock = threading.Lock()
-                self._lives_summary_locks[key] = lock
+            with lock:
+                # Double-checked: another caller may have populated the
+                # cache while we were waiting on the lock.
+                now2 = time.monotonic()
+                hit2 = self._lives_summary_cache.get(key)
+                if hit2 and (now2 - hit2[0]) < self._LIVES_SUMMARY_TTL_S:
+                    sql_result = hit2[1]
+                else:
+                    sql_result = self._persistence.get_lives_summary(handles)
+                    self._lives_summary_cache[key] = (now2, sql_result)
 
-        with lock:
-            # Double-checked: another caller may have populated the
-            # cache while we were waiting on the lock.
-            now2 = time.monotonic()
-            hit2 = self._lives_summary_cache.get(key)
-            if hit2 and (now2 - hit2[0]) < self._LIVES_SUMMARY_TTL_S:
-                return hit2[1]
-            result = self._persistence.get_lives_summary(handles)
-            self._lives_summary_cache[key] = (now2, result)
-            return result
+        # Phase 9C: state-cache overlay + per-host version.
+        if self._state_cache is None:
+            return sql_result
+        return self._overlay_state_cache(sql_result, handles)
+
+    def _overlay_state_cache(
+        self,
+        sql_result: dict[str, Any],
+        handles: list[str],
+    ) -> dict[str, Any]:
+        """Build a fresh dict-of-dicts: for each handle, start from the
+        SQL slice (shallow-copied so the TTL cache isn't poisoned),
+        replace any field in `_CACHE_OVERLAY_FIELDS` with the cached
+        value when present, and attach `version`.
+
+        Handles not in the SQL result get a slice synthesized purely
+        from cache (rare — happens when the SQL `list_subscriptions`
+        upstream from us hasn't picked up a brand-new handle yet)."""
+        out: dict[str, Any] = {h: dict(slice_) for h, slice_ in sql_result.items()}
+        for handle in handles:
+            norm = handle.lstrip("@").lower()
+            slice_ = out.setdefault(norm, {})
+            try:
+                cached = self._state_cache.get(norm)
+            except Exception:
+                logger.exception(
+                    "state-cache read failed for %s — falling back to SQL only",
+                    norm,
+                )
+                cached = None
+            if cached is None:
+                # No cache entry yet — version 0 lets clients detect
+                # that no events have flowed through this host yet, and
+                # any subsequent delta (version >= 1) is a strict
+                # advance from their viewpoint.
+                slice_.setdefault("version", 0)
+                continue
+            version, cache_state = cached
+            for k in self._CACHE_OVERLAY_FIELDS:
+                if k in cache_state:
+                    slice_[k] = cache_state[k]
+            slice_["version"] = version
+        return out
 
     # ── Public-lives sanitizer allowlists ────────────────────────────
     #
