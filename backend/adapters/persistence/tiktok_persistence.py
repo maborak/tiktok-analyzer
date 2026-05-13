@@ -78,6 +78,57 @@ from ports.tiktok_persistence import TikTokPersistencePort
 logger = logging.getLogger(__name__)
 
 
+# ── Phase 9B small helpers ──────────────────────────────────────────
+
+
+def _now_iso() -> str:
+    """Current UTC time as ISO-8601 string. Used for `_last_*_at`
+    aux fields in the state cache — Phase D's tick task parses
+    these back to compute `last_*_age_s`."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _iso_to_epoch(s: Any) -> float:
+    """Tolerant ISO-8601 → unix epoch. Returns -inf on parse failure
+    so callers treat a malformed timestamp as "infinitely old"."""
+    if s is None:
+        return float("-inf")
+    if isinstance(s, datetime):
+        return s.timestamp()
+    try:
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError):
+        return float("-inf")
+
+
+def _dt_to_epoch(d: Any) -> float:
+    """Datetime → unix epoch, with the same fallback as
+    `_iso_to_epoch` for non-datetime inputs."""
+    if isinstance(d, datetime):
+        return d.timestamp()
+    return _iso_to_epoch(d)
+
+
+def _user_id_from_viewer_or_payload(viewer: Any, payload: dict) -> int | None:
+    """The persist path passes `viewer` (a domain object) plus the
+    raw `payload`. user_id can live on either depending on event
+    type. Return an int or None."""
+    try:
+        if viewer is not None:
+            uid = getattr(viewer, "user_id", None)
+            if uid is not None:
+                return int(uid)
+    except (TypeError, ValueError, AttributeError):
+        pass
+    try:
+        raw = payload.get("user_id") if isinstance(payload, dict) else None
+        if raw is None:
+            return None
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 class WorkerKeyConflictError(RuntimeError):
     """Raised by `upsert_worker` when the requested worker_key is
     actively held by another live worker (heartbeat <30s old). The CLI
@@ -151,6 +202,28 @@ def _match_to_dataclass(m: TikTokMatchModel) -> Match:
 
 
 class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
+    """TikTok persistence adapter.
+
+    The `state_cache` kwarg (Phase 9B) is the per-host summary cache
+    that the persist path mirrors on every event. When `None` (the
+    default, used when `PHOVEU_BACKEND_TIKTOK_WS_STATE_PUSH=off`),
+    `_apply_state_delta` is a no-op and the persist path's behavior
+    is identical to before Phase 9. When wired, every event mutates
+    the cache + publishes a delta on admin + public channels."""
+
+    def __init__(
+        self,
+        *args: Any,
+        state_cache: Any = None,
+        **kwargs: Any,
+    ) -> None:
+        # All base-class kwargs pass through unchanged. Keeping
+        # `state_cache` as kwarg-only keeps the existing call-sites
+        # — `TikTokPersistenceAdapter(auto_init=True)` — working
+        # without modification.
+        super().__init__(*args, **kwargs)
+        self._state_cache = state_cache
+
     # ── Subscriptions ────────────────────────────────────────────────
 
     def list_subscriptions(self, *, enabled_only: bool = False) -> list[Subscription]:
@@ -2069,6 +2142,12 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                         s, host_unique_id,
                         event_type=type, payload=payload,
                     )
+                    # Phase 9B: state-cache mirror. No-op when
+                    # `self._state_cache is None` (feature flag off).
+                    self._apply_state_delta(
+                        s, host_unique_id,
+                        event_type=type, payload=payload, viewer=viewer,
+                    )
                 s.commit()
                 return int(row_id) if row_id else 0
 
@@ -2093,6 +2172,12 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
             self._bump_event_hour_count(
                 s, host_unique_id,
                 event_type=type, payload=payload,
+            )
+            # Phase 9B: state-cache mirror. No-op when
+            # `self._state_cache is None` (feature flag off).
+            self._apply_state_delta(
+                s, host_unique_id,
+                event_type=type, payload=payload, viewer=viewer,
             )
             s.commit()
             s.refresh(row)
@@ -2137,6 +2222,469 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
               DO UPDATE SET n = tiktok_event_hour_counts.n + 1,
                             diamonds = tiktok_event_hour_counts.diamonds + EXCLUDED.diamonds
         """), {"h": host_unique_id, "d": diamonds_delta})
+
+    # ── Phase 9B: state-cache mirror ─────────────────────────────────
+    #
+    # Every event that affects per-host runtime state translates into
+    # a patch applied to the state cache. Subscribers (Phase D) see
+    # the patch as a WS-pushed delta. When `self._state_cache` is
+    # `None` (the default for `PHOVEU_BACKEND_TIKTOK_WS_STATE_PUSH=off`
+    # mode), every call is a no-op — preserving pre-Phase-9 behavior.
+    #
+    # See `.claude/tracking/perf/PHASE9_PLAN.md` for the full mapping
+    # table. The implementations below match the SQL-equivalent
+    # semantics of `get_lives_summary` field-for-field so a shadow-
+    # mode soak can be validated by comparing cache state to SQL
+    # output on every host.
+
+    def _apply_state_delta(
+        self,
+        s,
+        host_unique_id: str | None,
+        *,
+        event_type: str | None,
+        payload: dict | None,
+        viewer: Any = None,
+    ) -> None:
+        """Dispatcher. Called inline from `record_event()` after the
+        DB row has been inserted and the user_host_summary upsert has
+        run, so any cross-session lookups (first-time-gifter detection)
+        find the just-committed state."""
+        if self._state_cache is None or not host_unique_id:
+            return
+        if not event_type:
+            return
+
+        payload = payload or {}
+        try:
+            if event_type == "gift":
+                self._state_apply_gift(s, host_unique_id, payload, viewer)
+            elif event_type == "comment":
+                self._state_apply_comment(host_unique_id, payload, viewer)
+            elif event_type in ("like", "join", "follow", "share"):
+                self._state_apply_simple_counter(host_unique_id, event_type)
+            elif event_type == "envelope":
+                self._state_apply_envelope(host_unique_id, payload)
+            elif event_type == "live_pause":
+                self._state_apply_pause(host_unique_id)
+            elif event_type == "poll":
+                self._state_apply_poll(host_unique_id, payload)
+            elif event_type == "battle_begin":
+                self._state_apply_battle_begin(host_unique_id, payload)
+            elif event_type == "battle_progress":
+                self._state_apply_battle_progress(host_unique_id, payload)
+            elif event_type == "battle_end":
+                self._state_apply_battle_end(host_unique_id)
+            elif event_type == "live_started":
+                self._state_apply_live_started(host_unique_id, payload)
+            elif event_type == "live_ended":
+                self._state_apply_live_ended(host_unique_id, payload)
+            elif event_type == "viewer_count_update":
+                self._state_apply_viewer_count(host_unique_id, payload)
+            else:
+                # Unknown / non-summary event. Don't publish, but bump
+                # `_last_event_at` so the tick task (Phase D) can keep
+                # `last_event_age_s` fresh. Aux-only patch → silent.
+                self._state_cache.apply_patch(
+                    host_unique_id,
+                    {"_last_event_at": _now_iso()},
+                )
+        except Exception:
+            # State-cache failures must NEVER break the persist path
+            # — the DB row is already committed. Log + swallow so the
+            # listener stays healthy.
+            logger.exception(
+                "_apply_state_delta failed: host=%s type=%s",
+                host_unique_id, event_type,
+            )
+
+    # Per-event helpers below. Each builds a single patch dict mixing
+    # publishable fields with `_*` aux fields, then calls
+    # `apply_patch(host, patch)`. The adapter strips `_*` before
+    # publishing so subscribers see only the user-facing fields.
+
+    def _state_apply_simple_counter(
+        self, host: str, event_type: str,
+    ) -> None:
+        """like / join / follow / share — increment one counter in
+        `session_stats`."""
+        cached = self._state_cache.get(host)
+        stats = (cached[1].get("session_stats") if cached else None) or {}
+        key = f"n_{event_type}s"  # likes / joins / follows / shares
+        new_count = (stats.get(key) or 0) + 1
+        self._state_cache.apply_patch(host, {
+            "session_stats": {key: new_count},
+            "_last_event_at": _now_iso(),
+        })
+
+    def _state_apply_envelope(self, host: str, payload: dict) -> None:
+        cached = self._state_cache.get(host)
+        current = cached[1] if cached else {}
+        n = (current.get("n_envelopes_session") or 0) + 1
+        diamonds = (
+            current.get("envelope_diamonds_session") or 0
+        ) + int(payload.get("diamonds") or payload.get("diamond_count") or 0)
+        self._state_cache.apply_patch(host, {
+            "n_envelopes_session": n,
+            "envelope_diamonds_session": diamonds,
+            "_last_event_at": _now_iso(),
+        })
+
+    def _state_apply_pause(self, host: str) -> None:
+        cached = self._state_cache.get(host)
+        current = cached[1] if cached else {}
+        n = (current.get("n_pauses") or 0) + 1
+        now_iso = _now_iso()
+        self._state_cache.apply_patch(host, {
+            "n_pauses": n,
+            "last_pause_age_s": 0,
+            "_last_pause_at": now_iso,
+            "_last_event_at": now_iso,
+        })
+
+    def _state_apply_poll(self, host: str, payload: dict) -> None:
+        # Active poll set with TTL — Phase D tick expires it after
+        # 60 s of no fresh poll event.
+        self._state_cache.apply_patch(host, {
+            "active_poll": {
+                "title": payload.get("title") or "",
+                "poll_id": payload.get("poll_id"),
+                "fresh_age_s": 0,
+            },
+            "_active_poll_at": _now_iso(),
+            "_last_event_at": _now_iso(),
+        })
+
+    def _state_apply_battle_begin(self, host: str, payload: dict) -> None:
+        match = {
+            "match_id": payload.get("match_id"),
+            "battle_id": payload.get("battle_id"),
+            "countdown_s": payload.get("countdown_s"),
+            "opponents": payload.get("opponents") or [],
+        }
+        self._state_cache.apply_patch(host, {
+            "active_match": match,
+            "_last_event_at": _now_iso(),
+        })
+
+    def _state_apply_battle_progress(
+        self, host: str, payload: dict,
+    ) -> None:
+        # Replace `opponents` wholesale (list-replace rule). Other
+        # active_match fields like match_id / battle_id stay put via
+        # deep-merge.
+        opps = payload.get("opponents")
+        if not opps:
+            return
+        self._state_cache.apply_patch(host, {
+            "active_match": {"opponents": opps},
+            "_last_event_at": _now_iso(),
+        })
+
+    def _state_apply_battle_end(self, host: str) -> None:
+        # `active_match: None` — deep-merge replaces.
+        self._state_cache.apply_patch(host, {
+            "active_match": None,
+            "_last_event_at": _now_iso(),
+        })
+
+    def _state_apply_viewer_count(
+        self, host: str, payload: dict,
+    ) -> None:
+        viewer_count = payload.get("viewer_count")
+        if viewer_count is None:
+            return
+        cached = self._state_cache.get(host)
+        current = cached[1] if cached else {}
+        history = list(current.get("viewer_history") or [])
+        history.append(int(viewer_count))
+        if len(history) > 30:
+            history = history[-30:]
+        self._state_cache.apply_patch(host, {
+            "viewer_count": int(viewer_count),
+            "viewer_history": history,
+            "_last_event_at": _now_iso(),
+        })
+
+    def _state_apply_comment(
+        self, host: str, payload: dict, viewer: Any,
+    ) -> None:
+        cached = self._state_cache.get(host)
+        current = cached[1] if cached else {}
+        stats = current.get("session_stats") or {}
+        commenter_ids = set(current.get("_commenter_ids") or [])
+        user_id = _user_id_from_viewer_or_payload(viewer, payload)
+        if user_id is not None:
+            commenter_ids.add(user_id)
+        n_comments = (stats.get("n_comments") or 0) + 1
+        now_iso = _now_iso()
+        self._state_cache.apply_patch(host, {
+            "session_stats": {
+                "n_comments": n_comments,
+                "n_unique_commenters": len(commenter_ids),
+            },
+            "last_comment_age_s": 0,
+            "_commenter_ids": sorted(commenter_ids),
+            "_last_comment_at": now_iso,
+            "_last_event_at": now_iso,
+        })
+
+    def _state_apply_gift(
+        self,
+        s,
+        host: str,
+        payload: dict,
+        viewer: Any,
+    ) -> None:
+        """The big one — diamonds + top_gifters + unique gifters +
+        first-timer detection."""
+        dc = int(payload.get("diamond_count") or 0)
+        rc = int(payload.get("repeat_count") or 1)
+        value = max(0, dc * rc)
+        if value == 0:
+            # Diamondless gift (free-promo envelope, etc.) — skip
+            # the heavy book-keeping; only bump the last-event clock.
+            self._state_cache.apply_patch(host, {
+                "_last_event_at": _now_iso(),
+            })
+            return
+
+        user_id = _user_id_from_viewer_or_payload(viewer, payload)
+        cached = self._state_cache.get(host)
+        current = cached[1] if cached else {}
+
+        gifter_totals = dict(current.get("_gifter_totals") or {})
+        if user_id is not None:
+            key = str(user_id)
+            gifter_totals[key] = (gifter_totals.get(key) or 0) + value
+        # Bounded growth: cap at 10k entries, evict smallest. A
+        # gifter below the bottom-10k cap by definition never reaches
+        # top-3 so eviction is correctness-safe.
+        if len(gifter_totals) > 10_000:
+            keep = sorted(
+                gifter_totals.items(), key=lambda kv: -kv[1],
+            )[:10_000]
+            gifter_totals = dict(keep)
+
+        # Recompute top-3 from gifter_totals + viewer-name lookups
+        # (we fetch nickname/avatar lazily from tiktok_viewers).
+        top3_ids = sorted(
+            gifter_totals.items(), key=lambda kv: -kv[1],
+        )[:3]
+        top_gifters = self._lookup_top_gifters(s, top3_ids)
+
+        # n_unique_gifters: distinct gifters this session.
+        n_unique = len(gifter_totals)
+
+        # n_first_time_gifters: cross-session check against
+        # `tiktok_user_host_summary`. The upsert already ran in
+        # `record_event` before this hook fires, so a freshly-inserted
+        # row has `first_seen_at = NOW()` which is >= live_started_at.
+        live_started_at = current.get("live_started_at")
+        n_first_time = current.get("n_first_time_gifters") or 0
+        if user_id is not None and live_started_at:
+            try:
+                row = s.execute(text(
+                    "SELECT first_seen_at FROM tiktok_user_host_summary "
+                    "WHERE user_id = :u AND host_unique_id = :h"
+                ), {"u": user_id, "h": host}).first()
+                first_seen = row[0] if row else None
+                if first_seen is not None and _iso_to_epoch(
+                    live_started_at
+                ) <= _dt_to_epoch(first_seen):
+                    # Only increment when this is the FIRST gift for
+                    # this user this session. Track in aux state.
+                    prior_gifters = set(
+                        current.get("_first_time_user_ids") or []
+                    )
+                    if user_id not in prior_gifters:
+                        prior_gifters.add(user_id)
+                        n_first_time = len(prior_gifters)
+                        # Will be merged below via the aux patch.
+                        cached_first_time_ids = sorted(prior_gifters)
+                    else:
+                        cached_first_time_ids = None
+                else:
+                    cached_first_time_ids = None
+            except Exception:
+                logger.debug(
+                    "first-timer lookup failed for %s/%s",
+                    user_id, host, exc_info=True,
+                )
+                cached_first_time_ids = None
+        else:
+            cached_first_time_ids = None
+
+        diamonds_session = (current.get("diamonds_session") or 0) + value
+        stats = current.get("session_stats") or {}
+        n_gifts = (stats.get("n_gifts") or 0) + 1
+        largest = max(stats.get("largest_gift_diamonds") or 0, value)
+        now_iso = _now_iso()
+
+        patch: dict[str, Any] = {
+            "diamonds_session": diamonds_session,
+            "session_stats": {
+                "n_gifts": n_gifts,
+                "largest_gift_diamonds": largest,
+            },
+            "top_gifters": top_gifters,
+            "n_unique_gifters": n_unique,
+            "n_first_time_gifters": n_first_time,
+            "last_gift_age_s": 0,
+            "_gifter_totals": gifter_totals,
+            "_last_gift_at": now_iso,
+            "_last_event_at": now_iso,
+        }
+        if cached_first_time_ids is not None:
+            patch["_first_time_user_ids"] = cached_first_time_ids
+
+        self._state_cache.apply_patch(host, patch)
+
+    def _state_apply_live_started(
+        self, host: str, payload: dict,
+    ) -> None:
+        """Synthesized event fired by the listener when it first sees
+        a room_id for this host. Resets all session-scoped fields.
+
+        Reset semantics: dict-valued fields use `None` to clear (not
+        `{}`) because deep-merge recurses into dict-dict pairs without
+        clearing keys — `target = {a:1}, patch = {}` deep-merges to
+        `{a:1}`, NOT `{}`. The downstream readers all treat `None`
+        and an empty container as equivalent via `or {}` / `or []`.
+        """
+        room_id = payload.get("room_id") or payload.get("active_room_id")
+        now_iso = _now_iso()
+        self._state_cache.apply_patch(host, {
+            "active_room_id": str(room_id) if room_id else None,
+            "live_started_at": now_iso,
+            "diamonds_session": 0,
+            # session_stats: every key listed gets reset via merge.
+            # Any operator-added key here will land at 0 on the next
+            # live_started — explicit allowlist, not implicit wipe.
+            "session_stats": {
+                "n_comments": 0, "n_gifts": 0, "n_likes": 0,
+                "n_joins": 0, "n_follows": 0, "n_shares": 0,
+                "n_unique_commenters": 0,
+                "largest_gift_diamonds": 0,
+            },
+            "top_gifters": [],
+            "n_unique_gifters": 0,
+            "n_first_time_gifters": 0,
+            "n_envelopes_session": 0,
+            "envelope_diamonds_session": 0,
+            "n_pauses": 0,
+            "viewer_count": payload.get("viewer_count"),
+            "viewer_history": [],
+            "active_match": None,
+            "active_poll": None,
+            "last_gift_age_s": None,
+            "last_comment_age_s": None,
+            "last_pause_age_s": None,
+            # Aux state reset. `_gifter_totals` is a dict — use None to
+            # clear it (see docstring above for why `{}` doesn't work).
+            "_gifter_totals": None,
+            "_commenter_ids": [],
+            "_first_time_user_ids": [],
+            "_last_event_at": now_iso,
+            "_last_gift_at": None,
+            "_last_comment_at": None,
+            "_last_pause_at": None,
+            "_active_poll_at": None,
+        })
+
+    def _state_apply_live_ended(
+        self, host: str, payload: dict,
+    ) -> None:
+        """Synthesized event fired by the listener on disconnect /
+        timeout. Move the just-finished session into
+        `last_broadcasts[0]` (frontend reads only `[0]`) and clear
+        session-scoped fields."""
+        cached = self._state_cache.get(host)
+        current = cached[1] if cached else {}
+        snapshot = {
+            "room_id": current.get("active_room_id"),
+            "started_at": current.get("live_started_at"),
+            "ended_at": _now_iso(),
+            "duration_min": payload.get("duration_min"),
+            "diamonds": current.get("diamonds_session") or 0,
+            "n_gifts": (current.get("session_stats") or {}).get("n_gifts") or 0,
+            "n_comments": (current.get("session_stats") or {}).get("n_comments") or 0,
+            "peak_viewers": payload.get("peak_viewers"),
+        }
+        # Dict-valued fields use `None` to clear (deep-merge limitation
+        # — see `_state_apply_live_started`). `last_broadcasts` stays
+        # populated with the just-archived session.
+        self._state_cache.apply_patch(host, {
+            "active_room_id": None,
+            "live_started_at": None,
+            "diamonds_session": 0,
+            "session_stats": None,
+            "top_gifters": [],
+            "n_unique_gifters": 0,
+            "n_first_time_gifters": 0,
+            "n_envelopes_session": 0,
+            "envelope_diamonds_session": 0,
+            "n_pauses": 0,
+            "viewer_count": None,
+            "viewer_history": [],
+            "active_match": None,
+            "active_poll": None,
+            "last_broadcasts": [snapshot],
+            "_gifter_totals": None,
+            "_commenter_ids": [],
+            "_first_time_user_ids": [],
+            "_last_event_at": _now_iso(),
+        })
+
+    def _lookup_top_gifters(
+        self,
+        s,
+        ranked: list[tuple[str, int]],
+    ) -> list[dict[str, Any]]:
+        """Resolve `(user_id, diamonds)` tuples into the full top-
+        gifter row shape expected by `TikTokLiveSummary.top_gifters`
+        — nickname, avatar_url, gifts count.
+
+        Cheap: one `WHERE user_id = ANY(:ids)` query into
+        `tiktok_viewers`, plus we synthesize `gifts=1` (Phase B
+        doesn't track per-gifter gift counts; this is a known
+        small deviation from the SQL output and is the only field
+        the parity oracle will report as different)."""
+        if not ranked:
+            return []
+        try:
+            user_ids = [int(uid) for uid, _ in ranked]
+        except (TypeError, ValueError):
+            return []
+        names_by_id: dict[int, tuple[str | None, str | None]] = {}
+        try:
+            rows = s.execute(text(
+                "SELECT user_id, nickname, avatar_url "
+                "FROM tiktok_viewers "
+                "WHERE user_id = ANY(:ids)"
+            ), {"ids": user_ids}).all()
+            for uid, nick, avatar in rows:
+                names_by_id[int(uid)] = (nick, avatar)
+        except Exception:
+            logger.debug(
+                "top-gifter viewer lookup failed", exc_info=True,
+            )
+        out: list[dict[str, Any]] = []
+        for uid_str, diamonds in ranked:
+            try:
+                uid = int(uid_str)
+            except (TypeError, ValueError):
+                continue
+            nick, avatar = names_by_id.get(uid, (None, None))
+            out.append({
+                "user_id": str(uid),
+                "unique_id": None,
+                "nickname": nick,
+                "avatar_url": avatar,
+                "diamonds": diamonds,
+                "gifts": 1,
+            })
+        return out
 
     def list_events(
         self,

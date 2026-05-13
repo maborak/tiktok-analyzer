@@ -343,6 +343,82 @@ async def test_subscribe_independent_channels(
 
 
 @pytest.mark.asyncio
+async def test_underscore_prefixed_keys_stay_in_cache_but_not_on_wire(
+    cache: TikTokStateCachePort,
+) -> None:
+    """Aux state (keys prefixed with `_`) is stored in the cache so
+    the persist-path layer can use it for the next patch computation,
+    but is stripped from the published delta so subscribers never see
+    it. Cache itself keeps the full state including aux."""
+    received: list[dict[str, Any]] = []
+
+    async def consume() -> None:
+        async for delta in cache.subscribe(CHANNEL_ADMIN):
+            received.append(delta)
+            if len(received) >= 1:
+                return
+
+    task = asyncio.create_task(consume())
+    await asyncio.sleep(0.1)
+
+    cache.apply_patch("h", {
+        "diamonds_session": 100,
+        "_gifter_totals": {"42": 100, "99": 50},
+        "_last_gift_at": "2026-05-13T17:00:00Z",
+    })
+
+    await asyncio.wait_for(task, timeout=5.0)
+
+    # Wire: published patch has the aux keys stripped.
+    assert received[0]["patch"] == {"diamonds_session": 100}
+
+    # Cache: full state including aux survives.
+    _, data = cache.get("h")  # type: ignore[misc]
+    assert data == {
+        "diamonds_session": 100,
+        "_gifter_totals": {"42": 100, "99": 50},
+        "_last_gift_at": "2026-05-13T17:00:00Z",
+    }
+
+
+@pytest.mark.asyncio
+async def test_aux_only_patch_does_not_publish(
+    cache: TikTokStateCachePort,
+) -> None:
+    """A patch containing ONLY `_*` keys still updates the cache and
+    bumps version, but produces no publish (no subscriber-visible
+    payload). The version gap on subscribers would trigger a
+    snapshot request, which is the correct recovery."""
+    received: list[dict[str, Any]] = []
+    sub_done = asyncio.Event()
+
+    async def consume() -> None:
+        try:
+            async for delta in cache.subscribe(CHANNEL_ADMIN):
+                received.append(delta)
+                if len(received) >= 1:
+                    return
+        finally:
+            sub_done.set()
+
+    task = asyncio.create_task(consume())
+    await asyncio.sleep(0.1)
+
+    # Aux-only patch: cache + version bump, NO publish.
+    v = cache.apply_patch("h", {"_internal": 42})
+    assert v == 1
+
+    # Followed by a real patch — subscriber sees only this one,
+    # at version 2 (gap from 0→2 because v=1 was aux-only silent).
+    cache.apply_patch("h", {"diamonds_session": 10})
+
+    await asyncio.wait_for(task, timeout=5.0)
+    assert len(received) == 1
+    assert received[0]["version"] == 2
+    assert received[0]["patch"] == {"diamonds_session": 10}
+
+
+@pytest.mark.asyncio
 async def test_oracle_apply_100_patches(
     cache: TikTokStateCachePort,
 ) -> None:

@@ -101,6 +101,54 @@ from utils.database.schema_validation import validate_database_schema
 # Removed display_command_args function - now using display_main_params
 
 
+def _build_tiktok_state_cache(*, mode: str, ws_state_push: str):
+    """Phase 9B factory for the per-host state cache.
+
+    - `ws_state_push` in {`off` | `shadow` | `on`}; only `shadow`/`on`
+      instantiate a cache. Default `off` means zero behavior change.
+    - `mode` in {`in_process` | `worker`} picks the backing store.
+      In-process: a Python dict + Lock (no Redis dep). Worker mode:
+      Redis (shared between the listener process and the API workers).
+
+    The `public_sanitizer` constructor argument is left `None` here
+    and wired up after the `TikTokService` is built — the sanitizer
+    is the service's `sanitize_public_patch` method which can't
+    exist before the service does.
+    """
+    if ws_state_push not in ("shadow", "on"):
+        return None
+    try:
+        if mode == "worker":
+            import redis as _redis
+            from adapters.tiktok_state_cache_redis import TikTokStateCacheRedis
+            from utils.redis_client import get_redis
+            url = CONFIG.get("REDIS_URL") or ""
+            if not url:
+                logger.warning(
+                    "ws_state_push=%s requested but PHOVEU_REDIS_SERVER "
+                    "is empty — falling back to in-process cache. "
+                    "Worker mode without Redis is unsupported in prod.",
+                    ws_state_push,
+                )
+            else:
+                sync_client = _redis.from_url(url, decode_responses=False)
+                return TikTokStateCacheRedis(
+                    sync_client=sync_client,
+                    async_client_getter=get_redis,
+                    public_sanitizer=None,  # wired after service init
+                )
+        # in_process (or worker fallback)
+        from adapters.tiktok_state_cache_inproc import TikTokStateCacheInProc
+        return TikTokStateCacheInProc(public_sanitizer=None)
+    except Exception:
+        logger.exception(
+            "Failed to build state cache (ws_state_push=%s, mode=%s) — "
+            "running with state cache disabled.",
+            ws_state_push, mode,
+        )
+        return None
+
+
 def initialize_services():
     """Initialize all service instances once at startup"""
     global _services, _services_initialized
@@ -348,17 +396,36 @@ def initialize_services():
         _listener_mode = os.getenv(
             "PHOVEU_BACKEND_TIKTOK_LISTENER_MODE", "in_process"
         ).strip().lower()
-        tiktok_persistence = TikTokPersistenceAdapter(auto_init=True)
+        # Phase 9B: per-host state cache for WS-pushed live updates.
+        # off | shadow | on — only `shadow` and `on` instantiate the
+        # cache. Default is `off` so existing deployments see zero
+        # behavior change until the operator opts in.
+        _ws_state_push = os.getenv(
+            "PHOVEU_BACKEND_TIKTOK_WS_STATE_PUSH", "off"
+        ).strip().lower()
+        state_cache = _build_tiktok_state_cache(
+            mode=_listener_mode, ws_state_push=_ws_state_push,
+        )
+        tiktok_persistence = TikTokPersistenceAdapter(
+            auto_init=True, state_cache=state_cache,
+        )
         tiktok_session_factory = TikTokLiveSessionFactory()
         tiktok_service = TikTokService(
             persistence=tiktok_persistence,
             session_factory=tiktok_session_factory,
             passive=(_listener_mode == "worker"),
         )
+        # The state cache adapter takes a public-sanitizer at construction.
+        # Wire it now that the service is built so the sanitizer can use
+        # the service's `_PUBLIC_SUMMARY_FIELDS` allowlist.
+        if state_cache is not None and hasattr(state_cache, "_public_sanitizer"):
+            state_cache._public_sanitizer = tiktok_service.sanitize_public_patch
         logger.info(
-            "✅ TikTok service initialized (mode=%s%s)",
+            "✅ TikTok service initialized (mode=%s%s, ws_state_push=%s%s)",
             _listener_mode,
             " — passive" if _listener_mode == "worker" else "",
+            _ws_state_push,
+            "" if state_cache is None else f" via {type(state_cache).__name__}",
         )
     except Exception as e:
         logger.warning(f"⚠️  TikTok service not available: {e}")

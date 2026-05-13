@@ -132,18 +132,19 @@ class TikTokStateCacheInProc(TikTokStateCachePort):
             self._versions[handle] = new_version
 
         # Fan-out happens outside the state lock — see __init__.
-        # Admin channel always gets the raw delta. Public channel may
-        # get a sanitized + possibly empty patch, in which case we
-        # skip the public publish (the version gap will trigger a
-        # snapshot request on the public client, which is correct).
-        admin_delta = {
-            "host": handle,
-            "version": new_version,
-            "patch": patch,
-        }
-        self._publish(CHANNEL_ADMIN, admin_delta)
+        # Strip internal `_*`-prefixed keys from the PUBLISHED delta —
+        # they're book-keeping the persist path needs in the cache to
+        # compute future patches (e.g. `_gifter_totals` for top-3
+        # recompute) but they have no business landing on the wire.
+        # The cache itself keeps them via the `_deep_merge` above.
+        admin_patch = _strip_internal(patch)
+        if admin_patch:
+            self._publish(
+                CHANNEL_ADMIN,
+                {"host": handle, "version": new_version, "patch": admin_patch},
+            )
 
-        public_patch = self._sanitize_for_public(patch)
+        public_patch = self._sanitize_for_public(admin_patch)
         if public_patch:
             self._publish(
                 CHANNEL_PUBLIC,
@@ -248,6 +249,20 @@ class TikTokStateCacheInProc(TikTokStateCachePort):
             # subscribers.
             return patch
         return self._public_sanitizer(patch)
+
+
+def _strip_internal(patch: dict[str, Any]) -> dict[str, Any]:
+    """Drop every top-level key starting with `_` from `patch`.
+
+    Convention: persist-path layer stores aux state in cache keys
+    prefixed with `_` (e.g. `_gifter_totals`, `_last_gift_at`). Those
+    keys help the next event's patch computation but are never meant
+    to leave the server. Filter at publish time so subscribers see
+    only the fields they care about. Cache itself keeps them all.
+
+    Single-level strip — we don't descend into nested dicts. By
+    convention, aux state is always top-level."""
+    return {k: v for k, v in patch.items() if not k.startswith("_")}
 
 
 def _deep_merge(target: dict[str, Any], source: dict[str, Any]) -> None:

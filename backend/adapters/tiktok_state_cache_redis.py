@@ -224,15 +224,21 @@ class TikTokStateCacheRedis(TikTokStateCachePort):
 
         # Publish from Python (the Lua script doesn't publish — we
         # need the public sanitizer applied on the Python side).
-        admin_delta = json.dumps(
-            {"host": handle, "version": new_version, "patch": patch}
-        )
-        try:
-            self._sync.publish(_DELTA_CHANNEL_ADMIN, admin_delta)
-        except Exception:
-            logger.exception("state-cache: admin publish failed for %s", handle)
+        # Strip internal `_*`-prefixed keys from the wire payload —
+        # they're aux state the persist-path uses for the NEXT
+        # patch's computation; subscribers don't need them. Cache
+        # itself retains them via the Lua deep-merge above.
+        admin_patch = _strip_internal(patch)
+        if admin_patch:
+            admin_delta = json.dumps(
+                {"host": handle, "version": new_version, "patch": admin_patch}
+            )
+            try:
+                self._sync.publish(_DELTA_CHANNEL_ADMIN, admin_delta)
+            except Exception:
+                logger.exception("state-cache: admin publish failed for %s", handle)
 
-        public_patch = self._sanitize_for_public(patch)
+        public_patch = self._sanitize_for_public(admin_patch)
         if public_patch:
             public_delta = json.dumps(
                 {"host": handle, "version": new_version, "patch": public_patch}
@@ -320,3 +326,11 @@ class TikTokStateCacheRedis(TikTokStateCachePort):
         if self._public_sanitizer is None:
             return patch
         return self._public_sanitizer(copy.deepcopy(patch))
+
+
+def _strip_internal(patch: dict[str, Any]) -> dict[str, Any]:
+    """Drop every top-level key starting with `_` from `patch`.
+    See the in-process adapter for the full rationale — these are
+    persist-path aux fields (e.g. `_gifter_totals`) that the cache
+    keeps but the wire never carries."""
+    return {k: v for k, v in patch.items() if not k.startswith("_")}

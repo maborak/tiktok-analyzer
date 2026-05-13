@@ -2708,6 +2708,27 @@ class TikTokService:
     # stringify on the wire (the admin route does the same).
     _BIGINT_SUBSCRIPTION_KEYS = ("current_room_id",)
 
+    def sanitize_public_patch(self, patch: dict[str, Any]) -> dict[str, Any]:
+        """Phase 9B: filter a state-cache delta patch for publication
+        on the public WS channel. Same allowlist + last_broadcasts
+        slice the `/public/tiktok/lives` REST endpoint already
+        applies, so subscribers and pollers see the same shape.
+
+        Injected into the state-cache adapter at boot via
+        `api_main._build_tiktok_state_cache`. The adapter applies
+        this before publishing on `tiktok:lives:delta:public` —
+        admin channel sees the raw delta. Operator-only fields never
+        cross the public WS boundary."""
+        allow = set(self._PUBLIC_SUMMARY_FIELDS)
+        out: dict[str, Any] = {}
+        for k, v in patch.items():
+            if k in allow:
+                if k == "last_broadcasts" and isinstance(v, list):
+                    out[k] = v[:1]
+                else:
+                    out[k] = v
+        return out
+
     @staticmethod
     def _pick(src: Any, allow: tuple[str, ...]) -> dict[str, Any]:
         """Return a fresh dict containing only allowlisted keys from
