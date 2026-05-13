@@ -2050,6 +2050,17 @@ async def ws_events(ws: WebSocket):
     # so a plain dict-of-state is safe (no lock needed).
     state: dict[str, Any] = {"handles": None}
 
+    # Phase 9D: resolve the state cache (if wired). Used by the
+    # delta-subscriber parallel task AND the request-snapshot inbound
+    # control message. `None` when `PHOVEU_BACKEND_TIKTOK_WS_STATE_PUSH=off`
+    # — in that case the WS reduces to its pre-Phase-9 behavior
+    # (event fan-out only, no per-host state deltas, no snapshot path).
+    state_cache = getattr(
+        getattr(tiktok_service, "_persistence", None),
+        "_state_cache",
+        None,
+    ) if tiktok_service is not None else None
+
     async def control_reader() -> None:
         """Reads control messages from the client. Updates `state` in place."""
         try:
@@ -2061,7 +2072,8 @@ async def ws_events(ws: WebSocket):
                     continue
                 if not isinstance(msg, dict):
                     continue
-                if msg.get("type") == "subscribe":
+                mtype = msg.get("type")
+                if mtype == "subscribe":
                     handles = msg.get("handles")
                     if handles is None or handles == "*" or (
                         isinstance(handles, list) and "*" in handles
@@ -2071,6 +2083,52 @@ async def ws_events(ws: WebSocket):
                         state["handles"] = {
                             h.lstrip("@").strip() for h in handles if isinstance(h, str)
                         }
+                elif mtype == "request-snapshot":
+                    # Phase 9D: per-host state snapshot reply for clients
+                    # that detected a `version` gap. One reply frame per
+                    # handle; missing handles get `version=0, data={}` so
+                    # the client always has a baseline.
+                    if state_cache is None:
+                        continue
+                    handles = msg.get("handles") or []
+                    if not isinstance(handles, list):
+                        continue
+                    for h in handles:
+                        if not isinstance(h, str):
+                            continue
+                        norm = h.lstrip("@").strip().lower()
+                        try:
+                            cached = state_cache.get(norm)
+                        except Exception:
+                            logger.exception(
+                                "state-cache.get failed for %s (admin ws)", norm,
+                            )
+                            cached = None
+                        if cached is None:
+                            payload = {
+                                "type": "snapshot",
+                                "host": norm,
+                                "version": 0,
+                                "data": {},
+                            }
+                        else:
+                            version, data = cached
+                            # Strip `_*` aux fields — same convention the
+                            # delta-publish path uses.
+                            public_data = {
+                                k: v for k, v in data.items()
+                                if not k.startswith("_")
+                            }
+                            payload = {
+                                "type": "snapshot",
+                                "host": norm,
+                                "version": version,
+                                "data": public_data,
+                            }
+                        try:
+                            await ws.send_json(payload)
+                        except Exception:
+                            return  # client disconnected mid-reply
         except WebSocketDisconnect:
             return
         except Exception:
@@ -2083,8 +2141,37 @@ async def ws_events(ws: WebSocket):
             return True
         return envelope.get("unique_id") in allowed
 
+    async def state_delta_pump() -> None:
+        """Phase 9D: forwards `tiktok:lives:delta:admin` to the client
+        as `{type:"summary-delta", host, version, patch}`. Applies the
+        same per-handle filter as the event stream — a client that
+        narrowed to `["host_x"]` doesn't get summary deltas for other
+        hosts.
+
+        No-op when no state cache is wired."""
+        if state_cache is None:
+            return
+        try:
+            async for delta in state_cache.subscribe("admin"):
+                if not isinstance(delta, dict):
+                    continue
+                host = delta.get("host", "")
+                allowed = state["handles"]
+                if allowed is not None and host not in allowed:
+                    continue
+                try:
+                    await ws.send_json({"type": "summary-delta", **delta})
+                except Exception:
+                    return  # client disconnected
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("state_delta_pump (admin) failed")
+            return
+
     try:
         reader = asyncio.create_task(control_reader())
+        delta_pump = asyncio.create_task(state_delta_pump())
         try:
             if listener_mode == "worker":
                 await _ws_pump_from_redis(ws, passes_filter)
@@ -2095,11 +2182,12 @@ async def ws_events(ws: WebSocket):
                     return
                 await _ws_pump_from_service(ws, tiktok_service, passes_filter)
         finally:
-            reader.cancel()
-            try:
-                await reader
-            except (asyncio.CancelledError, Exception):
-                pass
+            for t in (reader, delta_pump):
+                t.cancel()
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
     except WebSocketDisconnect:
         pass
     except asyncio.CancelledError:

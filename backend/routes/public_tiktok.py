@@ -442,34 +442,9 @@ async def public_ws_events(ws: WebSocket):
     # ALWAYS applied on top, regardless of what the client sends.
     state: dict[str, Any] = {"handles": None}
 
-    async def control_reader() -> None:
-        """Reads `{"type":"subscribe", "handles":[...]}` control messages.
-        Same shape as the admin WS so the same client helper works."""
-        try:
-            while True:
-                raw = await ws.receive_text()
-                try:
-                    msg = json.loads(raw)
-                except (TypeError, ValueError):
-                    continue
-                if not isinstance(msg, dict):
-                    continue
-                if msg.get("type") == "subscribe":
-                    handles = msg.get("handles")
-                    if handles is None or handles == "*" or (
-                        isinstance(handles, list) and "*" in handles
-                    ):
-                        state["handles"] = None
-                    elif isinstance(handles, list):
-                        state["handles"] = {
-                            h.lstrip("@").strip().lower()
-                            for h in handles
-                            if isinstance(h, str)
-                        }
-        except WebSocketDisconnect:
-            return
-        except Exception:
-            return
+    # Phase 9D extended the reader to also handle `request-snapshot`.
+    # The combined handler `control_reader_public` is defined below
+    # after `state_cache` is resolved — see the comment block there.
 
     def passes_filter(envelope: dict) -> bool:
         """Two-layer check: (1) the envelope's host MUST be in the
@@ -499,8 +474,134 @@ async def public_ws_events(ws: WebSocket):
     # to a shared module would be cleaner but isn't load-bearing.
     from routes.admin.tiktok import _ws_pump_from_service, _ws_pump_from_redis
 
+    # Phase 9D: state cache for delta fan-out + snapshot replies.
+    # Public channel deltas are pre-sanitized by the adapter (via
+    # `service.sanitize_public_patch` injected at construction); we
+    # forward them verbatim. Snapshot replies go through the same
+    # sanitizer here because we read raw cache state directly.
+    state_cache = getattr(
+        getattr(tiktok_service, "_persistence", None), "_state_cache", None,
+    ) if tiktok_service is not None else None
+
+    async def state_delta_pump_public() -> None:
+        """Forwards `tiktok:lives:delta:public` deltas to this client.
+        Channel is pre-sanitized; we still apply the public-handle-set
+        check AND the client-narrowed filter so flipping a host private
+        kills its stream within one event."""
+        if state_cache is None:
+            return
+        try:
+            async for delta in state_cache.subscribe("public"):
+                if not isinstance(delta, dict):
+                    continue
+                host = (delta.get("host") or "").lstrip("@").lower()
+                # Public-set check: same rule as event filtering.
+                if tiktok_service is None:
+                    continue
+                if host not in tiktok_service.get_public_handle_set():
+                    continue
+                # Client-narrowed subscription.
+                allowed = state["handles"]
+                if allowed is not None and host not in allowed:
+                    continue
+                try:
+                    await ws.send_json({"type": "summary-delta", **delta})
+                except Exception:
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("state_delta_pump (public) failed")
+            return
+
+    # Extend the existing reader with `request-snapshot` handling.
+    # The base `control_reader` defined above ONLY handles `subscribe`;
+    # wrap it with our own that also dispatches snapshots and falls
+    # through to the base for everything else.
+    async def control_reader_public() -> None:
+        try:
+            while True:
+                raw = await ws.receive_text()
+                try:
+                    msg = json.loads(raw)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(msg, dict):
+                    continue
+                mtype = msg.get("type")
+                if mtype == "subscribe":
+                    handles = msg.get("handles")
+                    if handles is None or handles == "*" or (
+                        isinstance(handles, list) and "*" in handles
+                    ):
+                        state["handles"] = None
+                    elif isinstance(handles, list):
+                        state["handles"] = {
+                            h.lstrip("@").strip().lower()
+                            for h in handles if isinstance(h, str)
+                        }
+                elif mtype == "request-snapshot":
+                    if state_cache is None or tiktok_service is None:
+                        continue
+                    handles = msg.get("handles") or []
+                    if not isinstance(handles, list):
+                        continue
+                    public_set = tiktok_service.get_public_handle_set()
+                    for h in handles:
+                        if not isinstance(h, str):
+                            continue
+                        norm = h.lstrip("@").strip().lower()
+                        # Public-set check: requests for non-public hosts
+                        # get an empty snapshot (same as "no entry yet")
+                        # — we don't reveal whether a private host exists.
+                        if norm not in public_set:
+                            try:
+                                await ws.send_json({
+                                    "type": "snapshot", "host": norm,
+                                    "version": 0, "data": {},
+                                })
+                            except Exception:
+                                return
+                            continue
+                        try:
+                            cached = state_cache.get(norm)
+                        except Exception:
+                            logger.exception(
+                                "state-cache.get failed for %s (public ws)", norm,
+                            )
+                            cached = None
+                        if cached is None:
+                            payload = {
+                                "type": "snapshot", "host": norm,
+                                "version": 0, "data": {},
+                            }
+                        else:
+                            version, data = cached
+                            # Strip aux + apply public sanitizer so a
+                            # snapshot reply can't leak operator-only
+                            # fields. Mirrors the delta channel's
+                            # pre-publish sanitization.
+                            stripped = {
+                                k: v for k, v in data.items()
+                                if not k.startswith("_")
+                            }
+                            sanitized = tiktok_service.sanitize_public_patch(stripped)
+                            payload = {
+                                "type": "snapshot", "host": norm,
+                                "version": version, "data": sanitized,
+                            }
+                        try:
+                            await ws.send_json(payload)
+                        except Exception:
+                            return
+        except WebSocketDisconnect:
+            return
+        except Exception:
+            return
+
     try:
-        reader = asyncio.create_task(control_reader())
+        reader = asyncio.create_task(control_reader_public())
+        delta_pump = asyncio.create_task(state_delta_pump_public())
         try:
             if listener_mode == "worker":
                 await _ws_pump_from_redis(ws, passes_filter)
@@ -511,11 +612,12 @@ async def public_ws_events(ws: WebSocket):
                     return
                 await _ws_pump_from_service(ws, tiktok_service, passes_filter)
         finally:
-            reader.cancel()
-            try:
-                await reader
-            except (asyncio.CancelledError, Exception):
-                pass
+            for t in (reader, delta_pump):
+                t.cancel()
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
     except WebSocketDisconnect:
         pass
     except asyncio.CancelledError:
