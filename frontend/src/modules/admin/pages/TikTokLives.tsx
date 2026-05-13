@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { lazy, memo, Suspense, useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from '@tanstack/react-router';
 import { Globe, Plus, RefreshCw, RotateCcw, Search, Star, Trash2, Power, PowerOff, Send, Radio, BarChart3, Users, X } from 'lucide-react';
 import toast from 'react-hot-toast';
@@ -13,8 +13,18 @@ import {
   type TikTokLiveSummary,
   type TikTokLivesTotals,
 } from '@admin/services/tiktok';
-import { TikTokAddLiveModal } from '@admin/components/TikTokAddLiveModal';
-import { TikTokGifterDetailModal } from '@admin/components/TikTokGifterDetailModal';
+// Two modals account for ~hundreds of KB of bundle (echarts core +
+// LineChart parses on import in the gifter modal). Both stay closed
+// 99% of the time on the lives list — defer their bundle until the
+// user actually opens one. The Suspense boundary below renders
+// nothing while the chunk loads, which is fine since neither modal
+// is on the first-paint critical path.
+const TikTokAddLiveModal = lazy(() =>
+  import('@admin/components/TikTokAddLiveModal').then((m) => ({ default: m.TikTokAddLiveModal })),
+);
+const TikTokGifterDetailModal = lazy(() =>
+  import('@admin/components/TikTokGifterDetailModal').then((m) => ({ default: m.TikTokGifterDetailModal })),
+);
 import { TikTokCommonGiftersTable } from '@admin/components/TikTokCommonGiftersTable';
 import { TikTokFavoriteGiftersTable } from '@admin/components/TikTokFavoriteGiftersTable';
 import { TikTokRealtimeIndicator } from '@admin/components/TikTokRealtimeIndicator';
@@ -182,7 +192,12 @@ function TikTokLivesBody() {
 
   // ── data ──────────────────────────────────────────────────────────
 
-  const refresh = async () => {
+  // Quick subs-only refresh — used after CRUD operations (add,
+  // delete, toggle, reconnect, public-flip) where we only need to
+  // re-fetch the subscription list to surface the change. The next
+  // `/lives/bundle` poll cycle picks up summary changes naturally.
+  // Cheaper than calling bundle, since summary + totals are heavy.
+  const refresh = useCallback(async () => {
     setLoading(true);
     try {
       const data = await tiktokApi.listLives();
@@ -193,40 +208,51 @@ function TikTokLivesBody() {
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
 
-  useEffect(() => {
-    // Only the `lives` tab renders the subscription table; the other
-    // tabs (worker, common, global, favorites) read their own data
-    // sources and never display `subs`. Without this gate, deep-
-    // linking to `?tab=worker` etc. would still fire `listLives()`
-    // and the summary+totals poll below for data those tabs ignore.
-    if (tab !== 'lives') return;
-    refresh();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab]);
-
-  // Per-host summary + page-level totals. Same tab-scoped gating as
-  // above: the other tabs don't render these and shouldn't pay the
-  // poll cost. `lives/summary` is the single most expensive endpoint
-  // in this page's call graph.
+  // Single bundled fetch — replaces the previous three-call fan-out
+  // (list/summary/totals). On cold mount this is one HTTP round-trip
+  // and one RBAC dependency resolution, vs three of each before.
+  // Structural sharing on `summary` keeps per-host object identity
+  // stable across polls when nothing changed, so `React.memo` on
+  // `SubscriptionCard` can short-circuit unchanged hosts.
   useEffect(() => {
     if (tab !== 'lives') return;
     let cancelled = false;
     const fetchOnce = () => {
-      Promise.all([
-        tiktokApi.livesSummary(),
-        tiktokApi.livesTotals(),
-      ])
-        .then(([s, t]) => {
+      tiktokApi
+        .livesBundle()
+        .then(({ subs: nextSubs, summary: nextSummary, totals: nextTotals }) => {
           if (cancelled) return;
-          setSummary(s);
-          setTotals(t);
+          setSubs(nextSubs);
+          setSummary((prev) => {
+            const next: Record<string, TikTokLiveSummary> = {};
+            let changed = false;
+            for (const [k, v] of Object.entries(nextSummary)) {
+              const prevEntry = prev[k];
+              if (prevEntry && JSON.stringify(prevEntry) === JSON.stringify(v)) {
+                next[k] = prevEntry;
+              } else {
+                next[k] = v;
+                changed = true;
+              }
+            }
+            for (const k of Object.keys(prev)) {
+              if (!(k in next)) {
+                changed = true;
+              }
+            }
+            return changed ? next : prev;
+          });
+          setTotals(nextTotals);
+          setLoading(false);
         })
         .catch(() => {
           /* silent — next tick will retry */
+          setLoading(false);
         });
     };
+    setLoading(true);
     fetchOnce();
     let interval: ReturnType<typeof setInterval> | null = null;
     const start = () => {
@@ -289,7 +315,12 @@ function TikTokLivesBody() {
     setPendingHandle(null);
   };
 
-  const onToggle = async (s: TikTokSubscription) => {
+  // All row handlers are wrapped in `useCallback` and accept the row
+  // directly so the parent never has to spawn a per-card inline arrow.
+  // Combined with `React.memo` on `SubscriptionCard` this is what
+  // stops every 30s poll tick from re-rendering the entire 79-card
+  // grid — only hosts whose summary slice actually changed re-render.
+  const onToggle = useCallback(async (s: TikTokSubscription) => {
     try {
       await tiktokApi.setEnabled(s.unique_id, !s.enabled);
       toast.success(`@${s.unique_id} ${s.enabled ? 'paused' : 'enabled'}`);
@@ -298,9 +329,9 @@ function TikTokLivesBody() {
       console.error(e);
       toast.error('Failed to update');
     }
-  };
+  }, [refresh]);
 
-  const onDelete = async (s: TikTokSubscription) => {
+  const onDelete = useCallback(async (s: TikTokSubscription) => {
     if (!confirm(`Remove subscription for @${s.unique_id}? Historical data is kept.`)) return;
     try {
       await tiktokApi.deleteLive(s.unique_id);
@@ -310,9 +341,9 @@ function TikTokLivesBody() {
       console.error(e);
       toast.error('Failed to remove');
     }
-  };
+  }, [refresh]);
 
-  const onReconnect = async (s: TikTokSubscription) => {
+  const onReconnect = useCallback(async (s: TikTokSubscription) => {
     try {
       await tiktokApi.reconnectLive(s.unique_id);
       toast.success(`Reconnect requested for @${s.unique_id}`);
@@ -324,13 +355,12 @@ function TikTokLivesBody() {
       console.error(e);
       toast.error('Failed to request reconnect');
     }
-  };
+  }, [refresh]);
 
-  // Toggle whether this subscription appears on the public `/` page.
   // Optimistic local flip so the button visual snaps immediately —
   // revert + toast on failure. We don't `refresh()` on success to
   // avoid flicker; the persisted value will surface on the next poll.
-  const onSetPublic = async (s: TikTokSubscription) => {
+  const onSetPublic = useCallback(async (s: TikTokSubscription) => {
     const next = !s.is_public;
     setSubs((prev) =>
       prev.map((row) =>
@@ -352,7 +382,7 @@ function TikTokLivesBody() {
         ),
       );
     }
-  };
+  }, []);
 
   const onElectronLogin = async () => {
     if (!window.api?.login) return;
@@ -366,7 +396,7 @@ function TikTokLivesBody() {
     }
   };
 
-  const onElectronSend = async (handle: string, text: string) => {
+  const onElectronSend = useCallback(async (handle: string, text: string) => {
     if (!window.api?.navigateToLive || !window.api?.sendComment) return;
     try {
       await window.api.navigateToLive(handle);
@@ -377,7 +407,7 @@ function TikTokLivesBody() {
       console.error(e);
       toast.error('Send failed');
     }
-  };
+  }, []);
 
   // ── render ────────────────────────────────────────────────────────
 
@@ -570,11 +600,11 @@ function TikTokLivesBody() {
                 sub={s}
                 electron={electron}
                 summary={s.unique_id ? summary[s.unique_id.toLowerCase()] : undefined}
-                onToggle={() => onToggle(s)}
-                onDelete={() => onDelete(s)}
-                onReconnect={() => onReconnect(s)}
-                onSetPublic={() => onSetPublic(s)}
-                onSend={(text) => onElectronSend(s.unique_id, text)}
+                onToggle={onToggle}
+                onDelete={onDelete}
+                onReconnect={onReconnect}
+                onSetPublic={onSetPublic}
+                onSend={onElectronSend}
                 onSelectGifter={setSelectedGifter}
               />
             ))}
@@ -585,29 +615,37 @@ function TikTokLivesBody() {
         </div>
       )}
 
-      {/* Page-level modals — the Add input above triggers
-          `pendingHandle`, the gifter chips inside SubscriptionCard
-          trigger `selectedGifter`. Both stay mounted but render
-          nothing when closed. */}
-      <TikTokAddLiveModal
-        isOpen={pendingHandle !== null}
-        handle={pendingHandle ?? ''}
-        onCancel={onCancelAdd}
-        onConfirm={onConfirmAdd}
-      />
-
-      <TikTokGifterDetailModal
-        isOpen={selectedGifter !== null}
-        onClose={() => setSelectedGifter(null)}
-        userId={selectedGifter?.userId ?? null}
-        uniqueId={selectedGifter?.uniqueId ?? null}
-        nickname={selectedGifter?.nickname ?? null}
-        diamondsTotal={selectedGifter?.diamonds ?? 0}
-        giftsCount={selectedGifter?.gifts ?? 0}
-        roomId={selectedGifter?.roomId ?? null}
-        currentHandle={selectedGifter?.currentHandle}
-        defaultTab="current"
-      />
+      {/* Page-level modals — code-split via React.lazy. Each modal is
+          mounted only when its trigger flips truthy, which means the
+          bundle for the echarts-heavy gifter modal is never fetched
+          on a session that doesn't open one. Suspense fallback is
+          null because both are interactive overlays — there's no
+          point flashing a spinner; the chunk arrives faster than the
+          user can perceive the trigger click. */}
+      <Suspense fallback={null}>
+        {pendingHandle !== null && (
+          <TikTokAddLiveModal
+            isOpen
+            handle={pendingHandle}
+            onCancel={onCancelAdd}
+            onConfirm={onConfirmAdd}
+          />
+        )}
+        {selectedGifter !== null && (
+          <TikTokGifterDetailModal
+            isOpen
+            onClose={() => setSelectedGifter(null)}
+            userId={selectedGifter.userId ?? null}
+            uniqueId={selectedGifter.uniqueId ?? null}
+            nickname={selectedGifter.nickname ?? null}
+            diamondsTotal={selectedGifter.diamonds ?? 0}
+            giftsCount={selectedGifter.gifts ?? 0}
+            roomId={selectedGifter.roomId ?? null}
+            currentHandle={selectedGifter.currentHandle}
+            defaultTab="current"
+          />
+        )}
+      </Suspense>
     </PageShell>
   );
 }
@@ -669,14 +707,18 @@ interface RowProps {
    *  `onSelectGifter` when provided — the gifter modal sums public
    *  signals only and is fine to expose. */
   readOnly?: boolean;
-  onToggle?: () => void;
-  onDelete?: () => void;
-  onReconnect?: () => void;
+  /** Action handlers take the row's subscription / handle directly so
+   *  the parent can pass stable function refs (no per-card inline
+   *  arrows). Without this, every parent render would synthesize five
+   *  fresh closures per card, defeating `React.memo`. */
+  onToggle?: (s: TikTokSubscription) => void;
+  onDelete?: (s: TikTokSubscription) => void;
+  onReconnect?: (s: TikTokSubscription) => void;
   /** Flips the subscription's `is_public` flag — controls whether this
    *  host's sanitized scoreboard shows up on the unauthenticated home
    *  page. Optimistic update happens at the page level. */
-  onSetPublic?: () => void;
-  onSend?: (text: string) => void;
+  onSetPublic?: (s: TikTokSubscription) => void;
+  onSend?: (handle: string, text: string) => void;
   /** Lifts a click on a top-gifter chip up to the page-level modal
    *  state. Optional so the card stays usable in contexts where no
    *  modal host is available. */
@@ -693,7 +735,7 @@ interface RowProps {
  *  Exported so the unauthenticated public page (`/`) can render the
  *  identical visual with `readOnly` — same scoreboard, same
  *  sparkline / heatmap / chips, just no admin-side actions. */
-export function SubscriptionCard({ sub, electron, summary, readOnly, onToggle, onDelete, onReconnect, onSetPublic, onSend, onSelectGifter }: RowProps) {
+function SubscriptionCardImpl({ sub, electron, summary, readOnly, onToggle, onDelete, onReconnect, onSetPublic, onSend, onSelectGifter }: RowProps) {
   const [composer, setComposer] = useState('');
   const [sending, setSending] = useState(false);
   const display = sub.nickname || sub.unique_id;
@@ -937,7 +979,7 @@ export function SubscriptionCard({ sub, electron, summary, readOnly, onToggle, o
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && composer.trim() && !sending) {
                   setSending(true);
-                  onSend(composer);
+                  onSend(sub.unique_id, composer);
                   setComposer('');
                   setSending(false);
                 }
@@ -950,7 +992,7 @@ export function SubscriptionCard({ sub, electron, summary, readOnly, onToggle, o
               className="min-w-[44px] min-h-[44px]"
               onClick={() => {
                 setSending(true);
-                onSend(composer);
+                onSend(sub.unique_id, composer);
                 setComposer('');
                 setSending(false);
               }}
@@ -972,7 +1014,7 @@ export function SubscriptionCard({ sub, electron, summary, readOnly, onToggle, o
           <Button
             variant="ghost"
             size="sm"
-            onClick={onSetPublic}
+            onClick={() => onSetPublic?.(sub)}
             aria-pressed={!!sub.is_public}
             className={
               'min-w-[44px] min-h-[44px] ' +
@@ -992,7 +1034,7 @@ export function SubscriptionCard({ sub, electron, summary, readOnly, onToggle, o
           <Button
             variant="ghost"
             size="sm"
-            onClick={onReconnect}
+            onClick={() => onReconnect?.(sub)}
             disabled={!sub.enabled}
             className="min-w-[44px] min-h-[44px]"
             title={
@@ -1007,7 +1049,7 @@ export function SubscriptionCard({ sub, electron, summary, readOnly, onToggle, o
           <Button
             variant="ghost"
             size="sm"
-            onClick={onToggle}
+            onClick={() => onToggle?.(sub)}
             className="min-w-[44px] min-h-[44px]"
             title={sub.enabled ? 'Disable' : 'Enable'}
             aria-label={sub.enabled ? 'Disable' : 'Enable'}
@@ -1017,7 +1059,7 @@ export function SubscriptionCard({ sub, electron, summary, readOnly, onToggle, o
           <Button
             variant="danger"
             size="sm"
-            onClick={onDelete}
+            onClick={() => onDelete?.(sub)}
             className="min-w-[44px] min-h-[44px]"
             title="Delete"
             aria-label="Delete"
@@ -1030,6 +1072,13 @@ export function SubscriptionCard({ sub, electron, summary, readOnly, onToggle, o
     </div>
   );
 }
+
+/** Memoized card. Re-renders only when `sub`, `summary`, or one of
+ *  the handler refs changes. The parent does structural sharing on
+ *  `summary` (preserving per-host object identity when JSON matches)
+ *  and `useCallback`-wraps the handlers, so a steady-state 30s poll
+ *  re-renders only the cards whose host data actually changed. */
+export const SubscriptionCard = memo(SubscriptionCardImpl);
 
 
 // ─── Page-level totals strip ───────────────────────────────────────
@@ -1386,88 +1435,152 @@ function ActivityStrip({
       {/* Audience composition (gifters · new) is rendered inline
           inside the scoreboard grid above. */}
 
-      {/* Activity row — 60-min diamond sparkline + 7-day heatmap
-          side-by-side. Each renders only when it has data so quiet
-          cards stay quiet. */}
+      {/* Activity row — 60-min diamond sparkline + 7-day heatmap in
+          a 50/50 split. When one side has no data we still hold its
+          slot with a dashed "no activity" placeholder so the row
+          stays visually balanced. */}
       {(hourly.some((v) => v > 0) || (summary?.week_calendar?.some((d) => d.diamonds > 0 || d.rooms > 0))) && (
-        <div className="flex items-center gap-3 flex-wrap">
-          {hourly.some((v) => v > 0) && <Sparkline values={hourly} />}
-          {summary?.week_calendar && summary.week_calendar.some((d) => d.diamonds > 0 || d.rooms > 0) && (
-            <WeekHeatmap days={summary.week_calendar} />
-          )}
+        <div className="grid grid-cols-2 gap-3 items-center">
+          <div className="min-w-0">
+            {hourly.some((v) => v > 0) ? (
+              <Sparkline values={hourly} />
+            ) : (
+              <NoActivityLine label="60m" />
+            )}
+          </div>
+          <div className="min-w-0 flex justify-start">
+            {summary?.week_calendar && summary.week_calendar.some((d) => d.diamonds > 0 || d.rooms > 0) ? (
+              <WeekHeatmap days={summary.week_calendar} />
+            ) : (
+              <NoActivityLine label="7d" />
+            )}
+          </div>
         </div>
       )}
     </div>
   );
 }
 
-/** 7-cell mini-heatmap of the host's last 7 days of activity.
- *  Each cell is colored by diamond intensity (vs the max in this
- *  strip — relative scale, so a quiet creator's busy day still
- *  looks dark and their dead day looks empty). Hover shows full
- *  details (date, broadcasts, duration, diamonds) in a native title
- *  tooltip — same level of detail as the live-detail calendar. */
+/** Last-7-days mini-strip: 7 boxes in a single row, one per day,
+ *  oldest → newest (today on the right). Each box shows its weekday
+ *  initial inside and is tinted by diamond intensity on the same
+ *  sky-blue ramp the live calendar + profile heatmap use. */
 function WeekHeatmap({ days }: { days: NonNullable<TikTokLiveSummary['week_calendar']> }) {
-  // Find max diamonds for relative intensity scaling. Falls back to
-  // rooms-count when no diamond activity (so cards with broadcasts
-  // but no gifts still get a visible mark).
   const maxDiamonds = Math.max(0, ...days.map((d) => d.diamonds));
-  const maxRooms = Math.max(0, ...days.map((d) => d.rooms));
   const total = days.reduce((acc, d) => acc + d.diamonds, 0);
 
-  const todayMidnight = new Date();
-  todayMidnight.setHours(0, 0, 0, 0);
+  // Anchor "today" as a fake-UTC Date (date bag — never .toISOString'd).
+  const now = new Date();
+  const todayAnchor = new Date(Date.UTC(
+    now.getFullYear(), now.getMonth(), now.getDate(),
+  ));
 
-  const dayLabel = (offset: number): string => {
-    // offset 0 = oldest (6 days ago), offset 6 = today.
-    const daysAgo = days.length - 1 - offset;
-    const d = new Date(todayMidnight.getTime() - daysAgo * 86_400_000);
-    return d.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
+  const LEVEL_COLOR = [
+    'bg-gray-100 dark:bg-white/[0.04]',
+    'bg-sky-100 dark:bg-sky-500/[0.20]',
+    'bg-sky-300 dark:bg-sky-500/[0.45]',
+    'bg-sky-500 dark:bg-sky-500/[0.75]',
+    'bg-sky-700 dark:bg-sky-400',
+  ];
+  // Borders are tinted one notch darker than the fill so the outline
+  // reinforces the cell's intensity instead of overprinting it with a
+  // mismatched gray. Empty cells get a very soft gray edge; filled
+  // cells get a darker shade of the same sky family.
+  const LEVEL_BORDER = [
+    'ring-gray-200 dark:ring-white/10',
+    'ring-sky-300/70 dark:ring-sky-400/30',
+    'ring-sky-500/70 dark:ring-sky-300/40',
+    'ring-sky-700/70 dark:ring-sky-200/50',
+    'ring-sky-900/60 dark:ring-sky-100/60',
+  ];
+  const levelFor = (d: number): number => {
+    if (d <= 0 || maxDiamonds <= 0) return 0;
+    const ratio = Math.sqrt(d / maxDiamonds);
+    if (ratio >= 0.8) return 4;
+    if (ratio >= 0.55) return 3;
+    if (ratio >= 0.3) return 2;
+    return 1;
   };
+
+  const WEEKDAY_LETTER = ['S', 'M', 'T', 'W', 'T', 'F', 'S'];
+
+  // Pre-compute weekday letter + level for each day so the header
+  // row and cell row stay in lockstep.
+  const cells = days.map((d, i) => {
+    const daysAgo = days.length - 1 - i;
+    const date = new Date(todayAnchor);
+    date.setUTCDate(todayAnchor.getUTCDate() - daysAgo);
+    const lvl = levelFor(d.diamonds);
+    const datePart = date.toLocaleDateString(undefined, {
+      weekday: 'short', month: 'short', day: 'numeric',
+    });
+    const hoverTitle =
+      `${datePart}\n` +
+      `${d.rooms} broadcast${d.rooms === 1 ? '' : 's'}\n` +
+      `${fmtDuration(d.duration_min)} streamed\n` +
+      `${d.diamonds.toLocaleString()} 💎`;
+    return {
+      d,
+      lvl,
+      letter: WEEKDAY_LETTER[date.getUTCDay()],
+      hoverTitle,
+    };
+  });
 
   return (
     <div
-      className="flex items-center gap-2"
+      className="inline-block"
       title={`Last 7 days — ${total.toLocaleString()} 💎 total`}
     >
-      <div className="flex items-center gap-0.5">
-        {days.map((d, i) => {
-          // Relative intensity: diamond-first, rooms-fallback. Five
-          // tone steps (none / very low / low / mid / high) mapped
-          // to amber-100 → amber-500 so the strip echoes the
-          // diamond sparkline's color language.
-          let tone = 'bg-gray-100 dark:bg-white/5';
-          if (d.diamonds > 0 && maxDiamonds > 0) {
-            const ratio = d.diamonds / maxDiamonds;
-            if (ratio >= 0.75)      tone = 'bg-amber-500';
-            else if (ratio >= 0.45) tone = 'bg-amber-400';
-            else if (ratio >= 0.2)  tone = 'bg-amber-300';
-            else                    tone = 'bg-amber-200';
-          } else if (d.rooms > 0 && maxRooms > 0) {
-            // Streamed but didn't capture any diamonds — show a
-            // muted slate dot so the cell isn't visually identical
-            // to a zero-activity day.
-            tone = 'bg-slate-300 dark:bg-slate-600';
-          }
-          const datePart = dayLabel(i);
-          const hoverTitle =
-            `${datePart}\n` +
-            `${d.rooms} broadcast${d.rooms === 1 ? '' : 's'}\n` +
-            `${fmtDuration(d.duration_min)} streamed\n` +
-            `${d.diamonds.toLocaleString()} 💎`;
+      <div
+        className="grid gap-x-[2px] gap-y-[2px]"
+        style={{ gridTemplateColumns: 'repeat(7, 2.25rem)' }}
+      >
+        {/* Header row — weekday letter for each day. */}
+        {cells.map((c, i) => (
+          <div
+            key={`h-${i}`}
+            className="text-[8px] font-mono text-gray-500 text-center leading-none"
+          >
+            {c.letter}
+          </div>
+        ))}
+        {/* Cell row — diamond count inside a short square. */}
+        {cells.map((c, i) => {
+          const textTone = c.lvl >= 3
+            ? 'text-sky-50 dark:text-sky-50'
+            : 'text-gray-700';
           return (
             <div
               key={i}
-              className={`w-3 h-3 rounded-sm ${tone}`}
-              title={hoverTitle}
-              aria-label={hoverTitle}
-            />
+              className={
+                `h-6 rounded-sm ring-1 ring-inset ${LEVEL_COLOR[c.lvl]} ${LEVEL_BORDER[c.lvl]} ` +
+                `flex items-center justify-center font-mono leading-none ${textTone}`
+              }
+              title={c.hoverTitle}
+              aria-label={c.hoverTitle}
+            >
+              <span className="text-[9px] tabular-nums">
+                {c.d.diamonds > 0 ? compactCount(c.d.diamonds) : '–'}
+              </span>
+            </div>
           );
         })}
       </div>
-      <span className="text-[9px] font-mono text-gray-500 tabular-nums shrink-0">
-        7d
-      </span>
+    </div>
+  );
+}
+
+/** Dashed placeholder used in the activity row when one of the two
+ *  panels has no data. Keeps the 50/50 row visually balanced and
+ *  signals "checked, nothing to show" rather than collapsing the
+ *  slot (which would leave the populated half visually orphaned). */
+function NoActivityLine({ label }: { label: string }) {
+  return (
+    <div className="flex items-center gap-2 w-full text-[9px] font-mono text-gray-400">
+      <div className="flex-1 border-t border-dashed border-gray-300 dark:border-white/15" />
+      <span className="shrink-0">no activity</span>
+      <span className="shrink-0 tabular-nums">· {label}</span>
     </div>
   );
 }
@@ -1770,7 +1883,7 @@ function Sparkline({ values }: { values: number[] }) {
   const total = values.reduce((a, b) => a + b, 0);
   return (
     <div
-      className="flex items-center gap-2 max-w-[200px]"
+      className="flex items-center gap-2 w-full"
       title={`Last 60 minutes — ${total.toLocaleString()} 💎 total, peak ${max.toLocaleString()}/min`}
     >
       <svg

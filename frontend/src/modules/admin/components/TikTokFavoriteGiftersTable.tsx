@@ -11,7 +11,7 @@
  * Favourites." — first-run discoverability.
  */
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from '@tanstack/react-router';
 import toast from 'react-hot-toast';
 import { ChevronLeft, ChevronRight, Gift, Loader2, MessageSquare, RefreshCw, Search, Star, UserPlus, Users, X } from 'lucide-react';
@@ -22,7 +22,12 @@ import {
   openTikTokWebSocket,
   tiktokApi,
 } from '@admin/services/tiktok';
-import { TikTokGifterDetailModal } from '@admin/components/TikTokGifterDetailModal';
+// Lazy — see TikTokCommonGiftersTable for the same pattern. Keeps
+// the echarts-heavy modal out of the lives-page first-paint bundle.
+const TikTokGifterDetailModal = lazy(() =>
+  import('@admin/components/TikTokGifterDetailModal')
+    .then((m) => ({ default: m.TikTokGifterDetailModal })),
+);
 
 const PAGE_SIZE_OPTIONS = [10, 25, 50, 100] as const;
 const DEFAULT_PAGE_SIZE = 25;
@@ -243,15 +248,19 @@ export function TikTokFavoriteGiftersTable({ refreshKey = 0 }: Props) {
         </ul>
       )}
 
-      <TikTokGifterDetailModal
-        isOpen={selected !== null}
-        userId={selected?.user_id ?? null}
-        nickname={selected?.nickname ?? null}
-        uniqueId={selected?.unique_id ?? null}
-        avatarUrl={selected?.avatar_url ?? null}
-        onClose={() => setSelected(null)}
-        defaultTab="profile"
-      />
+      <Suspense fallback={null}>
+        {selected !== null && (
+          <TikTokGifterDetailModal
+            isOpen
+            userId={selected.user_id ?? null}
+            nickname={selected.nickname ?? null}
+            uniqueId={selected.unique_id ?? null}
+            avatarUrl={selected.avatar_url ?? null}
+            onClose={() => setSelected(null)}
+            defaultTab="profile"
+          />
+        )}
+      </Suspense>
 
       {items.length > 0 && (
         <div className="flex items-center justify-between gap-2 text-xs font-mono text-gray-500">

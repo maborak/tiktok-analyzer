@@ -1,0 +1,21 @@
+{
+  "label": "phase-8-final",
+  "timestamp": "2026-05-13T17:13:12.484861+00:00",
+  "base_url": "http://localhost:9020",
+  "warmup": 2,
+  "cold": {
+    "GET /admin/tiktok/lives/bundle": {
+      "ms": 1439.0,
+      "status": 200,
+      "bytes": 201843
+    }
+  },
+  "warm": {
+    "total_p50_ms": 14.38,
+    "total_p95_ms": 16.1,
+    "total_min_ms": 13.1,
+    "total_max_ms": 16.1,
+    "total_mean_ms": 14.49,
+    "runs": 15
+  }
+}

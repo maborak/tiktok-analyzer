@@ -18,6 +18,8 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from '@tanstack/react-router';
+
+import { TikTokDailyHeatmap30 } from '@admin/components/TikTokDailyHeatmap30';
 import toast from 'react-hot-toast';
 import * as echarts from 'echarts/core';
 import { LineChart } from 'echarts/charts';
@@ -587,30 +589,56 @@ export function TikTokCommonGifterDetailModal({
         </div>
       )}
 
-      {/* Tab bar — only visible once data is loaded so the loading
-          state stays clean. */}
+      {/* Segmented control — same pill-chip style as the
+          "This live / All time" scope switcher in Cross-live, so the
+          deep-analysis section picker reads as "filter the same view"
+          rather than "navigate between pages". Wraps on narrow
+          viewports instead of horizontally scrolling — wrapping keeps
+          the active segment visible without a swipe.
+          `role="tablist"` retained because each segment swaps the
+          panel below; semantically it's still a tabs interaction,
+          just rendered with chip visuals. */}
       {data && (
         <div
-          className="flex items-center gap-1 mb-3 border-b border-gray-200 overflow-x-auto whitespace-nowrap -mx-4 px-4 sm:mx-0 sm:px-0"
+          className="flex flex-wrap items-center gap-1.5 mb-3 text-[11px] font-mono"
           role="tablist"
           aria-label="Deep analysis sections"
         >
           {DEEP_TABS.map((tab) => {
             const active = activeTab === tab.id;
+            // Counters for segments whose data we already know the
+            // size of: hosts (one entry per host the viewer touched)
+            // and comments (aggregate count across rooms). Other
+            // segments don't have a single scalar size — Behavior is
+            // a chart, Network is a graph, Timeline is paginated —
+            // so showing `(N)` would be misleading for them.
+            const count: number | null =
+              tab.id === 'hosts'
+                ? data.totals.host_count
+                : tab.id === 'comments'
+                  ? data.totals.comment_count
+                  : null;
             return (
               <button
                 key={tab.id}
+                type="button"
                 role="tab"
                 aria-selected={active}
                 onClick={() => setActiveTab(tab.id)}
-                className={`shrink-0 inline-flex items-center gap-1.5 px-3 py-2 text-xs font-mono uppercase tracking-wider border-b-2 -mb-px transition-colors ${
-                  active
-                    ? 'border-primary-500 text-primary-700 dark:text-primary-300'
-                    : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
-                }`}
+                className={
+                  'inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full border transition-colors ' +
+                  (active
+                    ? 'bg-primary-100 dark:bg-primary-500/15 text-primary-700 dark:text-primary-300 border-primary-200 dark:border-primary-500/30'
+                    : 'bg-white dark:bg-white/[0.03] text-gray-600 border-gray-200 hover:bg-gray-50')
+                }
               >
                 {tab.icon}
                 {tab.label}
+                {count != null && (
+                  <span className="opacity-70 tabular-nums">
+                    ({count.toLocaleString()})
+                  </span>
+                )}
               </button>
             );
           })}
@@ -630,19 +658,7 @@ export function TikTokCommonGifterDetailModal({
         <ProfileTab data={data} />
       )}
       {data && data.hosts.length > 0 && activeTab === 'timeline' && (
-        <TimelineTab
-          data={data}
-          tz={tz}
-          onPickHour={(dow, hour) => {
-            setNetworkSeed({
-              dow,
-              hour,
-              type: 'gift',
-              hint: `${DOW_LABELS[dow]} ${hour}:00 gifts`,
-            });
-            setActiveTab('network');
-          }}
-        />
+        <TimelineTab data={data} tz={tz} />
       )}
       {data && data.hosts.length > 0 && activeTab === 'hosts' && (
         <HostsTab data={data} userId={userId} />
@@ -2332,13 +2348,9 @@ function HostsTab({
 function TimelineTab({
   data,
   tz,
-  onPickHour,
 }: {
   data: TikTokCommonGifterDetail;
   tz: string;
-  /** Heatmap-cell click handler — passes (dow, hour) up to the modal
-   *  which jumps to the Network tab with a pre-applied filter. */
-  onPickHour?: (dow: number, hour: number) => void;
 }) {
   // Hosts the user has chosen to hide from the three panels. Pure
   // client-side filter — the data is already loaded.
@@ -2398,9 +2410,10 @@ function TimelineTab({
           })}
         </div>
       )}
-      {data.heatmap && data.heatmap.length > 0 && (
-        <HeatmapPanel cells={data.heatmap} onPickHour={onPickHour} />
-      )}
+      <HeatmapPanel
+        dailySeries={filteredSeries ?? null}
+        tz={tz}
+      />
       {filteredSeries && filteredSeries.length > 0 && (
         <DailyStackPanel points={filteredSeries} tz={tz} />
       )}
@@ -2411,173 +2424,43 @@ function TimelineTab({
   );
 }
 
+// Still referenced by the Network tab's hour-band filter chip even
+// after the heatmap grid was retired.
 const DOW_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
 function HeatmapPanel({
-  cells,
-  onPickHour,
+  dailySeries,
+  tz,
 }: {
-  cells: NonNullable<TikTokCommonGifterDetail['heatmap']>;
-  onPickHour?: (dow: number, hour: number) => void;
+  /** Per-host per-day diamond rollup. The panel takes the last 30
+   *  calendar days off the end and renders them as a stacked-bar
+   *  histogram. `null` shows an "no recent activity" message. The
+   *  legacy heatmap (hour × day-of-week) that this component used to
+   *  render was removed in favour of the recency-focused histogram —
+   *  operators kept asking "what did they do recently?" rather than
+   *  "what's their typical weekly rhythm?". */
+  dailySeries: NonNullable<TikTokCommonGifterDetail['daily_series']> | null;
+  tz: string;
 }) {
-  // Index cells by (dow, hour) for quick lookup.
-  const byKey = useMemo(() => {
-    const m = new Map<string, { gifts: number; diamonds: number }>();
-    for (const c of cells) m.set(`${c.dow}:${c.hour}`, c);
-    return m;
-  }, [cells]);
-  const maxDiamonds = useMemo(
-    () => Math.max(0, ...cells.map((c) => c.diamonds)),
-    [cells],
-  );
-
-  // Bucket the diamonds into 5 intensity levels (gray for 0; amber
-  // ramp 1–5). Logarithmic-ish via square root so a few large values
-  // don't wash out the rest.
-  const levelFor = (d: number): number => {
-    if (d <= 0) return 0;
-    if (maxDiamonds <= 0) return 0;
-    const ratio = Math.sqrt(d / maxDiamonds);
-    if (ratio >= 0.85) return 5;
-    if (ratio >= 0.6) return 4;
-    if (ratio >= 0.4) return 3;
-    if (ratio >= 0.2) return 2;
-    return 1;
-  };
-  // Monotonically darker/more-saturated as the level increases. The
-  // dark-mode opacities used to *decrease* between level 4 and 5
-  // because the higher level switched to amber-400 base — that
-  // inverts the gradient. Now both modes step up cleanly.
-  const LEVEL_COLOR = [
-    'bg-gray-100 dark:bg-white/[0.04]',
-    'bg-amber-100 dark:bg-amber-500/[0.20]',
-    'bg-amber-200 dark:bg-amber-500/[0.40]',
-    'bg-amber-300 dark:bg-amber-500/[0.60]',
-    'bg-amber-500 dark:bg-amber-500/[0.80]',
-    'bg-amber-600 dark:bg-amber-400',
-  ];
-
   return (
     <section className="rounded-lg border border-gray-200 bg-white dark:bg-gray-100/[0.05] p-4 shadow-sm">
       <div className="auth-mono-label flex items-center gap-1.5 mb-3">
         <Clock className="w-3.5 h-3.5 text-amber-500" />
-        When do they gift? (hour × day-of-week)
+        When do they gift? · last 30 days
       </div>
-      {/* 7 rows × 24 cols. Each row stretches to fill the section's
-          full width via 24 equal `1fr` columns (`minmax(0, 1fr)` so
-          they shrink uniformly under their content), with the label
-          gutter at `auto`. Cells get tall enough (h-6) to fit the
-          compact diamond count in-cell — no separate tooltip read
-          needed for the headline number. */}
-      <div
-        className="grid gap-[2px] w-full"
-        style={{ gridTemplateColumns: 'auto repeat(24, minmax(0, 1fr))' }}
-      >
-        {/* Header row: hour numbers. */}
-        <div />
-        {Array.from({ length: 24 }, (_, h) => (
-          <div
-            key={`h-${h}`}
-            className="text-[8px] text-gray-400 font-mono text-center"
-          >
-            {h % 6 === 0 ? h : ''}
-          </div>
-        ))}
-        {/* 7 rows. */}
-        {DOW_LABELS.map((label, dow) => (
-          <RowFragment
-            key={label}
-            dow={dow}
-            label={label}
-            byKey={byKey}
-            levelFor={levelFor}
-            LEVEL_COLOR={LEVEL_COLOR}
-            onPickHour={onPickHour}
-          />
-        ))}
-      </div>
-      {/* Legend. */}
-      <div className="mt-2 flex items-center gap-1.5 text-[10px] font-mono text-gray-500">
-        <span>Less</span>
-        {LEVEL_COLOR.map((c, i) => (
-          <span key={i} className={`w-3 h-3 rounded-sm ${c} border border-gray-200 dark:border-white/10`} />
-        ))}
-        <span>More</span>
-      </div>
+      {dailySeries && dailySeries.length > 0 ? (
+        <TikTokDailyHeatmap30
+          points={dailySeries.map((p) => ({ day: p.day ?? '', diamonds: p.diamonds }))}
+        />
+      ) : (
+        <div className="text-[11px] font-mono text-gray-500 py-6 text-center">
+          No gifting activity in the last 30 days.
+        </div>
+      )}
     </section>
   );
 }
 
-// React doesn't allow returning a Fragment containing siblings inline
-// in a grid template without a wrapper-keyed parent — broken into a
-// small component so each cell row keeps its own key namespace.
-function RowFragment({
-  dow,
-  label,
-  byKey,
-  levelFor,
-  LEVEL_COLOR,
-  onPickHour,
-}: {
-  dow: number;
-  label: string;
-  byKey: Map<string, { gifts: number; diamonds: number }>;
-  levelFor: (d: number) => number;
-  LEVEL_COLOR: string[];
-  onPickHour?: (dow: number, hour: number) => void;
-}) {
-  return (
-    <>
-      <div className="text-[10px] text-gray-500 font-mono pr-1.5 self-center">
-        {label}
-      </div>
-      {Array.from({ length: 24 }, (_, h) => {
-        const cell = byKey.get(`${dow}:${h}`);
-        const lvl = cell ? levelFor(cell.diamonds) : 0;
-        const title = cell
-          ? `${label} ${h}:00 — ${cell.gifts} gifts · ${cell.diamonds.toLocaleString()} 💎\nClick to drill into Network feed`
-          : `${label} ${h}:00 — no activity`;
-        const hasActivity = !!cell;
-        // In-cell diamond count — compact so a 24-col row stays
-        // readable down to ~600px wide. Below ~3-digit diamonds we
-        // show the raw number; above we collapse to k/M with one
-        // decimal where useful.
-        const cellLabel = cell ? compactCount(cell.diamonds) : '';
-        // On the darker amber levels (3-5), the gray-700 default
-        // washes out against the saturated background — flip to
-        // amber-900 (light mode) / amber-50 (dark mode) for contrast.
-        const textTone = lvl >= 3
-          ? 'text-amber-900 dark:text-amber-50'
-          : 'text-gray-700';
-        // Cells with activity are clickable: hand the (dow, hour)
-        // pair up so the modal can pivot to the Network tab pre-
-        // filtered to that hour band. Empty cells stay non-clickable
-        // so we don't trap the user in a "no events" state.
-        const cellClass = `h-6 min-w-0 rounded-[2px] ${LEVEL_COLOR[lvl]} border border-gray-200/60 dark:border-white/10 flex items-center justify-center text-[9px] font-mono tabular-nums leading-none overflow-hidden ${textTone}`;
-        return hasActivity && onPickHour ? (
-          <button
-            type="button"
-            key={`c-${dow}-${h}`}
-            onClick={() => onPickHour(dow, h)}
-            className={`${cellClass} hover:ring-2 hover:ring-primary-400 transition-shadow cursor-pointer`}
-            title={title}
-            aria-label={title}
-          >
-            {cellLabel}
-          </button>
-        ) : (
-          <div
-            key={`c-${dow}-${h}`}
-            className={cellClass}
-            title={title}
-          >
-            {cellLabel}
-          </div>
-        );
-      })}
-    </>
-  );
-}
 
 const HOST_PALETTE = [
   '#f59e0b', '#3b82f6', '#10b981', '#ef4444', '#8b5cf6',

@@ -7,6 +7,7 @@ import {
   Lock, KeyRound, UserPlus, History, Coins,
   Layers, LogIn,
   Database, ShieldAlert, Radio, BarChart3, Gift,
+  LayoutDashboard,
 } from 'lucide-react';
 import { cn } from '../../utils/cn';
 import { appConfig } from '../../config/env';
@@ -37,7 +38,7 @@ const generalSection: NavigationSection = {
   title: 'General',
   key: 'general',
   items: [
-    { name: 'Home', href: '/admin', icon: Home, end: true },
+    { name: 'Home', href: '/', icon: Home, end: true },
   ],
 };
 
@@ -47,6 +48,12 @@ const adminPlatformSection: NavigationSection = {
   collapsible: true,
   defaultExpanded: true,
   items: [
+    // Dashboard is the framework's admin home — used to live at `/` via
+    // the sidebar "Home" link, but Home now points at the public
+    // landing page so anonymous viewers get a meaningful entry. Admins
+    // still need the shortcut, so it lives here at the top of the
+    // Platform section.
+    { name: 'Dashboard', href: `/admin`, icon: LayoutDashboard, end: true },
     { name: 'Users', href: `/admin/users`, icon: User },
     { name: 'Roles', href: `/admin/rbac/roles`, icon: Shield },
     { name: 'Permissions', href: `/admin/rbac/permissions`, icon: KeyRound },

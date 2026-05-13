@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { Fragment, useEffect, useMemo, useState } from 'react';
 import { Calendar as CalendarIcon } from 'lucide-react';
 
 import { type TikTokRoom } from '@admin/services/tiktok';
@@ -6,12 +6,18 @@ import { useTikTokApi } from '@admin/contexts/TikTokApiContext';
 import {
   useTikTokTimezone,
   dateKeyInZone,
+  partsInZone,
 } from '@admin/contexts/TikTokTimezoneContext';
 
 interface Props {
   handle: string;
-  /** Default 26 weeks ≈ ~6 months. The backend snaps the start to the
-   *  previous Monday so the grid is rectangular (7 × N). */
+  /** Default 5 weeks (~30 days, "last month") to match the rest of
+   *  the modal's 30-day heatmap conventions. The backend snaps the
+   *  start to the previous Monday so the grid is rectangular (7 × N);
+   *  the frontend then renders a GitHub-style 7-row layout windowed
+   *  to the trailing 30 calendar days (out-of-window cells stay
+   *  blank). Callers wanting a longer span can override (e.g. for
+   *  the host detail page). */
   weeks?: number;
   /** Same room list the parent page already loaded for the broadcast
    *  selector dropdown — passed in so we can map a clicked calendar
@@ -26,6 +32,20 @@ interface Props {
    *  room view (which made the chart look truncated to one of N
    *  broadcasts, exactly the bug you noticed on `electra504de_yady`). */
   onSelectDay?: (rooms: TikTokRoom[], date: string) => void;
+  /** Fires when the calendar data resolves (or is reset). The parent
+   *  uses this to render the activity summary chip ("6 days · 10
+   *  broadcasts · 1d 5h · 1.5M 💎 · 124 matches") inside the
+   *  ProfileHeaderCard alongside the avatar — keeping the heatmap
+   *  itself a clean grid without a header strap of stats. */
+  onSummary?: (summary: TikTokLiveActivitySummary | null) => void;
+}
+
+export interface TikTokLiveActivitySummary {
+  activeDays: number;
+  totalBroadcasts: number;
+  totalMinutes: number;
+  totalDiamonds: number;
+  totalMatches: number;
 }
 
 interface CalendarData {
@@ -53,9 +73,10 @@ interface CalendarData {
  */
 export function TikTokLiveCalendar({
   handle,
-  weeks = 26,
+  weeks = 5,
   rooms,
   onSelectDay,
+  onSummary,
 }: Props) {
   const tiktokApi = useTikTokApi();
   const { tz } = useTikTokTimezone();
@@ -164,38 +185,16 @@ export function TikTokLiveCalendar({
     return map;
   }, [rooms, tz]);
 
-  // Pre-compute the (week, day) grid the chart will render.
-  // Walk from the snapped start (Monday `weeks*7` ago) UP TO end_date
-  // (today) — `data.weeks` is just the requested window length, not
-  // the column count. Today usually lands mid-week, so the actual
-  // grid often needs `weeks + 1` columns to keep today visible.
-  const grid = useMemo(() => {
-    if (!data) return null;
-    const start = parseDate(data.start_date);
-    const end = parseDate(data.end_date);
-    const days: Date[][] = [];
-    let cursor = new Date(start);
-    while (cursor <= end) {
-      const col: Date[] = [];
-      for (let d = 0; d < 7; d += 1) {
-        col.push(new Date(cursor));
-        cursor.setDate(cursor.getDate() + 1);
-      }
-      days.push(col);
-    }
-    return days;
-  }, [data]);
-
-  // Active days + window-wide totals for the header strap.
-  const summary = useMemo(() => {
+  // Window-wide totals derived from the same `byDate` map the grid
+  // uses. The chip itself no longer renders here — it's emitted up
+  // via `onSummary` so the parent can render it inside the
+  // ProfileHeaderCard alongside the avatar (keeps this panel as a
+  // pure heatmap, no header strap clutter).
+  useEffect(() => {
+    if (!onSummary) return;
     if (!data) {
-      return {
-        activeDays: 0,
-        totalBroadcasts: 0,
-        totalMinutes: 0,
-        totalDiamonds: 0,
-        totalMatches: 0,
-      };
+      onSummary(null);
+      return;
     }
     let activeDays = 0;
     let totalBroadcasts = 0;
@@ -209,173 +208,38 @@ export function TikTokLiveCalendar({
       totalDiamonds += v.diamonds;
       totalMatches += v.matches;
     });
-    return { activeDays, totalBroadcasts, totalMinutes, totalDiamonds, totalMatches };
-  }, [data]);
+    onSummary({
+      activeDays,
+      totalBroadcasts,
+      totalMinutes,
+      totalDiamonds,
+      totalMatches,
+    });
+  }, [data, onSummary]);
 
   return (
-    <section className="card flex flex-col gap-3 min-w-0">
+    <section className="card flex flex-col gap-3 min-w-0 h-full">
       <div className="flex items-center justify-between gap-2 flex-wrap">
         <h2 className="auth-mono-label flex items-center gap-1.5">
-          <CalendarIcon className="w-3.5 h-3.5 text-emerald-500" />
-          Live activity — last {weeks}w
+          <CalendarIcon className="w-3.5 h-3.5 text-sky-500" />
+          Live activity — last 30 days
         </h2>
-        {data && (
-          <span className="text-[11px] font-mono text-gray-500 tabular-nums">
-            {summary.activeDays} day{summary.activeDays === 1 ? '' : 's'} ·{' '}
-            {summary.totalBroadcasts} broadcast{summary.totalBroadcasts === 1 ? '' : 's'}
-            {summary.totalMinutes > 0 && ` · ${formatDuration(summary.totalMinutes)}`}
-            {summary.totalDiamonds > 0 && ` · ${formatCount(summary.totalDiamonds)} 💎`}
-            {summary.totalMatches > 0 && ` · ${summary.totalMatches} match${summary.totalMatches === 1 ? '' : 'es'}`}
-          </span>
-        )}
       </div>
 
       {loading && !data ? (
         <div className="text-xs text-gray-400 font-mono">Loading…</div>
-      ) : !grid || !data ? (
+      ) : !data ? (
         <div className="text-xs text-gray-400 font-mono">No activity recorded.</div>
       ) : (
-        <div>
-          {/* Month labels — one per column-group where the month changes.
-              `weeks={13}` (default below) gives ~3 months at a glance,
-              with 7-day rows and no horizontal scroll inside the
-              360-px card. Each label sits above its first column. */}
-          <div className="flex gap-0.5 mb-1 text-[9px] font-mono text-gray-400 select-none">
-            <div className="w-7 shrink-0" aria-hidden />
-            {grid.map((week, wi) => {
-              const firstOfMonth = week.find((d) => d.getDate() <= 7);
-              const showLabel =
-                firstOfMonth &&
-                (wi === 0 || firstOfMonth.getDate() <= 7);
-              const prevWeekHasSameMonth =
-                wi > 0 &&
-                grid[wi - 1].some(
-                  (d) =>
-                    firstOfMonth && d.getMonth() === firstOfMonth.getMonth(),
-                );
-              return (
-                <div key={wi} className="w-3.5 shrink-0">
-                  {showLabel && !prevWeekHasSameMonth && firstOfMonth
-                    ? MONTH_LABELS[firstOfMonth.getMonth()]
-                    : ''}
-                </div>
-              );
-            })}
-          </div>
-
-          {/* Day-of-week labels + 7×N grid. All seven labels visible
-              now (we have the horizontal room since the grid was
-              shrunk to 13 weeks). Cells are 14px so the column fits
-              the page card without scrolling. */}
-          <div className="flex gap-0.5">
-            <div className="flex flex-col gap-0.5 mr-1 text-[9px] font-mono text-gray-400 select-none w-6 shrink-0">
-              {DOW_LABELS.map((lbl, i) => (
-                <div key={i} className="h-3.5 leading-[14px]">
-                  {lbl}
-                </div>
-              ))}
-            </div>
-            <div className="flex gap-0.5">
-              {grid.map((week, wi) => (
-                <div key={wi} className="flex flex-col gap-0.5">
-                  {week.map((d) => {
-                    const key = isoDate(d);
-                    const cell = data.byDate.get(key);
-                    const count = cell?.rooms ?? 0;
-                    const isFuture = d > new Date();
-                    const bg = isFuture ? 'transparent' : countColor(count);
-                    const isHovered = hovered?.key === key;
-                    const open = (
-                      target: HTMLElement,
-                    ) => {
-                      const r = target.getBoundingClientRect();
-                      setHovered({
-                        key,
-                        label: formatLongDate(d),
-                        rooms: cell?.rooms ?? 0,
-                        duration_minutes: cell?.duration_minutes ?? 0,
-                        diamonds: cell?.diamonds ?? 0,
-                        matches: cell?.matches ?? 0,
-                        isFuture,
-                        rect: {
-                          top: r.top, left: r.left,
-                          bottom: r.bottom, right: r.right,
-                        },
-                      });
-                    };
-                    // Hover ring rendered as inline box-shadow so the
-                    // contrast can't be diluted by Tailwind opacity
-                    // helpers and the colour is consistent across
-                    // emerald shades. Inner 1.5-px white halo +
-                    // outer 2-px near-black ring → cell visibly
-                    // "lifts" above its neighbours. `z-10` keeps the
-                    // shadow from being clipped by the next cell's
-                    // gap on either side.
-                    const hoverShadow =
-                      isHovered && !isFuture
-                        ? '0 0 0 1.5px #ffffff, 0 0 0 3.5px rgba(15, 23, 42, 0.95)'
-                        : 'none';
-                    // Click only fires for days that have broadcasts
-                    // we know about — gray (no-live) and future cells
-                    // are click-inert.
-                    const dayRooms = roomsByDate.get(key) ?? [];
-                    const isClickable =
-                      !isFuture && dayRooms.length > 0 && Boolean(onSelectDay);
-                    return (
-                      <div
-                        key={key}
-                        role={isClickable ? 'button' : undefined}
-                        tabIndex={isClickable ? 0 : -1}
-                        onMouseEnter={(e) => open(e.currentTarget)}
-                        onMouseLeave={() => setHovered(null)}
-                        onFocus={(e) => open(e.currentTarget)}
-                        onBlur={() => setHovered(null)}
-                        onClick={() => {
-                          if (isClickable) onSelectDay?.(dayRooms, key);
-                        }}
-                        onKeyDown={(e) => {
-                          if (
-                            isClickable &&
-                            (e.key === 'Enter' || e.key === ' ')
-                          ) {
-                            e.preventDefault();
-                            onSelectDay?.(dayRooms, key);
-                          }
-                        }}
-                        className={
-                          'w-3.5 h-3.5 rounded-sm transition-shadow ' +
-                          (isFuture
-                            ? 'cursor-default'
-                            : isClickable
-                              ? 'cursor-pointer '
-                              : 'cursor-default ') +
-                          (isHovered ? 'relative z-10' : '')
-                        }
-                        style={{
-                          backgroundColor: bg,
-                          boxShadow: hoverShadow,
-                        }}
-                      />
-                    );
-                  })}
-                </div>
-              ))}
-            </div>
-          </div>
-
-          {/* Legend — inline-styled so it stays in sync with the grid
-              and isn't subject to Tailwind class-purge surprises. */}
-          <div className="flex items-center gap-1.5 mt-2 text-[10px] font-mono text-gray-500 select-none">
-            <span>less</span>
-            {[0, 1, 2, 3, 4].map((n) => (
-              <span
-                key={n}
-                className="w-3 h-3 rounded-sm"
-                style={{ backgroundColor: countColor(n) }}
-              />
-            ))}
-            <span>more</span>
-          </div>
+        <div className="flex-1 flex flex-col min-h-0">
+          <RecentMonthGrid
+            data={data}
+            roomsByDate={roomsByDate}
+            hovered={hovered}
+            setHovered={setHovered}
+            onSelectDay={onSelectDay}
+            tz={tz}
+          />
         </div>
       )}
 
@@ -388,6 +252,264 @@ export function TikTokLiveCalendar({
         <CellPopover hovered={hovered} />
       )}
     </section>
+  );
+}
+
+// ── GitHub-style 30-day grid ────────────────────────────────────────
+//
+// 7 rows (Sun → Sat) × ~5 week columns, anchored to today. Out-of-
+// window cells (top-left + bottom-right) stay blank so the layout
+// snaps to whole weeks. Color ramp matches the gifter-modal
+// Timeline heatmap (`TikTokDailyHeatmap30`): gray for zero, then a
+// 5-step amber ramp keyed off broadcast count. The cell shows the
+// broadcast count when ≥ 1; tooltip + click behaviour preserved
+// from the previous emerald 13-week grid.
+type HoveredCell = NonNullable<
+  Parameters<typeof setCellPopoverPlaceholder>[0]
+>;
+
+function RecentMonthGrid({
+  data,
+  roomsByDate,
+  hovered,
+  setHovered,
+  onSelectDay,
+  tz,
+}: {
+  data: CalendarData;
+  roomsByDate: Map<string, TikTokRoom[]>;
+  hovered: HoveredCell | null;
+  setHovered: (h: HoveredCell | null) => void;
+  onSelectDay?: (rooms: TikTokRoom[], date: string) => void;
+  /** Active page timezone. The grid is built in this zone so cells
+   *  line up with the backend's `cells[].date` keys (which the
+   *  service buckets by `AT TIME ZONE :tz`). Without this the grid
+   *  uses the browser's local zone, and a user whose local zone
+   *  differs from the page zone sees cell highlights drifting by a
+   *  day — and clicking a cell hands the parent a local-zone YMD
+   *  that doesn't match what the rest of the page is filtering on. */
+  tz: string;
+}) {
+  const WINDOW_DAYS = 30;
+  const { weekRows, maxDayDiamonds } = useMemo(() => {
+    // Calendar-style layout: 7 columns = days of week (Sun → Sat),
+    // 4–5 rows = weeks. The grid is built in the ACTIVE page tz —
+    // we anchor "today" via `partsInZone(now, tz)`, then walk
+    // calendar dates in a fake-UTC Date (so .getUTCDay /
+    // .setUTCDate operate on the tz's wall-clock calendar without
+    // DST traps). The resulting YMD keys match the backend's
+    // `cells[].date` bucketing, and the click handler hands the
+    // parent a date string interpreted in the same zone the rest
+    // of the page filters by.
+    const todayParts = partsInZone(new Date(), tz);
+    // Anchor: midnight of "today in tz", represented as a UTC Date
+    // whose Y-M-D triplet matches the tz's wall-clock calendar.
+    // We never call `toISOString()` on these — they're just date
+    // bags for stepping through the calendar.
+    const todayAnchor = new Date(Date.UTC(
+      todayParts.year, todayParts.month - 1, todayParts.day,
+    ));
+    const windowStart = new Date(todayAnchor);
+    windowStart.setUTCDate(todayAnchor.getUTCDate() - (WINDOW_DAYS - 1));
+    const gridStart = new Date(windowStart);
+    gridStart.setUTCDate(windowStart.getUTCDate() - windowStart.getUTCDay());
+    const gridEnd = new Date(todayAnchor);
+    gridEnd.setUTCDate(todayAnchor.getUTCDate() + (6 - todayAnchor.getUTCDay()));
+    const totalCells =
+      Math.round((gridEnd.getTime() - gridStart.getTime()) / 86_400_000) + 1;
+    const totalRows = Math.ceil(totalCells / 7);
+    type Cell = { key: string; date: Date } | null;
+    const rows: Cell[][] = [];
+    let max = 0;
+    for (let r = 0; r < totalRows; r++) {
+      const row: Cell[] = [];
+      for (let c = 0; c < 7; c++) {
+        const d = new Date(gridStart);
+        d.setUTCDate(gridStart.getUTCDate() + r * 7 + c);
+        if (d < windowStart || d > todayAnchor) {
+          row.push(null);
+          continue;
+        }
+        const y = d.getUTCFullYear();
+        const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+        const dd = String(d.getUTCDate()).padStart(2, '0');
+        const key = `${y}-${m}-${dd}`;
+        const entry = data.byDate.get(key);
+        if (entry && entry.diamonds > max) max = entry.diamonds;
+        row.push({ key, date: new Date(d) });
+      }
+      rows.push(row);
+    }
+    return { weekRows: rows, maxDayDiamonds: max };
+  }, [data, tz]);
+
+  // Row labels — show the month for the row's first in-window day,
+  // and only when the month differs from the row above. Other rows
+  // get blank labels so the column stays narrow.
+  const rowLabels = useMemo(() => {
+    const fmtMonth = new Intl.DateTimeFormat(undefined, {
+      month: 'short', year: '2-digit',
+    });
+    const labels: string[] = [];
+    let prevMonth = -1;
+    for (const row of weekRows) {
+      const firstReal = row.find((x): x is NonNullable<typeof x> => x !== null);
+      const m = firstReal ? firstReal.date.getMonth() : -1;
+      if (firstReal && m !== prevMonth) {
+        labels.push(fmtMonth.format(firstReal.date));
+        prevMonth = m;
+      } else {
+        labels.push('');
+      }
+    }
+    return labels;
+  }, [weekRows]);
+
+  // Sky-blue ramp — cooler, more neutral than emerald, and reads
+  // calmly against the warm amber of the gifter-modal Profile
+  // heatmap so the two surfaces stay distinct.
+  const LEVEL_COLOR = [
+    'bg-gray-100 dark:bg-white/[0.04]',
+    'bg-sky-100 dark:bg-sky-500/[0.20]',
+    'bg-sky-300 dark:bg-sky-500/[0.45]',
+    'bg-sky-500 dark:bg-sky-500/[0.75]',
+    'bg-sky-700 dark:bg-sky-400',
+  ];
+  const levelFor = (d: number): number => {
+    if (d <= 0) return 0;
+    if (maxDayDiamonds <= 0) return 0;
+    const ratio = Math.sqrt(d / maxDayDiamonds);
+    if (ratio >= 0.8) return 4;
+    if (ratio >= 0.55) return 3;
+    if (ratio >= 0.3) return 2;
+    return 1;
+  };
+
+  const WEEKDAY_SHORT = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+  return (
+    <div className="flex-1 flex flex-col min-h-0">
+      {/* Calendar layout: 7 weekday columns × N week rows. Rows
+          stretch to share the available card height via
+          `gridTemplateRows: auto repeat(N, 1fr)`, so the band fills
+          its sidebar slot end-to-end and visually matches the
+          ProfileHeaderCard height beside it. */}
+      <div
+        className="grid gap-[2px] w-full flex-1 min-h-0"
+        style={{
+          gridTemplateColumns: `auto repeat(7, minmax(0, 1fr))`,
+          gridTemplateRows: `auto repeat(${weekRows.length}, minmax(0, 1fr))`,
+        }}
+      >
+        {/* Header row: weekday labels. */}
+        <div />
+        {WEEKDAY_SHORT.map((dayName) => (
+          <div
+            key={dayName}
+            className="text-[9px] font-mono text-gray-500 tabular-nums text-center leading-none"
+          >
+            {dayName}
+          </div>
+        ))}
+        {/* One row per week. */}
+        {weekRows.map((row, ri) => (
+          <Fragment key={ri}>
+            <div className="text-[10px] font-mono text-gray-600 self-center pr-2 text-right leading-none">
+              {rowLabels[ri]}
+            </div>
+            {row.map((cell, ci) => {
+              if (!cell) {
+                // Out-of-window slot: top-left corners before the
+                // 30-day window starts, OR bottom-right corners
+                // after today. Either way render a dashed-border
+                // placeholder so the calendar grid stays visually
+                // square even at the edges, distinct from in-window
+                // zero-activity cells which carry a solid border.
+                return (
+                  <div
+                    key={ci}
+                    className="min-h-0 rounded-[2px] border border-dashed border-gray-300/70 dark:border-white/15"
+                    aria-hidden
+                  />
+                );
+              }
+              const entry = data.byDate.get(cell.key);
+              const diamonds = entry?.diamonds ?? 0;
+              const lvl = levelFor(diamonds);
+              const textTone = lvl >= 3
+                ? 'text-sky-50 dark:text-sky-50'
+                : 'text-gray-700';
+              const dayRooms = roomsByDate.get(cell.key) ?? [];
+              const isClickable = dayRooms.length > 0 && Boolean(onSelectDay);
+              const isHovered = hovered?.key === cell.key;
+              const open = (target: HTMLElement) => {
+                const r = target.getBoundingClientRect();
+                setHovered({
+                  key: cell.key,
+                  label: formatLongDate(cell.date),
+                  rooms: entry?.rooms ?? 0,
+                  duration_minutes: entry?.duration_minutes ?? 0,
+                  diamonds: entry?.diamonds ?? 0,
+                  matches: entry?.matches ?? 0,
+                  isFuture: false,
+                  rect: {
+                    top: r.top, left: r.left,
+                    bottom: r.bottom, right: r.right,
+                  },
+                });
+              };
+              return (
+                <div
+                  key={ci}
+                  role={isClickable ? 'button' : undefined}
+                  tabIndex={isClickable ? 0 : -1}
+                  onMouseEnter={(e) => open(e.currentTarget)}
+                  onMouseLeave={() => setHovered(null)}
+                  onFocus={(e) => open(e.currentTarget)}
+                  onBlur={() => setHovered(null)}
+                  onClick={() => {
+                    if (isClickable) onSelectDay?.(dayRooms, cell.key);
+                  }}
+                  onKeyDown={(e) => {
+                    if (isClickable && (e.key === 'Enter' || e.key === ' ')) {
+                      e.preventDefault();
+                      onSelectDay?.(dayRooms, cell.key);
+                    }
+                  }}
+                  className={
+                    `min-h-0 min-w-0 rounded-[2px] border border-gray-200/60 dark:border-white/10 ${LEVEL_COLOR[lvl]} ` +
+                    `flex items-center justify-center text-[10px] font-mono tabular-nums leading-none overflow-hidden ${textTone} ` +
+                    (isClickable ? 'cursor-pointer' : 'cursor-default') +
+                    (isHovered ? ' relative z-10' : '')
+                  }
+                  style={
+                    isHovered
+                      ? {
+                          boxShadow:
+                            '0 0 0 1.5px #ffffff, 0 0 0 3.5px rgba(15, 23, 42, 0.95)',
+                        }
+                      : undefined
+                  }
+                  aria-label={`${cell.key} · ${diamonds.toLocaleString()} 💎`}
+                >
+                  {diamonds > 0 ? formatCount(diamonds) : ''}
+                </div>
+              );
+            })}
+          </Fragment>
+        ))}
+      </div>
+      <div className="flex items-center gap-1.5 text-[10px] font-mono text-gray-500 mt-2 select-none">
+        <span>less</span>
+        {LEVEL_COLOR.map((c, i) => (
+          <span
+            key={i}
+            className={`w-3 h-3 rounded-[2px] ${c} border border-gray-200/60 dark:border-white/10`}
+          />
+        ))}
+        <span>more</span>
+      </div>
+    </div>
   );
 }
 
@@ -479,33 +601,6 @@ function setCellPopoverPlaceholder(
   },
 ) {
   /* unused — typeof reference for the popover prop */
-}
-
-const DOW_LABELS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
-const MONTH_LABELS = [
-  'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
-];
-
-/** GitHub-Contributions-style five-stop color ramp.
- *  Inline `style={{backgroundColor}}` is used in the markup rather
- *  than Tailwind utility classes so the values can't be silently
- *  dropped by the JIT purger when builds bundle the component. The
- *  tradeoff is no automatic dark-mode inversion — but the emerald
- *  ramp reads fine on both light and dark surfaces. */
-function countColor(n: number): string {
-  if (n <= 0) return 'rgb(229 231 235 / 0.7)'; // gray-200 @ 70%
-  if (n === 1) return '#a7f3d0';               // emerald-200
-  if (n === 2) return '#34d399';               // emerald-400
-  if (n === 3) return '#10b981';               // emerald-500
-  return '#047857';                            // emerald-700
-}
-
-function parseDate(s: string): Date {
-  // The backend returns YYYY-MM-DD without timezone — interpret as local
-  // midnight so the grid lines up with the viewer's calendar.
-  const [y, m, d] = s.split('-').map((x) => Number(x));
-  return new Date(y, (m || 1) - 1, d || 1);
 }
 
 function isoDate(d: Date): string {

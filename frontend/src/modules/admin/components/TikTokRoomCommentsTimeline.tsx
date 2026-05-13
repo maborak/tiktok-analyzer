@@ -80,11 +80,15 @@ interface RoomCommentsTimelineProps {
   /** Bubble the server-side total up so the parent can render `(N)`
    *  on its tab label without a duplicate query. */
   onTotalChange?: (total: number) => void;
-  /** When the user clicks a row, the parent can open the gifter modal. */
+  /** When the user clicks a row, the parent can open the gifter modal.
+   *  `tab: 'comments'` is included so the unified modal opens on the
+   *  Comments tab directly — the user clicked a comment, they
+   *  probably want to see more comments, not the gifts tab. */
   onSelectUser?: (u: {
     userId: string | null;
     uniqueId: string | null;
     nickname: string | null;
+    tab?: 'comments';
   }) => void;
 }
 
@@ -609,6 +613,7 @@ interface EventRowProps {
     userId: string | null;
     uniqueId: string | null;
     nickname: string | null;
+    tab?: 'comments';
   }) => void;
 }
 
@@ -661,6 +666,7 @@ function EventRow({
                 userId: event.user_id,
                 uniqueId: u.unique_id ?? null,
                 nickname: u.nickname ?? null,
+                tab: 'comments',
               })
           : undefined
       }

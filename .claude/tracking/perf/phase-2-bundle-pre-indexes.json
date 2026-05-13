@@ -1,0 +1,21 @@
+{
+  "label": "phase-2-bundle-pre-indexes",
+  "timestamp": "2026-05-13T16:38:05.546503+00:00",
+  "base_url": "http://localhost:9020",
+  "warmup": 2,
+  "cold": {
+    "GET /admin/tiktok/lives/bundle": {
+      "ms": 1135.25,
+      "status": 200,
+      "bytes": 266912
+    }
+  },
+  "warm": {
+    "total_p50_ms": 23.33,
+    "total_p95_ms": 27.55,
+    "total_min_ms": 20.8,
+    "total_max_ms": 27.55,
+    "total_mean_ms": 23.42,
+    "runs": 15
+  }
+}

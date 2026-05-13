@@ -218,8 +218,8 @@ export function TikTokGifterDetailModal({
           userId={userId}
           uniqueId={uniqueId ?? null}
           nickname={nickname ?? null}
-          diamondsTotal={diamondsTotal ?? 0}
-          giftsCount={giftsCount ?? 0}
+          diamondsTotal={diamondsTotal}
+          giftsCount={giftsCount}
           commentsCount={commentsCount}
           roomId={roomId}
           extraRoomIds={extraRoomIds}

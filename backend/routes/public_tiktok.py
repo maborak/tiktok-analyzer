@@ -1110,3 +1110,25 @@ def public_user_matches(
         limit=limit,
         offset=offset,
     )
+
+
+@router.get("/tiktok/users/{user_id}/host-daily-series")
+def public_user_host_daily_series(
+    user_id: int,
+    response: Response,
+    handle: str = Query(..., description="Host handle to scope to."),
+    days: int = Query(30, ge=1, le=180),
+):
+    """Public mirror of `/admin/tiktok/users/{user_id}/host-daily-series`.
+
+    The host must be `is_public=True`; resolved via `_resolve_public_host`
+    so unknown / private handles 404 with no info leak.
+    """
+    _resolve_public_host(handle)
+    svc = _require_service()
+    _set_cache_headers(response)
+    return svc.get_user_host_daily_series(
+        user_id=int(user_id),
+        host_unique_id=handle.lstrip("@"),
+        days=int(days),
+    )

@@ -1,0 +1,21 @@
+{
+  "label": "phase-7-payload-trim",
+  "timestamp": "2026-05-13T16:58:53.119254+00:00",
+  "base_url": "http://localhost:9020",
+  "warmup": 2,
+  "cold": {
+    "GET /admin/tiktok/lives/bundle": {
+      "ms": 817.69,
+      "status": 200,
+      "bytes": 249042
+    }
+  },
+  "warm": {
+    "total_p50_ms": 16.66,
+    "total_p95_ms": 17.58,
+    "total_min_ms": 15.08,
+    "total_max_ms": 17.58,
+    "total_mean_ms": 16.56,
+    "runs": 15
+  }
+}

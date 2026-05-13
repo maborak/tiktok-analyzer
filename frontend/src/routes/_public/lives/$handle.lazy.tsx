@@ -94,7 +94,7 @@ function PublicGateMessage({ icon, title, body }: { icon: React.ReactNode; title
       <h1 className="auth-mono-label text-lg mb-3">{title}</h1>
       <p className="text-sm text-gray-600 mb-8 leading-relaxed">{body}</p>
       <Link
-        to="/"
+        to="/lives"
         className="auth-mono-label text-xs px-4 py-2 border border-gray-300 rounded-md hover:bg-gray-50"
       >
         ← Back to lives

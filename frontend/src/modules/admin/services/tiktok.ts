@@ -1243,18 +1243,20 @@ export const tiktokApi = {
     });
   },
 
-  // ─── Lives row enrichment ─────────────────────────────────────
+  // ─── Lives page rollup ─────────────────────────────────────
+  //
+  // Single round-trip for the /admin/tiktok Lives page: subs +
+  // per-host summary + page-level totals in one response. Replaces
+  // the previous three-endpoint fan-out (list/summary/totals) that
+  // paid for two parallel `list_subscriptions()` queries on every
+  // cold mount.
 
-  livesTotals(): Promise<TikTokLivesTotals> {
-    return apiRequest({ method: 'GET', url: `${BASE}/lives/totals` });
-  },
-
-  livesSummary(handles?: string[]): Promise<Record<string, TikTokLiveSummary>> {
-    return apiRequest({
-      method: 'GET',
-      url: `${BASE}/lives/summary`,
-      params: handles && handles.length > 0 ? { handles: handles.join(',') } : {},
-    });
+  livesBundle(): Promise<{
+    subs: TikTokSubscription[];
+    summary: Record<string, TikTokLiveSummary>;
+    totals: TikTokLivesTotals;
+  }> {
+    return apiRequest({ method: 'GET', url: `${BASE}/lives/bundle` });
   },
 
   // ─── Notifications history ────────────────────────────────────
@@ -1369,6 +1371,23 @@ export const tiktokApi = {
       method: 'GET',
       url: `${BASE}/users/${encodeURIComponent(opts.userId)}/matches`,
       params,
+    });
+  },
+
+  /** Per-day diamond + gift totals for a single (user, host) pair.
+   *  Drives the Timeline tab heatmap in the in-room gifter modal. */
+  getUserHostDailySeries(opts: {
+    userId: string;
+    handle: string;
+    days?: number;
+  }): Promise<Array<{ day: string; diamonds: number; gifts: number }>> {
+    return apiRequest({
+      method: 'GET',
+      url: `${BASE}/users/${encodeURIComponent(opts.userId)}/host-daily-series`,
+      params: {
+        handle: opts.handle.replace(/^@/, ''),
+        days: opts.days ?? 30,
+      },
     });
   },
 

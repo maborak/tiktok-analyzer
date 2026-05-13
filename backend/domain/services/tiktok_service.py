@@ -2490,6 +2490,16 @@ class TikTokService:
             int(user_id), public_only=public_only,
         )
 
+    def get_user_host_daily_series(
+        self, user_id: int, *, host_unique_id: str, days: int = 30,
+    ) -> list[dict[str, Any]]:
+        """Per-day diamond + gift totals for a single (user, host)
+        pair. Powers the gifter modal's Timeline tab — a lighter
+        query than the full cross-host detail."""
+        return self._persistence.get_user_host_daily_series(
+            int(user_id), host_unique_id=host_unique_id, days=int(days),
+        )
+
     # ── Notifications history ────────────────────────────────────────
 
     # ── Lives-page row enrichment ───────────────────────────────────
@@ -2512,7 +2522,15 @@ class TikTokService:
     # real-time events alongside this slower-cadence rollup. The
     # frontend Cache-Control: max-age=10 in the route layer is the
     # browser-side cap and is intentionally tighter than this TTL.
-    _LIVES_SUMMARY_TTL_S = 35.0
+    # 60 s — doubles the headroom over the 30 s frontend poll cycle.
+    # Was 35 s before; that was tight enough that a slightly late
+    # poll (network jitter, browser scheduler skew) could miss the
+    # cache. 60 s means two consecutive polls always hit warm cache
+    # in steady state; cold miss only on (a) backend restart or (b)
+    # the rare ≥60 s page idle. Trade-off: data staleness window
+    # widens by ~25 s, which is acceptable for the rollup-style
+    # numbers on the card (per-event freshness comes from the WS feed).
+    _LIVES_SUMMARY_TTL_S = 60.0
     _lives_summary_cache: dict[tuple[str, ...], tuple[float, dict[str, Any]]] = {}
     # Per-key singleflight locks. When N concurrent callers race for
     # the same cache key on a cold miss (warm-up + first user request,
@@ -2608,8 +2626,18 @@ class TikTokService:
         "viewer_history",
         "diamonds_session",
         "hourly_buckets",
-        "daily_buckets",
-        "top_gifter",            # legacy single — kept for shape compat
+        # Eight fields the React card never reads — removed in lockstep
+        # with the admin bundle deny-list (see
+        # `_BUNDLE_OMIT_SUMMARY_FIELDS` above). They were carried over
+        # historically because the public sanitizer is a SAFE-by-default
+        # allowlist, but allowlisting unused fields is just wire bloat:
+        #   - daily_buckets         (rhythm strip — detail page only)
+        #   - top_gifter            (single legacy, superseded by [])
+        #   - comments_per_min_*    (no UI)
+        #   - momentum_label        (no UI)
+        #   - avg_*, n_rooms_30d    (30-day averages, not on the card)
+        # Add any of them back here AND to the admin deny-list if a
+        # public UI starts rendering them.
         "top_gifters",           # top 3, public on TikTok's gift leaderboard
         "n_unique_gifters",
         "n_first_time_gifters",
@@ -2620,8 +2648,6 @@ class TikTokService:
         # the live is on, but the internal "seconds since the last
         # webcast event we observed" signal is listener-health data
         # that the public has no business seeing.
-        "comments_per_min_recent",
-        "comments_per_min_baseline",
         "n_envelopes_session",
         "envelope_diamonds_session",
         "n_pauses",
@@ -2629,11 +2655,7 @@ class TikTokService:
         "active_poll",
         "active_match",
         "last_broadcasts",
-        "avg_duration_min",
-        "avg_diamonds",
-        "n_rooms_30d",
         "week_calendar",
-        "momentum_label",
     )
 
     # Public endpoint cache: 30s TTL per the contract. Distinct from the
@@ -2759,10 +2781,17 @@ class TikTokService:
             if not h:
                 continue
             row = summary.get(h.lstrip("@").lower(), {}) or {}
+            summary_slice = self._pick(row, self._PUBLIC_SUMMARY_FIELDS)
+            # Same trim as the admin bundle: `last_broadcasts` is a
+            # 3-element history but the React card only reads index 0.
+            # Slicing here mirrors the admin behaviour and shrinks the
+            # public response symmetrically.
+            if isinstance(summary_slice.get("last_broadcasts"), list):
+                summary_slice["last_broadcasts"] = summary_slice["last_broadcasts"][:1]
             items.append(
                 {
                     "subscription": self._pick(sub, self._PUBLIC_SUBSCRIPTION_FIELDS),
-                    "summary":      self._pick(row, self._PUBLIC_SUMMARY_FIELDS),
+                    "summary":      summary_slice,
                 }
             )
 
@@ -2780,7 +2809,7 @@ class TikTokService:
     # to one DB round-trip per 15 s instead of one per tab per 30 s).
     # Same rationale as `_LIVES_SUMMARY_TTL_S` — 35 s buffer over the
     # 30 s frontend poll so steady-state polling always hits warm cache.
-    _LIVES_TOTALS_TTL_S = 35.0
+    _LIVES_TOTALS_TTL_S = 60.0  # see `_LIVES_SUMMARY_TTL_S` rationale
     _lives_totals_cache: tuple[float, dict[str, Any]] | None = None
     # Singleflight on cold miss — same rationale as `_lives_summary_cache`.
     # The cache has one slot (no per-key dimension), so one lock is enough.
@@ -2800,6 +2829,96 @@ class TikTokService:
             result = self._persistence.get_lives_totals()
             self._lives_totals_cache = (now2, result)
             return result
+
+    # Fields the `/admin/tiktok/lives/bundle` response intentionally
+    # omits. Each is still computed inside `get_lives_summary` (cached
+    # at the service layer, so dropping them saves no DB work) but
+    # the React grid never reads them, so shipping them over the wire
+    # is dead weight. On a 79-handle install this strips ~21 KB from
+    # the 264 KB bundle payload (~8%).
+    #
+    # - daily_buckets:        24-int per-host hourly events; only the
+    #                         rhythm strip in TikTokLiveDetail reads it.
+    # - top_gifter:           single-gifter legacy field; superseded
+    #                         by `top_gifters[]` everywhere.
+    # - comments_per_min_*:   computed but no UI surfaces them.
+    # - momentum_label:       heating/cooling label; not rendered on
+    #                         the card.
+    # - avg_*, n_rooms_30d:   30-day averages; not on the card grid.
+    # - median_diamonds_30d:  only used server-side to compute
+    #                         `diamonds_vs_typical`, which IS shipped.
+    #
+    # Don't add a field here without verifying the React grid doesn't
+    # read it — `grep -rn summary?\.<name> frontend/src` is the check.
+    _BUNDLE_OMIT_SUMMARY_FIELDS: tuple[str, ...] = (
+        "daily_buckets",
+        "top_gifter",
+        "comments_per_min_recent",
+        "comments_per_min_baseline",
+        "momentum_label",
+        "avg_duration_min",
+        "avg_diamonds",
+        "n_rooms_30d",
+        "median_diamonds_30d",
+    )
+
+    async def get_lives_bundle(self) -> dict[str, Any]:
+        """Single round-trip rollup for the /admin/tiktok Lives page.
+
+        Returns `{"subs", "summary", "totals"}` — everything the page
+        needs on first paint and on each 30 s poll. Consolidates what
+        used to be three separate HTTP round-trips (and a duplicate
+        `list_subscriptions()` call inside the old `/lives/summary`
+        handler) into one.
+
+        Wall-clock shape on a warm-cache hit (steady-state poll):
+        `list_subscriptions` is a cheap single-query lookup (~5 ms);
+        `get_lives_summary` + `get_lives_totals` race in `to_thread`
+        and both hit warm 35 s TTL caches (~sub-ms). On a cold miss
+        (first request after restart, or 35 s gap) the parallel
+        `summary` query is the dominant cost.
+
+        The handle list is computed ONCE here and threaded into
+        `get_lives_summary`. The previous `/lives/summary` handler
+        re-fetched the subscription list internally when called
+        without `?handles=`, which doubled the DB work on every cold
+        mount — that duplication is gone now.
+
+        Each per-host summary slice is filtered through
+        `_BUNDLE_OMIT_SUMMARY_FIELDS` so the wire payload doesn't carry
+        fields the React grid never reads."""
+        subs = await self.list_subscriptions()
+        handles = [s["unique_id"] for s in subs if s.get("unique_id")]
+        # Run the two heavy aggregations in parallel against the
+        # connection pool. Each carries its own service-layer TTL +
+        # singleflight lock so concurrent tabs / cold-miss races
+        # collapse to one DB round-trip per cache window.
+        summary, totals = await asyncio.gather(
+            asyncio.to_thread(self.get_lives_summary, handles),
+            asyncio.to_thread(self.get_lives_totals),
+        )
+        # Strip dead-weight fields from each per-host slice. Done as
+        # a fresh dict so we don't mutate the cached summary (which
+        # gets returned for 35 s by the singleflight cache).
+        #
+        # Plus: `last_broadcasts` is a list of up to 3 prior broadcasts
+        # per host (~55 KB across 80 hosts), but the React card only
+        # renders `last_broadcasts[0]` (the most recent). Slicing to
+        # the first entry saves another ~35 KB per poll without changing
+        # the wire shape — frontend code that does `last_broadcasts?.[0]`
+        # still reads the same value.
+        omit = self._BUNDLE_OMIT_SUMMARY_FIELDS
+        trimmed: dict[str, dict[str, Any]] = {}
+        for handle, slice_ in summary.items():
+            entry: dict[str, Any] = {}
+            for k, v in slice_.items():
+                if k in omit:
+                    continue
+                if k == "last_broadcasts" and isinstance(v, list):
+                    v = v[:1]
+                entry[k] = v
+            trimmed[handle] = entry
+        return {"subs": subs, "summary": trimmed, "totals": totals}
 
     def insert_notification(
         self,

@@ -1,21 +1,29 @@
-import { useEffect, useMemo, useState } from 'react';
+import { lazy, Suspense, useEffect, useMemo, useState } from 'react';
 import { Radio } from 'lucide-react';
 
 import { PageShell, PageHeader } from '@/components/ui/PageShell';
 import {
   SubscriptionCard,
-  TikTokGifterDetailModal,
   type TikTokSubscription,
   type TikTokLiveSummary,
 } from '@admin';
+// Same code-split as the admin /admin/tiktok page — the gifter modal
+// pulls echarts on import and is closed 99% of the time. Loading the
+// chunk on first open keeps the public-lives bundle (which a viewer
+// hits cold from a marketing link) trim.
+const TikTokGifterDetailModal = lazy(() =>
+  import('@admin/components/TikTokGifterDetailModal')
+    .then((m) => ({ default: m.TikTokGifterDetailModal })),
+);
 import {
   TikTokApiProvider,
   type TikTokApi,
 } from '@admin/contexts/TikTokApiContext';
 import { publicTiktokApi, type PublicLivesPayload } from '../services/publicTiktok';
 
-/** Unauthenticated home page — surfaces the operator's public TikTok
- *  lives at `/`. Renders the *same* `SubscriptionCard` as the admin
+/** Unauthenticated public-lives index — surfaces the operator's
+ *  public TikTok lives at `/lives`. The landing page at `/` has a
+ *  marketing CTA that links here. Renders the *same* `SubscriptionCard` as the admin
  *  page so a public viewer gets visual parity (scoreboard, sparkline,
  *  week-heatmap, top-gifter chips, IN-MATCH pill, emerald LIVE
  *  badge) minus operator-only chrome.
@@ -67,7 +75,42 @@ export function PublicLives() {
       try {
         const r = await publicTiktokApi.listLives();
         if (cancelled) return;
-        setEntries(normalizePayload(r));
+        const next = normalizePayload(r);
+        // Structural sharing across polls — same pattern as the admin
+        // lives page. Each 30 s tick brings a fresh JSON parse, so
+        // entry / subscription / summary refs change wholesale even
+        // when the underlying data is unchanged. By preserving prior
+        // per-host references when JSON.stringify(prev) === stringify(new),
+        // `React.memo(SubscriptionCard)` short-circuits and we avoid
+        // re-rendering every card on every poll.
+        setEntries((prev) => {
+          if (prev.length === 0) return next;
+          const prevByHandle = new Map(
+            prev.map((e) => [e.subscription.unique_id, e]),
+          );
+          let mutated = false;
+          const merged = next.map((entry) => {
+            const prior = prevByHandle.get(entry.subscription.unique_id);
+            if (!prior) {
+              mutated = true;
+              return entry;
+            }
+            const subSame =
+              JSON.stringify(prior.subscription) === JSON.stringify(entry.subscription);
+            const sumSame =
+              JSON.stringify(prior.summary) === JSON.stringify(entry.summary);
+            if (subSame && sumSame) {
+              return prior;
+            }
+            mutated = true;
+            return {
+              subscription: subSame ? prior.subscription : entry.subscription,
+              summary: sumSame ? prior.summary : entry.summary,
+            };
+          });
+          if (!mutated && merged.length === prev.length) return prev;
+          return merged;
+        });
         setError(null);
       } catch (e) {
         if (cancelled) return;
@@ -175,19 +218,24 @@ export function PublicLives() {
           public viewers can inspect a top-gifter's history. The modal
           only displays the same kinds of signals the scoreboard
           already surfaces (totals, recent gifts), so it's safe to
-          expose. */}
-      <TikTokGifterDetailModal
-        isOpen={selectedGifter !== null}
-        onClose={() => setSelectedGifter(null)}
-        userId={selectedGifter?.userId ?? null}
-        uniqueId={selectedGifter?.uniqueId ?? null}
-        nickname={selectedGifter?.nickname ?? null}
-        diamondsTotal={selectedGifter?.diamonds ?? 0}
-        giftsCount={selectedGifter?.gifts ?? 0}
-        roomId={selectedGifter?.roomId ?? null}
-        currentHandle={selectedGifter?.currentHandle}
-        readOnly
-      />
+          expose. Mounted conditionally so the lazy chunk is fetched
+          only when a gifter chip is actually clicked. */}
+      <Suspense fallback={null}>
+        {selectedGifter !== null && (
+          <TikTokGifterDetailModal
+            isOpen
+            onClose={() => setSelectedGifter(null)}
+            userId={selectedGifter.userId ?? null}
+            uniqueId={selectedGifter.uniqueId ?? null}
+            nickname={selectedGifter.nickname ?? null}
+            diamondsTotal={selectedGifter.diamonds ?? 0}
+            giftsCount={selectedGifter.gifts ?? 0}
+            roomId={selectedGifter.roomId ?? null}
+            currentHandle={selectedGifter.currentHandle}
+            readOnly
+          />
+        )}
+      </Suspense>
     </PageShell>
     </TikTokApiProvider>
   );

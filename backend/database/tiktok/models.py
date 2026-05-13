@@ -299,12 +299,18 @@ class TikTokEventModel(Base):
 
 
 class TikTokEventHourCountModel(Base):
-    """Pre-aggregated event count per (host, hour). Replaces the
-    1.7M-row /admin/tiktok rhythm-strip scan with a ≤24-row-per-host
-    indexed lookup. Bumped inline by the event-persist transaction
-    (one UPSERT per event, fast as long as the PK index is hot).
-    Backfilled once from `tiktok_events` by the migration; the live
-    write hook keeps it accurate from then on."""
+    """Pre-aggregated event count + diamond total per (host, hour).
+    Replaces the 1.7M-row /admin/tiktok rhythm-strip scan with a
+    ≤24-row-per-host indexed lookup. Bumped inline by the
+    event-persist transaction (one UPSERT per event, fast as long as
+    the PK index is hot). Backfilled once from `tiktok_events` by
+    the migration; the live write hook keeps it accurate from then on.
+
+    The `diamonds` column was added by Phase 5 of the lives-list perf
+    plan so `get_lives_totals` can compute the 24h diamond sum from
+    this pre-agg table (≤79×24 = 1896 rows) instead of scanning the
+    full gift-event volume of the last 24 hours (millions of rows on
+    a busy install)."""
 
     __tablename__ = "tiktok_event_hour_counts"
 
@@ -314,3 +320,7 @@ class TikTokEventHourCountModel(Base):
     # filter via `> NOW() - INTERVAL '24 hours'` directly.
     hour_bucket = Column(DateTime(timezone=True), primary_key=True)
     n = Column(BigInteger, nullable=False, default=0)
+    # Pre-aggregated diamonds for this (host, hour). Bumped inline
+    # by `_bump_event_hour_count` for events with type='gift' using
+    # `payload->>'diamond_count' * payload->>'repeat_count'`.
+    diamonds = Column(BigInteger, nullable=False, default=0)

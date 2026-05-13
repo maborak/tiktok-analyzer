@@ -172,15 +172,27 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
   // Past-battles host chip. Re-fetched on a 30s cadence so the live
   // status stays fresh without WS dependency.
   const [hostProfile, setHostProfile] = useState<TikTokSubscription | null>(null);
+  // 30-day activity summary lifted out of TikTokLiveCalendar so the
+  // ProfileHeaderCard can render the chip alongside the avatar (vs
+  // the calendar's own header strap). Set via the calendar's
+  // `onSummary` callback when its data resolves.
+  const [activitySummary, setActivitySummary] = useState<
+    import('@admin/components/TikTokLiveCalendar').TikTokLiveActivitySummary | null
+  >(null);
   // When a Top Gifter row is clicked, this stores enough context to
   // populate the gift-history modal without a second round-trip.
   const [selectedGifter, setSelectedGifter] = useState<{
     userId: string | null;
     uniqueId: string | null;
     nickname: string | null;
-    diamonds: number;
-    gifts: number;
-    comments: number;
+    /** Counters are optional. Click paths that already know the
+     *  totals (leaderboard chips, gifters table) pass them through.
+     *  Paths that don't (the comments timeline only knows identity)
+     *  leave them undefined — the gifter modal then renders `(·)` on
+     *  the tab badges instead of a misleading `(0)`. */
+    diamonds?: number;
+    gifts?: number;
+    comments?: number;
     /** Tab to open by default — defaults to "gifts" but the user can
      *  open directly into "comments" by clicking the comments chip. */
     tab?: 'gifts' | 'comments' | 'relationships';
@@ -413,8 +425,25 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
         until: customRange.until,
       };
     }
+    // Single-broadcast calendar pick: dayWindow is set but
+    // aggregatedRooms is null. Surface the dayWindow as a custom
+    // range so the chart + tabs filter to the picked tz-day and the
+    // numbers match the calendar's per-day bucket. Without this
+    // branch, fetchStats falls back to BROADCAST_WINDOW and pulls
+    // the entire pinned broadcast's diamonds — a cross-midnight
+    // broadcast or a multi-hour stream that mostly ran on a
+    // different day would show a total wildly larger than the
+    // calendar cell promised.
+    if (dayWindow && !aggregatedRooms) {
+      return {
+        kind: 'custom',
+        label: `Day · ${dayWindow.dateYmd}`,
+        since: dayWindow.since,
+        until: dayWindow.until,
+      };
+    }
     return BROADCAST_WINDOW;
-  }, [customRange]);
+  }, [customRange, dayWindow, aggregatedRooms]);
 
   /** Resolve a WindowOption to concrete since/until ISO strings.
    *  Centralized so the Top Gifters comments-tab and the stats fetcher
@@ -497,6 +526,13 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
       const span =
         first && last ? `${fmtTime(first)} → ${fmtTime(last)}` : '';
       return `Day view · ${dateLabel}${span ? ` · ${span}` : ''} · summing ${aggregatedRoomsChrono.length} broadcasts`;
+    }
+    // Single-broadcast calendar pick: dayWindow is set, aggregated
+    // mode is off. Frame as the zone-day rather than the broadcast's
+    // own bounds so the heading matches the calendar cell the user
+    // just clicked.
+    if (dayWindow && !aggregatedRoomsChrono) {
+      return `Day view · ${fmtDate(dayWindow.since)} · ${fmtTime(dayWindow.since)} → ${fmtTime(dayWindow.until)}`;
     }
     if (selectedRoom?.first_seen_at) {
       const start = selectedRoom.first_seen_at;
@@ -661,12 +697,17 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [handle]);
 
-  // Re-fetch stats on room change OR custom-range change.
+  // Re-fetch stats on room change, brushed-range change, OR
+  // calendar-day pick. `dayWindow` is in the deps because it now
+  // feeds into `effectiveWindow` (single-broadcast calendar picks
+  // route through it); without it, clicking a different day on the
+  // calendar wouldn't re-fire the fetch and the chart kept showing
+  // whatever was loaded previously.
   useEffect(() => {
     if (aggregatedRooms && aggregatedRooms.length > 1) return; // handled below
     if (roomId) fetchStats(roomId, effectiveWindow, selectedRoom);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [roomId, customRange, aggregatedRooms]);
+  }, [roomId, customRange, dayWindow, aggregatedRooms]);
 
   // Day-aggregate fetch path. When 2+ rooms are selected we hit a
   // single backend endpoint that does the room_id IN (...) GROUP BY
@@ -1225,17 +1266,13 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
         }
         actions={
           <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
-            {/* Realtime/poll indicator — same component on admin and
-                public mounts; reads runtime config + telemetry to show
-                whether the page is streaming WS events or falling
-                back to REST polling. The `audience` prop picks which
-                configured mode (admin vs public) it describes. */}
-            <TikTokRealtimeIndicator audience={readOnly ? 'public' : 'admin'} />
-            {/* Back link — admin routes back to the lives index;
-                public routes back to the unauthenticated home page.
-                Same affordance, different target depending on which
-                surface the user is browsing. */}
-            <Link to={readOnly ? '/' : '/admin/tiktok'}>
+            {/* Back link — admin routes back to /admin/tiktok (the
+                admin lives index); public routes back to /lives (the
+                public lives index that was moved out of `/` when the
+                landing page was added). Same affordance, different
+                target depending on which surface the user is
+                browsing. */}
+            <Link to={readOnly ? '/lives' : '/admin/tiktok'}>
               <Button variant="ghost" size="sm">
                 <ArrowLeft className="w-4 h-4 mr-1" />
                 Lives
@@ -1255,9 +1292,15 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
                     // auto-advance so a new broadcast starting won't yank
                     // the user off their explicit selection.
                     pinRoom(rid);
-                    // Different broadcast → drop any brush-selected range.
+                    // Different broadcast → drop any brush-selected range
+                    // AND any calendar-picked day window. Without
+                    // clearing dayWindow, the new broadcast would still
+                    // be filtered to the OLD day's tz-bounds, hiding
+                    // most of its events.
                     setCustomRange(null);
                     setBrushIndices(null);
+                    setDayWindow(null);
+                    setAggregatedRooms(null);
                   }}
                   isLiveRoom={(r) =>
                     !r.ended_at && !roomEndedHeuristic(r)
@@ -1289,9 +1332,13 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
       />
 
       {/* Rich profile header + live-activity heatmap.
-          Side-by-side on lg+; stacked on mobile. The heatmap is a
-          fixed-ish width so the profile card takes the lion's share
-          of the row at desktop sizes. */}
+          Side-by-side on lg+, stacked on mobile. The heatmap uses
+          `h-8` (rectangular) cells instead of `aspect-square` so the
+          panel matches the profile card's height envelope on desktop
+          — square cells would balloon vertically and dwarf the
+          profile beside them. The lg:w-[420px] sidebar gives the
+          heatmap room for ~5 columns × ~70px each with inline
+          diamond counts readable at a glance. */}
       <div className="flex flex-col lg:flex-row gap-4 items-stretch">
         <div className="flex-1 min-w-0">
           <ProfileHeaderCard
@@ -1300,13 +1347,15 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
             recent={recent}
             selectedRoom={selectedRoom}
             readOnly={readOnly}
+            activitySummary={activitySummary}
           />
         </div>
-        <div className="lg:w-[360px] lg:shrink-0">
+        <div className="lg:w-[420px] lg:shrink-0">
           <TikTokLiveCalendar
             handle={handle}
-            weeks={13}
+            weeks={5}
             rooms={rooms}
+            onSummary={setActivitySummary}
             onSelectDay={(dayRooms, date) => {
               if (dayRooms.length === 0) return;
               // Resolve the day to UTC bounds in the user's zone now
@@ -1318,7 +1367,18 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
               if (dayRooms.length === 1) {
                 pinRoom(dayRooms[0].room_id);
                 setAggregatedRooms(null);
-                setDayWindow(null);
+                // Keep `dayWindow` set so `effectiveWindow` (and
+                // therefore chart + tabs) filter to the picked
+                // tz-day rather than the broadcast's full extent.
+                // `aggregatedRooms` stays null because there's only
+                // one broadcast — the day-aggregate banner above
+                // the chart is gated on `aggregatedRooms.length > 1`
+                // and won't render here.
+                setDayWindow({
+                  dateYmd: date,
+                  since: bounds.since,
+                  until: bounds.until,
+                });
                 setCustomRange(null);
                 setBrushIndices(null);
                 return;
@@ -1783,10 +1843,16 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
                 userId: u.userId,
                 uniqueId: u.uniqueId,
                 nickname: u.nickname,
-                diamonds: 0,
-                gifts: 0,
-                comments: 0,
-                tab: 'comments',
+                // Counters left undefined — the comments timeline only
+                // knows the user's identity, not their lifetime gift /
+                // comment totals. Forcing 0 here made the tab badges
+                // render "(0)" instead of "(·)". The per-tab search's
+                // own countEvents call still populates the pagination
+                // total accurately once data loads.
+                diamonds: undefined,
+                gifts: undefined,
+                comments: undefined,
+                tab: u.tab ?? 'comments',
               })
             }
           />
@@ -1848,9 +1914,15 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
         userId={selectedGifter?.userId ?? null}
         uniqueId={selectedGifter?.uniqueId ?? null}
         nickname={selectedGifter?.nickname ?? null}
-        diamondsTotal={selectedGifter?.diamonds ?? 0}
-        giftsCount={selectedGifter?.gifts ?? 0}
-        commentsCount={selectedGifter?.comments ?? 0}
+        // Don't default to 0 — for clicks from the comments timeline
+        // we don't know the user's lifetime counters, and showing
+        // "(0)" on the tab badges is misleading. Leaving these
+        // undefined lets the modal render `(·)` instead and the
+        // per-tab search query populates the real total in
+        // pagination once data loads.
+        diamondsTotal={selectedGifter?.diamonds}
+        giftsCount={selectedGifter?.gifts}
+        commentsCount={selectedGifter?.comments}
         defaultTab="current"
         currentInnerTab={selectedGifter?.tab ?? 'gifts'}
         roomId={roomId}
@@ -2276,6 +2348,12 @@ interface ProfileHeaderCardProps {
    *  modal (which read worker_log), and skip the listenerStatus poll
    *  entirely (the public namespace doesn't expose it). */
   readOnly?: boolean;
+  /** Last-30-days activity summary emitted by `TikTokLiveCalendar`
+   *  via its `onSummary` callback. Rendered as a single chip in the
+   *  card header so the profile and the heatmap stay separated
+   *  visually but share the headline number. `null` while the
+   *  calendar fetch is in flight. */
+  activitySummary?: import('@admin/components/TikTokLiveCalendar').TikTokLiveActivitySummary | null;
 }
 
 function ProfileHeaderCard({
@@ -2284,6 +2362,7 @@ function ProfileHeaderCard({
   recent,
   selectedRoom,
   readOnly = false,
+  activitySummary = null,
 }: ProfileHeaderCardProps) {
   const tiktokApi = useTikTokApi();
   // Re-render once a second so the "last event Xs ago" stays accurate
@@ -2417,6 +2496,52 @@ function ProfileHeaderCard({
             )}
           </div>
 
+          {/* 30-day activity summary chip — emitted by the
+              TikTokLiveCalendar via `onSummary`. We render it here
+              (instead of inside the calendar's header) so the
+              profile carries the headline number and the heatmap
+              stays a clean grid. */}
+          {activitySummary && activitySummary.activeDays > 0 && (
+            <div className="mt-1.5 text-[11px] font-mono text-gray-500 tabular-nums flex items-center gap-1 flex-wrap">
+              <span className="uppercase tracking-wider text-[9px] text-gray-400">
+                30d
+              </span>
+              <span>·</span>
+              <span>
+                {activitySummary.activeDays} day
+                {activitySummary.activeDays === 1 ? '' : 's'} active
+              </span>
+              <span>·</span>
+              <span>
+                {activitySummary.totalBroadcasts} broadcast
+                {activitySummary.totalBroadcasts === 1 ? '' : 's'}
+              </span>
+              {activitySummary.totalMinutes > 0 && (
+                <>
+                  <span>·</span>
+                  <span>{formatActivityDuration(activitySummary.totalMinutes)}</span>
+                </>
+              )}
+              {activitySummary.totalDiamonds > 0 && (
+                <>
+                  <span>·</span>
+                  <span className="text-amber-700 dark:text-amber-300">
+                    {formatActivityCount(activitySummary.totalDiamonds)} 💎
+                  </span>
+                </>
+              )}
+              {activitySummary.totalMatches > 0 && (
+                <>
+                  <span>·</span>
+                  <span>
+                    {activitySummary.totalMatches} match
+                    {activitySummary.totalMatches === 1 ? '' : 'es'}
+                  </span>
+                </>
+              )}
+            </div>
+          )}
+
           {profile?.bio && (
             <p className="mt-2 text-xs text-gray-600 dark:text-gray-400 whitespace-pre-line line-clamp-3">
               {profile.bio}
@@ -2484,14 +2609,14 @@ function ProfileHeaderCard({
             )}
           </div>
 
-          {/* Timezone selector — every date / time on this page (chart
-              labels, broadcast pills, day-picker, comments timeline,
-              calendar, match history) is rendered through the
-              context's helpers, so changing this dropdown reformats
-              the entire page in place. The choice is persisted to
-              localStorage and re-applies on next visit. */}
-          <div className="mt-2">
+          {/* Timezone selector + realtime indicator — both are page-
+              level controls that live in the profile card instead of
+              the page header so the operator can read them alongside
+              the host context. `flex-wrap` lets the indicator drop to
+              a second line on narrow viewports. */}
+          <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1">
             <TimezoneSelector />
+            <TikTokRealtimeIndicator audience={readOnly ? 'public' : 'admin'} />
           </div>
 
           {/* Probe-debug trigger + modal — admin-only. Reads worker_log,
@@ -2935,6 +3060,59 @@ function compactCount(n: number): string {
   if (n >= 10_000) return `${(n / 1_000).toFixed(0)}k`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
   return n.toLocaleString();
+}
+
+/** Same shape as `compactCount` but lives next to its sibling
+ *  duration formatter so the activity-summary chip in ProfileHeaderCard
+ *  reads them both from one place. */
+function formatActivityCount(n: number): string {
+  return compactCount(n);
+}
+
+/** Minutes → human-readable "1d 5h 12m" form. Distinct from the
+ *  start/end-ISO `formatDuration` already used by the chart row. */
+function formatActivityDuration(minutes: number): string {
+  if (minutes < 60) return `${minutes}m`;
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  if (h < 24) return m === 0 ? `${h}h` : `${h}h ${m}m`;
+  const d = Math.floor(h / 24);
+  const hh = h % 24;
+  return hh === 0 ? `${d}d` : `${d}d ${hh}h`;
+}
+
+/** Current UTC offset for an IANA timezone, in both a display
+ *  string ("UTC-04:00", "UTC+05:30") and signed-minute form for
+ *  sorting. Uses `Intl.DateTimeFormat`'s `longOffset` token which
+ *  gives a normalized "GMT±HH:MM" string regardless of DST state —
+ *  we re-prefix with "UTC" so the dropdown reads consistently with
+ *  the rest of the framework. */
+function currentTzOffset(tz: string): { display: string; minutes: number } {
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz,
+      timeZoneName: 'longOffset',
+    }).formatToParts(new Date());
+    const raw =
+      parts.find((p) => p.type === 'timeZoneName')?.value ?? 'GMT+00:00';
+    // `longOffset` produces "GMT+05:00" or "GMT" (for UTC exact).
+    const m = /^GMT([+-])(\d{1,2})(?::?(\d{2}))?$/.exec(raw);
+    if (!m) {
+      // Sole "GMT" (no sign) — that's UTC.
+      return { display: 'UTC+00:00', minutes: 0 };
+    }
+    const sign = m[1] === '-' ? -1 : 1;
+    const hh = parseInt(m[2], 10);
+    const mm = parseInt(m[3] ?? '0', 10);
+    const totalMin = sign * (hh * 60 + mm);
+    const pad2 = (n: number) => String(n).padStart(2, '0');
+    return {
+      display: `UTC${sign < 0 ? '-' : '+'}${pad2(hh)}:${pad2(mm)}`,
+      minutes: totalMin,
+    };
+  } catch {
+    return { display: 'UTC?', minutes: 0 };
+  }
 }
 
 function CardTabButton({
@@ -4286,14 +4464,31 @@ function TimezoneSelector() {
   // Build the option set: browser-local always at the top, then the
   // curated list. If the browser zone is already in the curated list
   // we don't duplicate; if the active zone is something exotic we
-  // also append it so the <select> shows a matching option.
+  // also append it so the <select> shows a matching option. Each
+  // option carries a `currentOffset` field computed at render time
+  // so the dropdown shows DST-aware UTC offsets like `(UTC-04:00)`
+  // alongside the region/city — DST shifts are picked up on the
+  // next minute-tick (force re-render above).
   const allOptions = useMemo(() => {
     const seen = new Set<string>();
-    const out: Array<{ value: string; label: string; region: string }> = [];
+    const out: Array<{
+      value: string;
+      label: string;
+      region: string;
+      currentOffset: string;
+      offsetMinutes: number;
+    }> = [];
     const push = (v: string, label: string, region: string) => {
       if (seen.has(v)) return;
       seen.add(v);
-      out.push({ value: v, label, region });
+      const { display, minutes } = currentTzOffset(v);
+      out.push({
+        value: v,
+        label,
+        region,
+        currentOffset: display,
+        offsetMinutes: minutes,
+      });
     };
     push(browserTz, `Browser local — ${browserTz}`, 'Auto');
     for (const opt of TIMEZONE_OPTIONS) {
@@ -4301,16 +4496,27 @@ function TimezoneSelector() {
     }
     if (!seen.has(tz)) push(tz, tz, 'Custom');
     return out;
+    // `force` tick updates the closure so DST flips refresh the
+    // offset labels without a full page reload.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [browserTz, tz]);
 
-  // Group by region for the optgroups.
+  // Group by region for the optgroups. Inside each group, sort by
+  // current UTC offset so options like `(UTC-10:00) Honolulu` come
+  // before `(UTC-08:00) Los Angeles` — feels more natural when
+  // scanning a list with offsets prefixed.
   const grouped = useMemo(() => {
     const byRegion: Record<string, typeof allOptions> = {};
     for (const opt of allOptions) {
       (byRegion[opt.region] ??= []).push(opt);
     }
+    for (const region of Object.keys(byRegion)) {
+      byRegion[region].sort((a, b) => a.offsetMinutes - b.offsetMinutes);
+    }
     return byRegion;
   }, [allOptions]);
+
+  const activeOption = allOptions.find((o) => o.value === tz);
 
   // Live preview of "now" in the selected zone — the most useful UI
   // signal for "did I pick the right one?".
@@ -4359,13 +4565,21 @@ function TimezoneSelector() {
             <optgroup key={region} label={region}>
               {opts.map((o) => (
                 <option key={o.value} value={o.value}>
-                  {o.label}
+                  ({o.currentOffset}) {o.label}
                 </option>
               ))}
             </optgroup>
           ))}
           <option value="__other__">Other / paste IANA name…</option>
         </select>
+        {activeOption && (
+          <span
+            className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-sky-50 text-sky-700 dark:bg-sky-500/10 dark:text-sky-300"
+            title={`${activeOption.value} is currently ${activeOption.currentOffset} from UTC. Shifts automatically on DST transitions.`}
+          >
+            {activeOption.currentOffset}
+          </span>
+        )}
         {tz !== browserTz && (
           <button
             type="button"

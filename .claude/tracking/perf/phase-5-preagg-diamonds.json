@@ -1,0 +1,21 @@
+{
+  "label": "phase-5-preagg-diamonds",
+  "timestamp": "2026-05-13T16:47:52.024186+00:00",
+  "base_url": "http://localhost:9020",
+  "warmup": 2,
+  "cold": {
+    "GET /admin/tiktok/lives/bundle": {
+      "ms": 846.0,
+      "status": 200,
+      "bytes": 266757
+    }
+  },
+  "warm": {
+    "total_p50_ms": 17.23,
+    "total_p95_ms": 19.67,
+    "total_min_ms": 16.04,
+    "total_max_ms": 19.67,
+    "total_mean_ms": 17.48,
+    "runs": 15
+  }
+}

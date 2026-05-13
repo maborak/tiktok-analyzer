@@ -10,7 +10,7 @@
  * Used as a tab on /admin/tiktok beside "Lives" / "Worker".
  */
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from '@tanstack/react-router';
 import { ChevronLeft, ChevronRight, Loader2, RefreshCw, Search, Users, X } from 'lucide-react';
 
@@ -21,7 +21,14 @@ import {
   openTikTokWebSocket,
   tiktokApi,
 } from '@admin/services/tiktok';
-import { TikTokGifterDetailModal } from '@admin/components/TikTokGifterDetailModal';
+// Lazy-load the gifter modal so the echarts chunk it pulls in is
+// only fetched when a row is actually clicked. Without this, every
+// page that mounts this table (TikTokLives, TikTokLiveDetail) pays
+// for the full modal bundle on first paint.
+const TikTokGifterDetailModal = lazy(() =>
+  import('@admin/components/TikTokGifterDetailModal')
+    .then((m) => ({ default: m.TikTokGifterDetailModal })),
+);
 
 const PAGE_SIZE_OPTIONS = [10, 25, 50, 100] as const;
 const DEFAULT_PAGE_SIZE = 25;
@@ -316,15 +323,19 @@ export function TikTokCommonGiftersTable({ refreshKey = 0, mode = 'common' }: Pr
         </ul>
       )}
 
-      <TikTokGifterDetailModal
-        isOpen={selected !== null}
-        userId={selected?.user_id ?? null}
-        nickname={selected?.nickname ?? null}
-        uniqueId={selected?.unique_id ?? null}
-        avatarUrl={selected?.avatar_url ?? null}
-        onClose={() => setSelected(null)}
-        defaultTab="profile"
-      />
+      <Suspense fallback={null}>
+        {selected !== null && (
+          <TikTokGifterDetailModal
+            isOpen
+            userId={selected.user_id ?? null}
+            nickname={selected.nickname ?? null}
+            uniqueId={selected.unique_id ?? null}
+            avatarUrl={selected.avatar_url ?? null}
+            onClose={() => setSelected(null)}
+            defaultTab="profile"
+          />
+        )}
+      </Suspense>
 
       {/* Pagination footer — only when there's something to page. */}
       {items.length > 0 && (

@@ -1,6 +1,6 @@
 import { createLazyFileRoute } from '@tanstack/react-router'
-import { PublicLives } from '@/modules/public/pages/PublicLives'
+import { Landing } from '@/modules/public/pages/Landing'
 
 export const Route = createLazyFileRoute('/_public/')({
-  component: PublicLives,
+  component: Landing,
 })

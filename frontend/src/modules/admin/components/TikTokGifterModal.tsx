@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { Link } from '@tanstack/react-router';
 import toast from 'react-hot-toast';
 import {
+  CalendarDays,
   ChevronLeft,
   ChevronRight,
   ExternalLink,
@@ -17,6 +18,8 @@ import {
   Users,
   X,
 } from 'lucide-react';
+
+import { TikTokDailyHeatmap30 } from '@admin/components/TikTokDailyHeatmap30';
 
 import { Input } from '@/components/ui/Input';
 
@@ -38,14 +41,21 @@ import {
 interface GifterModalProps {
   isOpen: boolean;
   onClose: () => void;
-  /** Gifter context — used for filtering and the modal header. */
+  /** Gifter context — used for filtering and the modal header.
+   *
+   *  Counters are optional: callers that already have a row's diamond/
+   *  gift totals (the leaderboard chip path) should pass them through
+   *  so the header + tab badges show real numbers immediately. Callers
+   *  that DON'T have those numbers (the comments-timeline path —
+   *  clicking a commenter only knows their identity, not their
+   *  lifetime counters) should leave them undefined. The badge then
+   *  renders `(·)` instead of a misleading `(0)`, and the per-tab
+   *  search query's own `total` populates pagination as normal. */
   userId: string | null;
   uniqueId: string | null;
   nickname: string | null;
-  diamondsTotal: number;
-  giftsCount: number;
-  /** Optional comment count (from the leaderboard chip). Used to label
-   *  the Comments tab; the actual comments are fetched when the tab opens. */
+  diamondsTotal?: number;
+  giftsCount?: number;
   commentsCount?: number;
   /** When set, scope all queries to this room only. Otherwise show
    *  the user's history across every monitored room. */
@@ -58,7 +68,7 @@ interface GifterModalProps {
   extraRoomIds?: string[];
   /** Auto-select the Comments tab on open (used when the user clicked
    *  the comments chip rather than the gifter row). */
-  defaultTab?: 'gifts' | 'comments' | 'relationships' | 'matches';
+  defaultTab?: 'gifts' | 'timeline' | 'comments' | 'relationships' | 'matches';
   /** The handle whose page the modal is being viewed from. Used by the
    *  Relationships tab to mark "this host" in the per-host list and
    *  to suppress the redundant link back to the same page. Optional —
@@ -150,9 +160,18 @@ export function TikTokGifterModal({
   // Stable string key for the extras — array identity flips every
   // render. Used in dep arrays without re-running on no-op changes.
   const extraKey = (extraRoomIds ?? []).join(',');
-  const [tab, setTab] = useState<'gifts' | 'comments' | 'relationships' | 'matches'>(
-    defaultTab,
-  );
+  const [tab, setTab] = useState<
+    'gifts' | 'timeline' | 'comments' | 'relationships' | 'matches'
+  >(defaultTab);
+  // Per-day diamond / gift totals for the (user, currentHandle) pair
+  // over the last 30 days. Drives the Timeline tab's heatmap. Lazy-
+  // fetched the first time the user lands on the Timeline tab and
+  // re-fetched when userId/handle changes.
+  const [dailySeries, setDailySeries] = useState<
+    Array<{ day: string; diamonds: number; gifts: number }> | null
+  >(null);
+  const [dailySeriesLoading, setDailySeriesLoading] = useState(false);
+  const [dailySeriesError, setDailySeriesError] = useState<string | null>(null);
   // Cross-host activity for the Relationships tab. Lazy-fetched the
   // first time the user lands on the tab; cached for the lifetime of
   // the open modal so flipping back-and-forth doesn't re-hit the
@@ -186,13 +205,14 @@ export function TikTokGifterModal({
   const [isMonitored, setIsMonitored] = useState<boolean>(false);
   const [addMonitorOpen, setAddMonitorOpen] = useState<boolean>(false);
   const hasWindow = Boolean(windowSince && windowUntil);
-  // Scope: 'window' (bounded by [windowSince, windowUntil)), 'room', 'all'.
-  // Default to 'window' when a window is provided so the user's first view
-  // matches the context that opened the modal (a past-match leaderboard).
-  type Scope = 'window' | 'room' | 'all';
-  const [scope, setScope] = useState<Scope>(
-    hasWindow ? 'window' : roomId ? 'room' : 'all'
-  );
+  // Scope: 'window' (bounded by [windowSince, windowUntil)) or 'room'.
+  // The previous 'all' (cross-host) option was removed — cross-host
+  // exploration lives under the Profile tab of the unified shell now,
+  // and surfacing it inside the in-room Current view was confusing
+  // ("this broadcast" + "cross-host" implies a third axis the data
+  // doesn't actually have).
+  type Scope = 'window' | 'room';
+  const [scope, setScope] = useState<Scope>(hasWindow ? 'window' : 'room');
 
   const [giftEvents, setGiftEvents] = useState<TikTokEvent[]>([]);
   const [commentEvents, setCommentEvents] = useState<TikTokEvent[]>([]);
@@ -222,7 +242,7 @@ export function TikTokGifterModal({
   useEffect(() => {
     if (!isOpenEff) return;
     setTab(defaultTab);
-    setScope(hasWindow ? 'window' : roomId ? 'room' : 'all');
+    setScope(hasWindow ? 'window' : 'room');
     setPage(0);
     setQ('');
     setDebouncedQ('');
@@ -234,7 +254,42 @@ export function TikTokGifterModal({
     setMatchesData(null);
     setMatchesError(null);
     setMatchesPage(0);
+    setDailySeries(null);
+    setDailySeriesError(null);
   }, [isOpenEff, userId, roomId, defaultTab, hasWindow]);
+
+  // Lazy-fetch the per-(user, currentHandle) daily series the first
+  // time the Timeline tab is activated. Cached for the lifetime of
+  // the open modal — flipping back and forth doesn't re-hit the
+  // backend. Skipped when there's no currentHandle in the click
+  // payload (e.g. opening from a search index where the host is
+  // ambiguous); Timeline still renders, just with an empty-state.
+  useEffect(() => {
+    if (!isOpenEff || !userId || tab !== 'timeline') return;
+    if (dailySeries !== null || dailySeriesLoading) return;
+    if (!currentHandle) {
+      setDailySeries([]);
+      return;
+    }
+    let cancelled = false;
+    setDailySeriesLoading(true);
+    setDailySeriesError(null);
+    tiktokApi
+      .getUserHostDailySeries({ userId, handle: currentHandle, days: 30 })
+      .then((rows) => {
+        if (cancelled) return;
+        setDailySeries(rows);
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setDailySeriesError((e as Error).message || 'Failed to load timeline');
+      })
+      .finally(() => {
+        if (!cancelled) setDailySeriesLoading(false);
+      });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpenEff, userId, currentHandle, tab]);
 
   // Force matches refetch when scope or paging changes.
   useEffect(() => {
@@ -255,23 +310,11 @@ export function TikTokGifterModal({
     // Build the room-set + time window from the same scope semantics
     // the gifts/comments queries use, so the Matches tab respects the
     // operator's scope chip selection.
-    //
-    // `scope === 'all'` admin path: undefined room_ids → cross-host
-    // matches across every monitored room (works because the admin
-    // endpoint accepts that). Public path requires `room_ids` — fall
-    // back to the in-scope room set (roomId + extraRoomIds) so the
-    // request actually reaches the endpoint instead of 422-ing.
-    const fullRoomSet = roomId
+    const roomIds: string[] | undefined = roomId
       ? Array.from(new Set([roomId, ...(extraRoomIds ?? [])]))
       : (extraRoomIds && extraRoomIds.length > 0
           ? Array.from(new Set(extraRoomIds))
           : undefined);
-    const roomIds: string[] | undefined =
-      scope === 'all'
-        ? readOnly
-          ? fullRoomSet
-          : undefined
-        : fullRoomSet;
     const since = scope === 'window' ? (windowSince ?? undefined) : undefined;
     const until = scope === 'window' ? (windowUntil ?? undefined) : undefined;
     tiktokApi
@@ -437,12 +480,9 @@ export function TikTokGifterModal({
     let cancelled = false;
     const type = tab === 'gifts' ? 'gift' : 'comment';
     setLoading(true);
-    const roomsInScope =
-      scope === 'all'
-        ? undefined
-        : roomId
-          ? Array.from(new Set([roomId, ...(extraRoomIds ?? [])]))
-          : undefined;
+    const roomsInScope = roomId
+      ? Array.from(new Set([roomId, ...(extraRoomIds ?? [])]))
+      : undefined;
     const md =
       tab === 'gifts' && minDiamonds !== '' && Number(minDiamonds) > 0
         ? Number(minDiamonds)
@@ -566,9 +606,13 @@ export function TikTokGifterModal({
             )}
           </div>
           <div className="flex items-baseline gap-4">
-            <Stat label="Diamonds" value={diamondsTotal.toLocaleString()} accent="amber" />
-            <Stat label="Gifts" value={giftsCount.toLocaleString()} />
-            {commentsCount !== undefined && (
+            {typeof diamondsTotal === 'number' && diamondsTotal > 0 && (
+              <Stat label="Diamonds" value={diamondsTotal.toLocaleString()} accent="amber" />
+            )}
+            {typeof giftsCount === 'number' && giftsCount > 0 && (
+              <Stat label="Gifts" value={giftsCount.toLocaleString()} />
+            )}
+            {typeof commentsCount === 'number' && commentsCount > 0 && (
               <Stat label="Comments" value={commentsCount.toLocaleString()} accent="sky" />
             )}
           </div>
@@ -576,17 +620,12 @@ export function TikTokGifterModal({
       )}
 
       {/* Contextual scope banner — tells the operator at a glance
-          WHICH dataset is being summed below. Computed from the
-          active scope + the provided labels so the user never has
-          to read the small chip toggle to know "is this last
-          broadcast / all time / this match window". */}
+          WHICH dataset is being summed below. */}
       {roomId && (() => {
-        const activeLabel = (() => {
-          if (scope === 'window') return windowLabel ?? 'Selected window';
-          if (scope === 'all')    return 'Every event captured (cross-host)';
-          // scope === 'room'
-          return roomSetLabel ?? 'This broadcast';
-        })();
+        const activeLabel =
+          scope === 'window'
+            ? (windowLabel ?? 'Selected window')
+            : (roomSetLabel ?? 'This broadcast');
         return (
           <div className="mb-3 text-[11px] font-mono text-gray-500 inline-flex items-center gap-1.5">
             <span className="uppercase tracking-wider">Showing:</span>
@@ -595,25 +634,24 @@ export function TikTokGifterModal({
         );
       })()}
 
-      {/* Scope toggle — same horizontal-scroll treatment as the
-          tab bar below. The `roomSetLabel` chip can run long
-          ("All time · 50 broadcasts") and was breaking the row on
-          narrow viewports. */}
-      {roomId && (
+      {/* Scope toggle — shown ONLY when there's a window context
+          (e.g. a past battle the operator drilled into), giving
+          them the choice between "this battle" and "this broadcast".
+          With no window, the only remaining scope is the broadcast
+          itself, so the toggle becomes a single-segment control —
+          redundant — and we hide it entirely. Cross-host scope was
+          dropped from this view; cross-host exploration lives on
+          the Profile tab of the unified shell. */}
+      {roomId && hasWindow && (
         <div className="flex items-center gap-1 mb-3 text-xs overflow-x-auto whitespace-nowrap -mx-4 px-4 sm:mx-0 sm:px-0">
-          {hasWindow && (
-            <ScopeButton
-              active={scope === 'window'}
-              onClick={() => setScope('window')}
-            >
-              {windowLabel ?? 'This window'}
-            </ScopeButton>
-          )}
+          <ScopeButton
+            active={scope === 'window'}
+            onClick={() => setScope('window')}
+          >
+            {windowLabel ?? 'This window'}
+          </ScopeButton>
           <ScopeButton active={scope === 'room'} onClick={() => setScope('room')}>
             {roomSetLabel ?? 'This broadcast'}
-          </ScopeButton>
-          <ScopeButton active={scope === 'all'} onClick={() => setScope('all')}>
-            Cross-host
           </ScopeButton>
         </div>
       )}
@@ -633,8 +671,12 @@ export function TikTokGifterModal({
           <GiftIcon className="w-3.5 h-3.5" />
           Gifts
           <span className="ml-1.5 text-[10px] text-gray-500 font-mono">
-            ({giftsCount})
+            ({giftsCount ?? '·'})
           </span>
+        </TabButton>
+        <TabButton active={tab === 'timeline'} onClick={() => setTab('timeline')}>
+          <CalendarDays className="w-3.5 h-3.5" />
+          Timeline
         </TabButton>
         <TabButton active={tab === 'comments'} onClick={() => setTab('comments')}>
           <MessageSquare className="w-3.5 h-3.5" />
@@ -667,9 +709,9 @@ export function TikTokGifterModal({
       </div>
 
       {/* Toolbar — only on event-list tabs (Gifts/Comments). The
-          Relationships + Matches tabs use their own layouts and don't
-          share the search/min-diamonds filter. */}
-      {tab !== 'relationships' && tab !== 'matches' && (
+          Timeline / Relationships / Matches tabs use their own
+          layouts and don't share the search/min-diamonds filter. */}
+      {(tab === 'gifts' || tab === 'comments') && (
         <EventListToolbar
           tab={tab}
           q={q}
@@ -687,6 +729,41 @@ export function TikTokGifterModal({
           visibleDiamonds={visibleDiamonds}
           showRoomCol={!roomId}
         />
+      )}
+      {tab === 'timeline' && (
+        <section className="rounded-lg border border-gray-200 bg-white dark:bg-gray-100/[0.05] p-4 shadow-sm">
+          <div className="auth-mono-label flex items-center gap-1.5 mb-3">
+            <CalendarDays className="w-3.5 h-3.5 text-amber-500" />
+            When do they gift{currentHandle ? ` @${currentHandle}` : ''}?{' '}
+            <span className="opacity-70">· last 30 days</span>
+          </div>
+          {dailySeriesLoading && (
+            <div className="text-[11px] font-mono text-gray-500 py-6 text-center">
+              <Loader2 className="w-4 h-4 inline animate-spin mr-2" />
+              Loading timeline…
+            </div>
+          )}
+          {dailySeriesError && (
+            <div className="text-[11px] font-mono text-rose-600 dark:text-rose-300 py-6 text-center">
+              {dailySeriesError}
+            </div>
+          )}
+          {!dailySeriesLoading && !dailySeriesError && dailySeries && (
+            dailySeries.length > 0 ? (
+              <TikTokDailyHeatmap30
+                points={dailySeries.map((p) => ({
+                  day: p.day,
+                  diamonds: p.diamonds,
+                }))}
+              />
+            ) : (
+              <div className="text-[11px] font-mono text-gray-500 py-6 text-center">
+                No gifting activity in the last 30 days
+                {currentHandle ? ` in @${currentHandle}'s broadcasts` : ''}.
+              </div>
+            )
+          )}
+        </section>
       )}
       {tab === 'comments' && (
         <CommentsView
@@ -720,7 +797,7 @@ export function TikTokGifterModal({
       {/* Pagination strip — `X–Y of Z · per page · ‹ N/M ›`. Always
           rendered when there's any data, even if `total <= pageSize`,
           so the per-page selector remains accessible. */}
-      {tab !== 'relationships' && tab !== 'matches' && total != null && total > 0 && (
+      {(tab === 'gifts' || tab === 'comments') && total != null && total > 0 && (
         <Pagination
           page={page}
           pageSize={pageSize}

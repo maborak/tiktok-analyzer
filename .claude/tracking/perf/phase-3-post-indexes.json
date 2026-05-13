@@ -1,0 +1,21 @@
+{
+  "label": "phase-3-post-indexes",
+  "timestamp": "2026-05-13T16:39:18.071779+00:00",
+  "base_url": "http://localhost:9020",
+  "warmup": 2,
+  "cold": {
+    "GET /admin/tiktok/lives/bundle": {
+      "ms": 1165.31,
+      "status": 200,
+      "bytes": 266394
+    }
+  },
+  "warm": {
+    "total_p50_ms": 22.57,
+    "total_p95_ms": 29.83,
+    "total_min_ms": 20.8,
+    "total_max_ms": 29.83,
+    "total_mean_ms": 23.27,
+    "runs": 15
+  }
+}

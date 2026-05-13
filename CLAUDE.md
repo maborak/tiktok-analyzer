@@ -389,6 +389,85 @@ The split lives in:
 - `routes/admin/tiktok.py` — `_ws_pump_from_service` for in-process,
   `_ws_pump_from_redis` for worker mode.
 
+### Lives-list page rollup (`/lives/bundle`)
+
+The `/admin/tiktok` Lives page reads `GET /admin/tiktok/lives/bundle`
+on cold mount and every 30s poll. The endpoint returns
+`{subs, summary, totals}` in a single round-trip — replacing what was
+once three separate endpoints (`/lives`, `/lives/summary`,
+`/lives/totals`). The bundle handler runs `list_subscriptions()` once
+and threads the handle list into `get_lives_summary` + `get_lives_totals`
+running in parallel via `asyncio.gather` + `to_thread`.
+
+`/lives` is kept as a thin "subs-only" endpoint for the five other
+consumers that enumerate handles without needing summary aggregates
+(match-events modal, gifter modal, live-detail rival pills, history,
+single-handle lookup). The lives page itself never hits it.
+
+Service-layer caches:
+- `_LIVES_SUMMARY_TTL_S = 60.0` — per-handle-set TTL with singleflight
+  lock. Bumped from 35 s so the 30 s frontend poll always hits warm
+  cache in steady state. Cold miss only on backend restart or ≥60 s idle.
+- `_LIVES_TOTALS_TTL_S = 60.0` — same shape, single slot.
+
+Wire payload is trimmed:
+- `_BUNDLE_OMIT_SUMMARY_FIELDS` deny-list strips nine fields the React
+  card never reads (`daily_buckets`, `top_gifter`, `comments_per_min_*`,
+  `momentum_label`, `avg_*`, `n_rooms_30d`, `median_diamonds_30d`).
+- `last_broadcasts` is sliced to `[0:1]` — frontend only reads the
+  most-recent broadcast.
+- Public endpoint (`/public/tiktok/lives`) trims the same fields via
+  the `_PUBLIC_SUMMARY_FIELDS` allowlist + the same `[0:1]` slice.
+
+### Pre-aggregated diamonds (`tiktok_event_hour_counts.diamonds`)
+
+`get_lives_totals` reads the 24 h diamond sum from
+`tiktok_event_hour_counts.diamonds` (≤79 × 25 row indexed scan)
+instead of scanning gift events directly (millions of rows on a busy
+install with a JSONB heap-fetch per row). The column is bumped inline
+by `_bump_event_hour_count(event_type, payload)` in the persist path
+for gift events. Migration: `add_event_hour_counts_diamonds.py`
+(idempotent ADD COLUMN + backfill from `tiktok_events`).
+
+Note: orphan gift events with `host_unique_id IS NULL` are correctly
+excluded from this total (you can't attribute them to a tracked host).
+
+### RBAC token cache
+
+`adapters/auth_persistence.py:AuthPersistenceAdapter` keeps a 30 s
+TTL cache keyed by `SHA256(token | ip | ua)`. Every authenticated
+request previously paid 3–4 DB round-trips inside `get_auth_context`;
+the cache short-circuits all of them on a repeat hit within 30 s.
+TTL-only invalidation is acceptable since logout-revoked sessions
+disappear within one poll cycle anyway.
+
+### Index coverage for the lives-summary call graph
+
+`add_tiktok_lives_summary_indexes.py` (idempotent
+`CREATE INDEX CONCURRENTLY`) adds four indexes the call graph needs
+at scale:
+1. `ix_tiktok_rooms_host_active` — partial `(host_unique_id, last_seen_at DESC) WHERE ended_at IS NULL`
+2. `ix_tiktok_rooms_host_first_seen` — `(host_unique_id, first_seen_at DESC NULLS LAST)`
+3. `ix_tiktok_events_room_type_ts` — `(room_id, type, ts DESC)`
+4. `ix_tiktok_worker_log_detail_host` — partial expression on `((detail->>'host')) WHERE event = 'session_reconnect'`
+
+At current scale (~63 rooms/host) the wins are minor; these are
+insurance against growth past ~1000 rooms/host.
+
+### Perf benchmarking — `python cli.py system tiktok perf`
+
+`backend/cli/commands/system/perf.py` exposes two commands for
+before/after measurement of the lives-list endpoint:
+- `perf endpoints --label <name> --json-out <path>` — captures one
+  cold-miss timing + N warm batches; writes a JSON snapshot.
+- `perf compare <baseline.json> <current.json>` — diff with per-row
+  ms delta and a colored verdict.
+
+Requires admin JWT via `$PHOVEU_ADMIN_TOKEN` or `--token`. Snapshots
+live in `.claude/tracking/perf/`; baseline + each phase is committed
+so future changes have a comparable starting point. See
+`.claude/tracking/perf/REPORT.md` for the running history.
+
 When you delete a module, also clean up imports in `api_main.py:
 initialize_services`, `routes/main.py:setup_routes`,
 `routes/admin/__init__.py`, the sidebar, and the related route files.

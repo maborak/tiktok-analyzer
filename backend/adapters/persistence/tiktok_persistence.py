@@ -14,6 +14,38 @@ def _utcnow() -> datetime:
     return naive datetimes that mix poorly with the now-tz-aware
     timestamptz columns."""
     return datetime.now(timezone.utc)
+
+
+# IANA legacy aliases that browser `Intl.DateTimeFormat` still
+# accepts but Postgres's `AT TIME ZONE` rejects. Keys are the legacy
+# name a frontend may send; values are the canonical post-2008 name
+# Postgres knows. Extend as new mismatches show up in the wild.
+_LEGACY_TZ_ALIASES: dict[str, str] = {
+    "America/Buenos_Aires":   "America/Argentina/Buenos_Aires",
+    "America/Catamarca":      "America/Argentina/Catamarca",
+    "America/Cordoba":        "America/Argentina/Cordoba",
+    "America/Jujuy":          "America/Argentina/Jujuy",
+    "America/Mendoza":        "America/Argentina/Mendoza",
+    "America/Indianapolis":   "America/Indiana/Indianapolis",
+    "America/Knox_IN":        "America/Indiana/Knox",
+    "America/Louisville":     "America/Kentucky/Louisville",
+    "Asia/Calcutta":          "Asia/Kolkata",
+    "Asia/Katmandu":          "Asia/Kathmandu",
+    "Asia/Saigon":            "Asia/Ho_Chi_Minh",
+    "Asia/Rangoon":           "Asia/Yangon",
+    "Asia/Ujung_Pandang":     "Asia/Makassar",
+    "Europe/Kiev":            "Europe/Kyiv",
+    "Pacific/Ponape":         "Pacific/Pohnpei",
+    "Pacific/Truk":           "Pacific/Chuuk",
+}
+
+
+def _canonicalize_tz(tz: str) -> str:
+    """Map a frontend-sent IANA timezone to a Postgres-known
+    canonical name. Returns the input unchanged when not in the
+    alias map — Postgres validation happens at query time and
+    falls back to UTC if even the canonical name is unrecognized."""
+    return _LEGACY_TZ_ALIASES.get(tz, tz)
 from typing import Any, Optional
 
 from sqlalchemy import BigInteger, case, cast, func, String, Integer, text
@@ -276,6 +308,29 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
         except Exception:
             return False
 
+    # Per-process cache of Postgres's known IANA timezone names. The
+    # set is small (~600 entries), shape never changes during process
+    # lifetime, and `pg_timezone_names` is a view-backed query that
+    # we don't want to re-run on every calendar request. Initialised
+    # lazily on first call so a fresh boot doesn't pay the cost.
+    _pg_known_tz_cache: frozenset[str] | None = None
+
+    def _is_pg_known_tz(self, session, tz: str) -> bool:
+        """`True` iff `tz` is a name `pg_timezone_names` recognises.
+        Caches the full set on first call so repeated calendar
+        requests don't re-hit the system catalog."""
+        cache = type(self)._pg_known_tz_cache
+        if cache is None:
+            try:
+                rows = session.execute(text(
+                    "SELECT name FROM pg_timezone_names"
+                )).all()
+                cache = frozenset(r[0] for r in rows if r and r[0])
+            except Exception:
+                cache = frozenset()
+            type(self)._pg_known_tz_cache = cache
+        return tz in cache
+
     def _upsert_room_in_session(self, s, room: Room, *, push_seen: bool) -> None:
         """Internal: assumes the caller is managing the session/commit.
         Lets persist_event_full bundle multiple writes into one txn."""
@@ -478,11 +533,22 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
         not server-UTC days — events from a cross-midnight broadcast
         attribute correctly to the day they actually happened.
         """
-        # Postgres `AT TIME ZONE` requires a known zone name. Fall back
-        # to UTC for an unknown / empty value rather than letting it
-        # error out at query time.
-        zone = (tz or "UTC").strip() or "UTC"
+        # Postgres `AT TIME ZONE` only accepts names from its own
+        # `pg_timezone_names` view, which uses POST-2008 canonical
+        # IANA names. JS `Intl.DateTimeFormat` still accepts older
+        # aliases (e.g. `America/Buenos_Aires`), so a frontend dropdown
+        # value can legitimately fail at the SQL boundary. We:
+        #   1. Map known legacy aliases to canonical via
+        #      `_canonicalize_tz` (e.g. `America/Buenos_Aires` →
+        #      `America/Argentina/Buenos_Aires`).
+        #   2. Validate the final value against the live Postgres
+        #      timezone catalog (cached per-process). Unknown zones
+        #      fall back to UTC so the heatmap renders empty cells
+        #      instead of 500'ing the page.
+        zone = _canonicalize_tz((tz or "UTC").strip() or "UTC")
         with self._get_session() as s:
+            if self._is_postgres() and not self._is_pg_known_tz(s, zone):
+                zone = "UTC"
             if self._is_postgres():
                 # Raw SQL — every "what day is this in `:tz`?" bucket
                 # uses `date_trunc('day', col AT TIME ZONE :tz)`. The
@@ -1999,7 +2065,10 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                         host_unique_id=host_unique_id,
                         payload=payload,
                     )
-                    self._bump_event_hour_count(s, host_unique_id)
+                    self._bump_event_hour_count(
+                        s, host_unique_id,
+                        event_type=type, payload=payload,
+                    )
                 s.commit()
                 return int(row_id) if row_id else 0
 
@@ -2021,25 +2090,53 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                 host_unique_id=host_unique_id,
                 payload=payload,
             )
-            self._bump_event_hour_count(s, host_unique_id)
+            self._bump_event_hour_count(
+                s, host_unique_id,
+                event_type=type, payload=payload,
+            )
             s.commit()
             s.refresh(row)
             return row.id
 
-    def _bump_event_hour_count(self, s, host_unique_id: str | None) -> None:
+    def _bump_event_hour_count(
+        self,
+        s,
+        host_unique_id: str | None,
+        *,
+        event_type: str | None = None,
+        payload: dict | None = None,
+    ) -> None:
         """Increment the (host, current-hour) counter row in
         `tiktok_event_hour_counts`. Called inline from the event-persist
         transaction so the rhythm-strip read path can scan a tiny
         pre-aggregated table instead of 1.7M raw events.
+
+        For gift events we also bump a `diamonds` column with
+        `diamond_count * repeat_count` from the payload. That lets
+        `get_lives_totals` compute the 24h diamond sum from this pre-agg
+        table (~1.9K rows) instead of scanning the full 24h gift event
+        volume (millions of rows on a busy install). The bump cost is
+        identical — same one-row UPSERT — but the read path collapses
+        from a multi-million-row heap fetch to a tiny indexed range scan.
+
         Postgres-only — the read path falls back to a scan on SQLite."""
         if not host_unique_id or not self._is_postgres():
             return
+        diamonds_delta = 0
+        if event_type == "gift" and isinstance(payload, dict):
+            try:
+                dc = int(payload.get("diamond_count") or 0)
+                rc = int(payload.get("repeat_count") or 1)
+                diamonds_delta = max(0, dc * rc)
+            except (TypeError, ValueError):
+                diamonds_delta = 0
         s.execute(text("""
-            INSERT INTO tiktok_event_hour_counts (host_unique_id, hour_bucket, n)
-            VALUES (:h, date_trunc('hour', NOW()), 1)
+            INSERT INTO tiktok_event_hour_counts (host_unique_id, hour_bucket, n, diamonds)
+            VALUES (:h, date_trunc('hour', NOW()), 1, :d)
             ON CONFLICT (host_unique_id, hour_bucket)
-              DO UPDATE SET n = tiktok_event_hour_counts.n + 1
-        """), {"h": host_unique_id})
+              DO UPDATE SET n = tiktok_event_hour_counts.n + 1,
+                            diamonds = tiktok_event_hour_counts.diamonds + EXCLUDED.diamonds
+        """), {"h": host_unique_id, "d": diamonds_delta})
 
     def list_events(
         self,
@@ -2948,6 +3045,77 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                 "needle": f"%{(q or '').strip()}%",
             }).scalar()
             return int(n or 0)
+
+    def get_user_host_daily_series(
+        self,
+        user_id: int,
+        *,
+        host_unique_id: str,
+        days: int = 30,
+    ) -> list[dict[str, Any]]:
+        """Per-day diamond + gift totals for a (user, host) pair over
+        the trailing `days` window. Returned rows are sparse — only
+        days with at least one gift event have an entry. The
+        frontend pivots into a calendar grid and fills empty cells
+        with zeros.
+
+        Single grouped SQL query keyed on `(user_id, host_unique_id,
+        ts)` via the JOIN to `tiktok_rooms`. Cheap enough to fetch on
+        every Timeline-tab mount."""
+        if not host_unique_id:
+            return []
+        host_norm = host_unique_id.lstrip("@").strip().lower()
+        if not host_norm:
+            return []
+        is_pg = self._is_postgres()
+        with self._get_session() as s:
+            if is_pg:
+                rows = s.execute(text("""
+                    SELECT date_trunc('day', e.ts)::date AS day,
+                           SUM(COALESCE((e.payload->>'diamond_count')::int, 0)
+                               * COALESCE((e.payload->>'repeat_count')::int, 1)) AS diamonds,
+                           SUM(COALESCE((e.payload->>'repeat_count')::int, 1))    AS gifts
+                    FROM tiktok_events e
+                    JOIN tiktok_rooms r ON r.room_id = e.room_id
+                    WHERE e.user_id = :uid
+                      AND e.type = 'gift'
+                      AND LOWER(r.host_unique_id) = :host
+                      AND e.ts >= NOW() - make_interval(days => :days)
+                    GROUP BY day
+                    ORDER BY day
+                """), {"uid": int(user_id), "host": host_norm, "days": int(days)}).all()
+                out: list[dict[str, Any]] = []
+                for r in rows:
+                    day = r[0]
+                    out.append({
+                        "day": day.isoformat() if day else None,
+                        "diamonds": int(r[1] or 0),
+                        "gifts": int(r[2] or 0),
+                    })
+                return out
+            # SQLite fallback — no `make_interval`, no date_trunc.
+            # We compute the boundary in Python and use date(ts).
+            from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+            since = (_dt.now(tz=_tz.utc) - _td(days=int(days))).isoformat()
+            rows = s.execute(text("""
+                SELECT date(e.ts) AS day,
+                       SUM(COALESCE(CAST(json_extract(e.payload,'$.diamond_count') AS INTEGER), 0)
+                           * COALESCE(CAST(json_extract(e.payload,'$.repeat_count') AS INTEGER), 1)) AS diamonds,
+                       SUM(COALESCE(CAST(json_extract(e.payload,'$.repeat_count') AS INTEGER), 1))   AS gifts
+                FROM tiktok_events e
+                JOIN tiktok_rooms r ON r.room_id = e.room_id
+                WHERE e.user_id = :uid
+                  AND e.type = 'gift'
+                  AND LOWER(r.host_unique_id) = :host
+                  AND e.ts >= :since
+                GROUP BY day
+                ORDER BY day
+            """), {"uid": int(user_id), "host": host_norm, "since": since}).all()
+            return [
+                {"day": str(r[0]), "diamonds": int(r[1] or 0), "gifts": int(r[2] or 0)}
+                for r in rows
+                if r[0] is not None
+            ]
 
     def common_gifter_detail(
         self,
@@ -4308,19 +4476,30 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
         with self._get_session() as s:
             # 6a — unique gifters + first-time-tonight count
             # (cross-reference user_host_summary).
+            #
+            # Rewritten from a correlated `NOT EXISTS` inside the
+            # `COUNT FILTER` to a LEFT JOIN anti-join (`u IS NULL OR
+            # u.first_seen_at >= r.first_seen_at`). The correlated
+            # form forced Postgres to run one SubPlan per distinct
+            # gifter per group — at high gifter counts (~150 per
+            # active room × 10 rooms) that was thousands of PK
+            # lookups in sequence. The LEFT JOIN form lets the
+            # planner choose a single Hash Anti Join with
+            # `tiktok_user_host_summary`, collapsing the per-row
+            # probes into one scan. Verify with EXPLAIN — the plan
+            # should show "Hash Anti Join", not "SubPlan".
             ug = s.execute(text("""
                 SELECT r.host_unique_id,
                        COUNT(DISTINCT e.user_id) AS uniq,
                        COUNT(DISTINCT e.user_id) FILTER (
-                           WHERE NOT EXISTS (
-                               SELECT 1 FROM tiktok_user_host_summary u
-                               WHERE u.user_id = e.user_id
-                                 AND u.host_unique_id = r.host_unique_id
-                                 AND u.first_seen_at < r.first_seen_at
-                           )
+                           WHERE u.user_id IS NULL
+                              OR u.first_seen_at >= r.first_seen_at
                        ) AS first_time
                 FROM tiktok_events e
                 JOIN tiktok_rooms r ON r.room_id = e.room_id
+                LEFT JOIN tiktok_user_host_summary u
+                       ON u.user_id = e.user_id
+                      AND u.host_unique_id = r.host_unique_id
                 WHERE e.room_id = ANY(:rids)
                   AND e.type = 'gift'
                   AND e.user_id IS NOT NULL
@@ -5117,14 +5296,23 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                     "events_per_min": 0.0,
                 }
 
+            # 24h diamonds — read from the pre-aggregated
+            # `tiktok_event_hour_counts.diamonds` column added by Phase 5
+            # of the lives-list perf plan. Replaces a heap walk over
+            # millions of gift events with a ≤79×25-row indexed scan
+            # (`hour_bucket > NOW() - 24h` covers at most 25 hour
+            # boundaries per host because of the inclusive boundary).
+            #
+            # Trade-off: this number now reflects events that came
+            # through `record_event()` — the same path that emits to
+            # WebSocket clients — so it matches the rest of the page.
+            # Direct DB inserts (none in production code) would not
+            # appear here; if that ever changes the backfill in
+            # `add_event_hour_counts_diamonds.py` can be re-run.
             r2 = s.execute(text("""
-                SELECT COALESCE(
-                    SUM(COALESCE((payload->>'diamond_count')::int, 0)
-                        * COALESCE((payload->>'repeat_count')::int, 1)),
-                    0)
-                FROM tiktok_events
-                WHERE type = 'gift'
-                  AND ts > NOW() - INTERVAL '24 hours'
+                SELECT COALESCE(SUM(diamonds), 0)
+                FROM tiktok_event_hour_counts
+                WHERE hour_bucket > NOW() - INTERVAL '24 hours'
             """)).scalar() or 0
 
             r3 = s.execute(text("""

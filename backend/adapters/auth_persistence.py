@@ -9,8 +9,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import desc, func, and_, or_, asc
+import hashlib
 import json
 import logging
+import threading
+import time
 import jwt
 import re
 import uuid
@@ -67,9 +70,82 @@ def _check_has_password(user_model) -> bool:
 class AuthPersistenceAdapter(AuthPort, UserManagementPort, SessionManagementPort,
                            ApiKeyManagementPort, AuthorizationPort):
     """Database adapter for authentication operations"""
-    
+
+    # Token-keyed AuthContext cache. `get_auth_context` is hit on every
+    # authenticated request — 3 calls on the /admin/tiktok cold mount,
+    # 1 per 30 s poll cycle, plus every other admin route call. Each
+    # call previously paid 3–4 DB round-trips (session lookup + user
+    # lookup + RBAC role perms + RBAC direct perms). At ~30 ms total
+    # per request on a remote DB, that's a measurable share of the
+    # admin-tab perf budget that adds no security value once we've
+    # already validated the same token a few seconds ago.
+    #
+    # Cache shape: `key → (expires_at, AuthContext)`. Key is
+    # SHA-256(token | ip | ua) so an IP / UA change forces a fresh
+    # full validation (the underlying DB check would reject anyway,
+    # but a different cache slot avoids racing against a stale entry).
+    # TTL is short (30 s) so a session revoked through `/auth/logout`
+    # disappears within one poll cycle even without explicit busting.
+    _auth_context_cache: dict[str, tuple[float, "AuthContext"]] = {}
+    _auth_context_lock = threading.Lock()
+    _AUTH_CONTEXT_TTL_S = 30.0
+
     def __init__(self, jwt_secret: str):
         self.jwt_secret = jwt_secret
+
+    @classmethod
+    def _auth_cache_key(
+        cls,
+        token: str,
+        ip_address: Optional[str],
+        user_agent: Optional[str],
+    ) -> str:
+        h = hashlib.sha256()
+        h.update(token.encode("utf-8"))
+        h.update(b"|")
+        h.update((ip_address or "").encode("utf-8"))
+        h.update(b"|")
+        h.update((user_agent or "").encode("utf-8"))
+        return h.hexdigest()
+
+    @classmethod
+    def _auth_cache_get(cls, key: str) -> Optional["AuthContext"]:
+        with cls._auth_context_lock:
+            hit = cls._auth_context_cache.get(key)
+            if hit is None:
+                return None
+            expires_at, ctx = hit
+            if time.monotonic() >= expires_at:
+                # Lazy eviction. Keeps the cache size bounded by the
+                # set of live tokens × IP/UA combos rather than letting
+                # expired entries linger forever.
+                cls._auth_context_cache.pop(key, None)
+                return None
+            return ctx
+
+    @classmethod
+    def _auth_cache_put(cls, key: str, ctx: "AuthContext") -> None:
+        expires_at = time.monotonic() + cls._AUTH_CONTEXT_TTL_S
+        with cls._auth_context_lock:
+            cls._auth_context_cache[key] = (expires_at, ctx)
+            # Cheap bound: when the cache grows past a soft limit,
+            # drop the oldest half by expiry. Real eviction strategy
+            # for an LRU would need an OrderedDict; this is good
+            # enough at our scale (tens of admins × handful of
+            # IP/UA combos = under 100 entries steady-state).
+            if len(cls._auth_context_cache) > 1024:
+                items = sorted(
+                    cls._auth_context_cache.items(),
+                    key=lambda kv: kv[1][0],
+                )
+                for k, _ in items[: len(items) // 2]:
+                    cls._auth_context_cache.pop(k, None)
+
+    # No explicit invalidate helper. The 30 s TTL ensures a session
+    # revoked via /auth/logout disappears from the cache within one
+    # poll cycle. If we ever need stricter logout semantics we'd
+    # maintain a `session_id → set[cache_key]` reverse index — for
+    # now the TTL bound is acceptable.
     
     # AuthPort implementations
     
@@ -1534,7 +1610,7 @@ class AuthPersistenceAdapter(AuthPort, UserManagementPort, SessionManagementPort
     
     # AuthorizationPort implementations
     
-    def get_auth_context(self, token: str, token_type: str = "bearer", 
+    def get_auth_context(self, token: str, token_type: str = "bearer",
                         ip_address: Optional[str] = None, user_agent: Optional[str] = None) -> Optional[AuthContext]:
         """Get authentication context from JWT token with IP and User-Agent validation"""
         try:
@@ -1542,6 +1618,18 @@ class AuthPersistenceAdapter(AuthPort, UserManagementPort, SessionManagementPort
             if not token or not isinstance(token, str):
                 logger.warning("Invalid token: token is empty or not a string")
                 return None
+
+            # Token-keyed cache (30 s TTL). Skips the full JWT decode +
+            # 3–4 DB round-trip cascade when the same (token, ip, ua)
+            # tuple was validated within the cache window. Decoded JWT
+            # signature is the only cryptographic guarantee we drop;
+            # since we control both the cache process and the JWT
+            # secret, that's safe. IP / UA are part of the key so a
+            # mismatch forces a fresh full validation.
+            cache_key = self._auth_cache_key(token, ip_address, user_agent)
+            cached = self._auth_cache_get(cache_key)
+            if cached is not None:
+                return cached
             
             # JWT tokens must have 3 parts separated by dots (header.payload.signature)
             token_parts = token.split('.')
@@ -1654,13 +1742,17 @@ class AuthPersistenceAdapter(AuthPort, UserManagementPort, SessionManagementPort
                             )
                             # Continue with empty permissions - user will only have role-based access
                         
-                        return AuthContext(
+                        ctx = AuthContext(
                             user=user,
                             session=self._session_model_to_domain(session_model),
                             permissions=all_perms,  # All permissions (for backward compatibility)
                             role_permissions=role_perms,  # Permissions from role
                             direct_permissions=direct_perms  # Direct user permissions
                         )
+                        # Populate cache for the next 30 s of requests
+                        # against the same (token, ip, ua) tuple.
+                        self._auth_cache_put(cache_key, ctx)
+                        return ctx
                 
                 return None
                 

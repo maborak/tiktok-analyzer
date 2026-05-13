@@ -119,7 +119,8 @@ The TikTok module has dense data-heavy pages with high responsive risk:
 - `frontend/src/modules/admin/pages/TikTokLives.tsx` — index page with the Live cards grid + a recent-events feed.
 - `frontend/src/modules/admin/pages/TikTokDashboard.tsx` — operator overview / KPIs panel.
 - `frontend/src/modules/admin/pages/TikTokHistory.tsx`, `TikTokGifts.tsx`, `TikTokSettings.tsx`, `TikTokSignConfig.tsx` — secondary tabs in the TikTok admin shell.
-- `frontend/src/modules/public/pages/PublicLives.tsx` — public mirror of the lives index; renders inside the shared `Layout` (sidebar + topbar) so its chrome matches admin.
+- `frontend/src/modules/public/pages/Landing.tsx` — anonymous landing at `/`. Centered hero, `max-w-2xl`, CTA button stacks on `sm` breakpoint; verify the headline doesn't wrap awkwardly on phones.
+- `frontend/src/modules/public/pages/PublicLives.tsx` — public mirror of the lives index at `/lives` (moved from `/` after the landing page was introduced). Renders inside the shared `Layout` (sidebar + topbar) so its chrome matches admin.
 - `frontend/src/modules/admin/components/TikTokGifterDetailModal.tsx` — unified shell with [Current][Profile] tab strip and a shared identity header. Used by every call site that previously opened `TikTokGifterModal` OR `TikTokCommonGifterDetailModal`.
 - `frontend/src/modules/admin/components/TikTokGifterModal.tsx` — Current-scope body. Embedded inside the unified shell; no longer mounted with its own Modal chrome.
 - `frontend/src/modules/admin/components/TikTokCommonGifterDetailModal.tsx` — Profile-scope body (deep analysis: profile, timeline, hosts, comments, behavior, network). Heatmap inside renders a 24×7 grid that stretches to full width via `repeat(24, minmax(0, 1fr))` with in-cell diamond labels — check that the row height still reads on narrow viewports.

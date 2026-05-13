@@ -21,7 +21,12 @@ export const TIMEZONE_OPTIONS: TimezoneOption[] = [
   { value: 'America/Lima',        label: 'Lima (PET)',                   region: 'Americas' },
   { value: 'America/Bogota',      label: 'Bogotá (COT)',                 region: 'Americas' },
   { value: 'America/Mexico_City', label: 'Mexico City (CST/CDT)',        region: 'Americas' },
-  { value: 'America/Buenos_Aires',label: 'Buenos Aires (ART)',           region: 'Americas' },
+  // Modern (post-2008) IANA name. The legacy alias `America/Buenos_Aires`
+  // is still accepted by JS `Intl.DateTimeFormat`, but Postgres's
+  // `AT TIME ZONE` only knows the canonical Argentina/* form, so we
+  // ship the modern name from the dropdown to avoid 500s on the
+  // `/calendar` endpoint.
+  { value: 'America/Argentina/Buenos_Aires', label: 'Buenos Aires (ART)', region: 'Americas' },
   { value: 'America/Sao_Paulo',   label: 'São Paulo (BRT)',              region: 'Americas' },
   { value: 'America/Caracas',     label: 'Caracas (VET)',                region: 'Americas' },
   { value: 'America/Santiago',    label: 'Santiago (CLT)',               region: 'Americas' },

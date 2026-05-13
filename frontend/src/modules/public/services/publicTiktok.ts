@@ -410,6 +410,23 @@ export const publicTiktokApi = {
       params,
     });
   },
+
+  /** Public mirror of the admin per-(user, host) daily-series
+   *  endpoint. The backend gates the host on `is_public=True`. */
+  getUserHostDailySeries(opts: {
+    userId: string;
+    handle: string;
+    days?: number;
+  }): Promise<Array<{ day: string; diamonds: number; gifts: number }>> {
+    return apiRequest({
+      method: 'GET',
+      url: `${BASE}/users/${encodeURIComponent(opts.userId)}/host-daily-series`,
+      params: {
+        handle: opts.handle.replace(/^@/, ''),
+        days: opts.days ?? 30,
+      },
+    });
+  },
 };
 
 export type PublicTikTokApi = typeof publicTiktokApi;

@@ -179,71 +179,58 @@ def _need_admin():
 # ── subscriptions CRUD ──────────────────────────────────────────────
 
 
+@router.get("/lives/bundle")
+async def lives_bundle(
+    response: Response,
+    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+):
+    """Single round-trip rollup for the /admin/tiktok Lives page.
+
+    Returns `{subs, summary, totals}` — replaces the previous
+    `GET /lives/summary` + `GET /lives/totals` pair, which together
+    with `GET /lives` required three HTTP round-trips on cold mount
+    plus a duplicate `list_subscriptions()` query inside `/lives/summary`.
+    The bundle runs `list_subscriptions` once and threads the handle
+    list into the parallel summary/totals fan-out.
+
+    `GET /lives` itself stays — five other consumers (match events
+    modal, gifter modal, live-detail rival pills, history page,
+    `getLiveByHandle` lookup) only need the cheap subscription list
+    and shouldn't pay for the heavy summary aggregation. The lives
+    page is the one that needs all three pieces in lockstep.
+
+    Service-layer caches still apply: `get_lives_summary` has a 35 s
+    TTL keyed by `tuple(sorted(handles))` with a singleflight lock,
+    and `get_lives_totals` has the same 35 s TTL on a single slot.
+    A warm-cache hit is sub-50 ms wall-clock. The browser cache
+    header lets a re-mount within the poll cycle skip the request
+    entirely."""
+    svc = _require_service()
+    response.headers["Cache-Control"] = "private, max-age=30"
+    return await svc.get_lives_bundle()
+
+
 @router.get("/lives", response_model=list[SubscriptionResponse])
 async def list_lives(
+    response: Response,
     _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
 ):
+    """Cheap subscription-list lookup. Used by every consumer that
+    only needs handle enumeration (match events modal monitor pills,
+    gifter modal favourite-state, live-detail rival pills, history
+    filter, single-handle `getLiveByHandle` lookup).
+
+    The lives page itself uses `/lives/bundle` instead, which folds
+    this list together with summary + totals into a single trip.
+
+    `Cache-Control: private, max-age=15` lets a re-mount within the
+    same 30 s window skip the wire entirely. Lower than the bundle's
+    30 s cap because this endpoint's freshness matters for the
+    post-CRUD `refresh()` path — operators expect a just-added
+    subscription to surface immediately on the next paint."""
     svc = _require_service()
+    response.headers["Cache-Control"] = "private, max-age=15"
     return await svc.list_subscriptions()
-
-
-@router.get("/lives/totals")
-async def lives_totals(
-    response: Response,
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
-):
-    """Page-level rollup for the /admin/tiktok header strip:
-    n_live / n_total / diamonds_24h / events_per_min.
-
-    Polled every 30 s by the page. Service-layer TTL cache (35 s) +
-    `Cache-Control: max-age=30` lets concurrent admin tabs collapse
-    to one DB round per cache window AND lets a re-mount within the
-    poll cycle skip the request entirely (browser cache). `to_thread`
-    keeps the event loop responsive during the cache-miss SQL
-    aggregates."""
-    svc = _require_service()
-    response.headers["Cache-Control"] = "private, max-age=30"
-    return await asyncio.to_thread(svc.get_lives_totals)
-
-
-@router.get("/lives/summary")
-async def lives_summary(
-    response: Response,
-    handles: Optional[str] = Query(
-        None,
-        description=(
-            "Comma-separated handles. When omitted, returns summary "
-            "for every tracked subscription."
-        ),
-    ),
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
-):
-    """Per-host enrichment for every row on /admin/tiktok Lives.
-    Drives sparklines, viewer count, session diamonds, top gifter,
-    PK chip, last broadcasts, and momentum tags — all in one
-    round-trip.
-
-    Polled every 30 s. Service-layer 35 s TTL + parallel query fan-out
-    means a steady-state poll hits warm cache (a sub-50 ms request).
-    `Cache-Control: max-age=30` lets a re-mount within the poll cycle
-    skip the request entirely on the browser side. `to_thread` keeps
-    the event loop responsive on a cold miss (the parallelised
-    `get_lives_summary` runs ~10 query families against the connection
-    pool — under 700 ms wall-clock with 72 handles)."""
-    svc = _require_service()
-    handle_list: list[str] = []
-    if handles:
-        handle_list = [
-            h.strip().lstrip("@")
-            for h in handles.split(",")
-            if h.strip()
-        ]
-    if not handle_list:
-        # No filter → use every subscription.
-        subs = await svc.list_subscriptions()
-        handle_list = [s["unique_id"] for s in subs if s.get("unique_id")]
-    response.headers["Cache-Control"] = "private, max-age=30"
-    return await asyncio.to_thread(svc.get_lives_summary, handle_list)
 
 
 @router.get("/lookup", response_model=HandleLookupResponse)
@@ -1312,6 +1299,28 @@ async def list_user_matches(
         until=until,
         limit=limit,
         offset=offset,
+    )
+
+
+@router.get("/users/{user_id}/host-daily-series")
+async def user_host_daily_series(
+    user_id: int,
+    handle: str = Query(..., description="Host handle to scope to."),
+    days: int = Query(30, ge=1, le=180),
+    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+):
+    """Per-day diamond + gift totals for a single (user, host) pair
+    over the last N days. Drives the Timeline heatmap tab on the
+    in-room gifter modal — scoped to "this host's broadcasts" rather
+    than every room the viewer has ever touched.
+
+    Lighter than the cross-host `common_gifter_detail` endpoint
+    (single grouped SQL query, no momentum/loyalty/intensity
+    extras) so it's cheap to fetch every time the user opens the
+    Timeline tab."""
+    svc = _require_service()
+    return svc.get_user_host_daily_series(
+        user_id=int(user_id), host_unique_id=handle.lstrip("@"), days=int(days),
     )
 
 

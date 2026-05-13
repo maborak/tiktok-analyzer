@@ -20,14 +20,14 @@ You are the only source of truth for "this endpoint is slow at the HTTP layer, n
 - **Notification queue** at `adapters/notification_queue/redis_queue.py`. Synchronous email sends in a request handler are a perf bug — they should enqueue.
 - **`hook_manager.fire(...)`** is fire-and-forget but synchronous within the request handler unless handlers themselves are async. A slow synchronous handler blocks the response.
 - **Hot endpoints** for the TikTok module:
-  - `/admin/tiktok/lives` (list)
-  - `/admin/tiktok/lives/summary` (per-host summary; the page polls this every 30s)
-  - `/admin/tiktok/lives/totals`
+  - `/admin/tiktok/lives/bundle` (single round-trip for the Lives page — subs + per-host summary + page totals; polled every 30s; service-layer 60s TTL cache)
+  - `/admin/tiktok/lives` (cheap subs-only list — used by 5 secondary consumers, NOT the Lives page itself)
   - `/admin/tiktok/rooms/{room_id}/stats`
   - `/admin/tiktok/events/search`
   - `/admin/tiktok/common-gifters`
   - `/admin/tiktok/lives/{handle}/cross-live-gifters`
   - `/admin/tiktok/dashboard`
+  - Removed: `/admin/tiktok/lives/summary` and `/admin/tiktok/lives/totals` — replaced by `/lives/bundle` (see CLAUDE.md "Lives-list page rollup").
 - **Public mirror** at `/public/tiktok/*` uses the same service methods + an allowlist sanitizer. If a public endpoint is slow, the admin one is too — fix at the service layer.
 
 ## Audit checklist — run all of these

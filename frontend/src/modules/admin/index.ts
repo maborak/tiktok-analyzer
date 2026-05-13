@@ -2,13 +2,14 @@ export { AdminQuickLogin } from './components/AdminQuickLogin';
 export { adminTicketsApi } from './services/tickets';
 export type * from './types';
 
-// Public-page reuse: the unauthenticated `/` page renders the same
-// `SubscriptionCard` and `TikTokGifterDetailModal` as `/admin/tiktok`,
-// with admin-side actions hidden via `readOnly`. Exposing through the
-// barrel keeps the public-module → admin-internals boundary clean
-// (eslint `no-restricted-imports`).
+// Public-page reuse: the unauthenticated `/lives` page renders the
+// same `SubscriptionCard` with `readOnly`. `TikTokGifterDetailModal`
+// is intentionally NOT re-exported here — both surfaces lazy-load it
+// via `import('@admin/components/TikTokGifterDetailModal')` so the
+// echarts-heavy chunk doesn't land in either main bundle. Keeping
+// it out of the barrel prevents it from being statically pulled
+// back into the main chunk by an unaware caller.
 export { SubscriptionCard } from './pages/TikTokLives';
-export { TikTokGifterDetailModal } from './components/TikTokGifterDetailModal';
 export type {
   TikTokSubscription,
   TikTokLiveSummary,
