@@ -119,21 +119,38 @@ export function TikTokEulerHistory() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [choiceIdx]);
 
+  // X-axis labels — same length as the data, but the chart's
+  // `axisLabel.interval` filter only renders ~6–10 of them so they
+  // never crowd. Three formats based on window:
+  //   ≥72h : "MM-DD"  (date only — each tick is a day boundary)
+  //   ≥24h : "HH:00"  (date implied by the run; hour is the unit)
+  //   <24h : "HH:MM"  (within-day resolution)
   const xLabels = useMemo(() => {
     if (!data) return [] as string[];
-    return data.bins.map((iso) => {
-      const d = new Date(iso);
-      if (choice.hours >= 24) {
-        return d.toLocaleString(undefined, {
-          month: '2-digit', day: '2-digit',
-          hour: '2-digit', minute: '2-digit',
-        });
-      }
-      return d.toLocaleTimeString(undefined, {
+    const fmtShort = (d: Date) =>
+      d.toLocaleTimeString(undefined, {
         hour: '2-digit', minute: '2-digit',
       });
+    const fmtHour = (d: Date) =>
+      d.toLocaleTimeString(undefined, { hour: '2-digit' }).replace(':00', '');
+    const fmtDate = (d: Date) =>
+      d.toLocaleDateString(undefined, { month: '2-digit', day: '2-digit' });
+    return data.bins.map((iso) => {
+      const d = new Date(iso);
+      if (choice.hours >= 72) return fmtDate(d);
+      if (choice.hours >= 24) return fmtHour(d);
+      return fmtShort(d);
     });
   }, [data, choice.hours]);
+
+  // Tick interval — pick a step that yields ~7 visible labels.
+  // ECharts' `axisLabel.interval` is the gap BETWEEN shown ticks
+  // (0 = every tick). We compute it from total bin count.
+  const labelInterval = useMemo(() => {
+    const n = data?.bins.length ?? 0;
+    if (n <= 8) return 0;
+    return Math.max(1, Math.floor(n / 7) - 1);
+  }, [data?.bins.length]);
 
   return (
     <section className="flex flex-col gap-4">
@@ -150,6 +167,8 @@ export function TikTokEulerHistory() {
         <div className="flex items-center gap-2">
           {data && (
             <span className="px-2 py-0.5 rounded font-mono text-xs bg-gray-50 dark:bg-gray-100/30">
+              room-info {data.room_info.totals.all.toLocaleString()}
+              {' · '}
               euler {data.euler.totals.all.toLocaleString()}
               {' · '}
               direct {data.direct.totals.all.toLocaleString()}
@@ -177,7 +196,10 @@ export function TikTokEulerHistory() {
           Loading…
         </div>
       )}
-      {!loading && data && data.euler.totals.all === 0 && data.direct.totals.all === 0 && (
+      {!loading && data
+        && data.room_info.totals.all === 0
+        && data.euler.totals.all === 0
+        && data.direct.totals.all === 0 && (
         <div className="card text-center text-sm text-gray-500 py-12">
           No calls captured in this window yet. Logging starts when the
           listener pool connects — boot the worker and check back in a
@@ -185,17 +207,36 @@ export function TikTokEulerHistory() {
         </div>
       )}
 
-      {data && (data.euler.totals.all > 0 || data.direct.totals.all > 0) && (
+      {data && (
+        data.room_info.totals.all > 0
+        || data.euler.totals.all > 0
+        || data.direct.totals.all > 0
+      ) && (
         <>
           <ChartCard
-            title="Euler-billing calls"
+            title="Room discovery probes"
+            subtitle={
+              'webcast/room/info + webcast/room/info_by_user — handle → '
+              + 'room_id lookups. Biggest quota burners in practice.'
+            }
+            bucket={data.room_info}
+            apiKeys={data.api_keys}
+            xLabels={xLabels}
+            labelInterval={labelInterval}
+            outcomes={data.outcomes.counts.room_info}
+            outcomeLabels={data.outcomes.labels}
+            countTotal={data.room_info.totals.all}
+          />
+          <ChartCard
+            title="Other Euler-billing calls"
             subtitle={
               'Every bar segment = 1 sign-quota slot. '
-              + 'Sign API (eulerstream.com) + signed webcast.* endpoints.'
+              + 'fetch (signed WSS URL), check_alive, enter, etc.'
             }
             bucket={data.euler}
             apiKeys={data.api_keys}
             xLabels={xLabels}
+            labelInterval={labelInterval}
             outcomes={data.outcomes.counts.euler}
             outcomeLabels={data.outcomes.labels}
             countTotal={data.euler.totals.all}
@@ -209,6 +250,7 @@ export function TikTokEulerHistory() {
             bucket={data.direct}
             apiKeys={data.api_keys}
             xLabels={xLabels}
+            labelInterval={labelInterval}
             outcomes={data.outcomes.counts.direct}
             outcomeLabels={data.outcomes.labels}
             countTotal={data.direct.totals.all}
@@ -226,6 +268,9 @@ interface ChartCardProps {
   bucket: TikTokEulerHistoryBucket;
   apiKeys: string[];
   xLabels: string[];
+  /** ECharts `axisLabel.interval`. 0 = show every tick. Higher means
+   *  show every Nth tick (gap between visible labels = N). */
+  labelInterval: number;
   outcomes: number[][];               // [N bins][5]
   outcomeLabels: string[];
   countTotal: number;
@@ -237,7 +282,7 @@ interface ChartCardProps {
  *  an outcome-class strip below. Memoised by data identity so a
  *  re-render of the parent doesn't reflow the chart instance. */
 function ChartCard({
-  title, subtitle, bucket, apiKeys, xLabels,
+  title, subtitle, bucket, apiKeys, xLabels, labelInterval,
   outcomes, outcomeLabels, countTotal, muted,
 }: ChartCardProps) {
   const hasMultipleKeys = apiKeys.length > 1;
@@ -270,8 +315,14 @@ function ChartCard({
         data: xLabels,
         axisLabel: {
           fontSize: 10,
-          rotate: xLabels.length > 24 ? 35 : 0,
-          interval: xLabels.length > 60 ? 'auto' : 0,
+          // Always horizontal — rotation reads worse than a sparser
+          // straight line even when bin count is high. The interval
+          // computed upstream caps visible labels at ~7.
+          rotate: 0,
+          interval: labelInterval,
+          // Subtle: shrink the gap-to-axis so labels feel attached to
+          // ticks rather than floating below the chart.
+          margin: 6,
         },
       },
       yAxis: {

@@ -113,12 +113,14 @@ export interface TikTokEulerHistory {
   bucket_minutes: number;
   bins: string[];
   api_keys: string[];
+  room_info: TikTokEulerHistoryBucket;
   euler: TikTokEulerHistoryBucket;
   direct: TikTokEulerHistoryBucket;
   outcomes: {
     labels: string[];                              // ["2xx","3xx","4xx","5xx","err"]
     counts: {
-      euler: number[][];                           // [N bins][5 classes]
+      room_info: number[][];
+      euler: number[][];
       direct: number[][];
     };
   };

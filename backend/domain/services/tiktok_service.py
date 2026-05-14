@@ -1768,25 +1768,28 @@ class TikTokService:
     # new rows bucket the same way. Updates here must update there.
     @staticmethod
     def _kind_for_endpoint(endpoint: str) -> str:
-        """Map a log row's endpoint label to a higher-level kind.
-        Used for the Euler-vs-Direct split + the quota-billing roll-up.
+        """Map a log row's endpoint label to a higher-level kind. Drives
+        the per-chart split in the API History dashboard.
 
-        Returns one of: 'euler-sign', 'webcast', 'tiktok-direct',
-        'other'."""
+        Returns one of:
+          'room-info'    — `webcast/room/info` + `webcast/room/info_by_user`.
+                           These are the discovery probes (handle → room_id);
+                           biggest quota burners in practice, so we surface
+                           them as their own chart instead of letting them
+                           swallow the rest of the stack.
+          'webcast'      — other Euler-signed `webcast/*` calls (fetch,
+                           check_alive, enter, …). Still Euler-billing.
+          'tiktok-direct'— anonymous `www.tiktok.com/@…` HTML scrapes.
+                           No quota cost.
+          'other'        — fallback (eulerstream sign-API direct hits
+                           with a non-`webcast/` path, etc.).
+        """
         if endpoint.startswith("tiktok/"):
             return "tiktok-direct"
+        if endpoint.startswith("webcast/room/info"):
+            return "room-info"
         if endpoint.startswith("webcast/"):
             return "webcast"
-        # The Euler sign API uses paths like "webcast/fetch" too, but
-        # those land on `tiktok.eulerstream.com` so the sink classifies
-        # them as 'euler-sign' (different host). We can't re-derive the
-        # host from the stored endpoint, so anything not webcast/ or
-        # tiktok/ is implicitly euler-sign. The sink's first capture
-        # of an EulerStream call would have written e.g. "webcast/fetch"
-        # without a host prefix — same label as the signed webcast
-        # GET that follows. To disambiguate, future rows could prepend
-        # the host; for now we treat "webcast/fetch" as `webcast` since
-        # it's still Euler-quota-billing either way.
         return "other"
 
     def get_euler_call_history(
@@ -1884,13 +1887,20 @@ class TikTokService:
                 "by_key": {},
                 "total": 0,
             }
-        euler_b = _empty_bucket()
-        direct_b = _empty_bucket()
+        # Three named buckets keyed by kind. `room-info` was peeled off
+        # `webcast` because in practice it's by far the highest-volume
+        # quota burner and was visually dominating the chart.
+        buckets = {
+            "room-info":   _empty_bucket(),
+            "webcast":     _empty_bucket(),
+            "tiktok-direct": _empty_bucket(),
+        }
 
         # 5-class outcome counts per bin per bucket.
         OUTCOME_LABELS = ["2xx", "3xx", "4xx", "5xx", "err"]
-        euler_outcomes = [[0] * 5 for _ in range(N)]
-        direct_outcomes = [[0] * 5 for _ in range(N)]
+        outcomes_by_kind: dict[str, list[list[int]]] = {
+            k: [[0] * 5 for _ in range(N)] for k in buckets
+        }
         api_keys: set[str] = set()
 
         def _outcome_idx(sc: int | None) -> int:
@@ -1908,8 +1918,11 @@ class TikTokService:
 
         for r in rows:
             kind = self._kind_for_endpoint(r.endpoint)
-            bucket = direct_b if kind == "tiktok-direct" else euler_b
-            outcome_bin = direct_outcomes if kind == "tiktok-direct" else euler_outcomes
+            # Anything that doesn't match a named bucket (the 'other'
+            # bucket) falls through onto the catch-all 'webcast' bucket
+            # so it still shows up rather than silently disappearing.
+            bucket = buckets.get(kind) or buckets["webcast"]
+            outcome_bin = outcomes_by_kind.get(kind) or outcomes_by_kind["webcast"]
             n = int(r.n or 0)
             api_keys.add(r.api_key_fp)
             bucket["endpoints"].add(r.endpoint)
@@ -1947,13 +1960,15 @@ class TikTokService:
             "bucket_minutes": bucket_minutes,
             "bins": [b.isoformat() for b in bins],
             "api_keys": sorted(api_keys),
-            "euler": _serialize(euler_b),
-            "direct": _serialize(direct_b),
+            "room_info": _serialize(buckets["room-info"]),
+            "euler":     _serialize(buckets["webcast"]),
+            "direct":    _serialize(buckets["tiktok-direct"]),
             "outcomes": {
                 "labels": OUTCOME_LABELS,
                 "counts": {
-                    "euler": euler_outcomes,
-                    "direct": direct_outcomes,
+                    "room_info": outcomes_by_kind["room-info"],
+                    "euler":     outcomes_by_kind["webcast"],
+                    "direct":    outcomes_by_kind["tiktok-direct"],
                 },
             },
         }
