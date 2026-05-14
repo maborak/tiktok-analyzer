@@ -4849,8 +4849,10 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
     _DAILY_BUCKETS_TTL_S = 60.0
     _daily_buckets_cache: dict[tuple[str, ...], tuple[float, dict[str, list[int]]]] = {}
     _WEEK_CALENDAR_TTL_S = 60.0
+    # Cache key is `(tz, sorted-handles)` so two TZ choices don't poison
+    # each other — the per-tz buckets are genuinely different data.
     _week_calendar_cache: dict[
-        tuple[str, ...],
+        tuple[str, tuple[str, ...]],
         tuple[float, dict[str, list[dict[str, int]]]],
     ] = {}
 
@@ -4896,16 +4898,40 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
         self._daily_buckets_cache[key] = (now, out)
         return out
 
-    def _week_calendar_cached(self, handles: list[str]) -> dict[str, list[dict[str, int]]]:
+    def _week_calendar_cached(
+        self,
+        handles: list[str],
+        *,
+        tz: str = "UTC",
+    ) -> dict[str, list[dict[str, int]]]:
         """Returns `{host: [7 day buckets oldest→newest]}` covering
-        the last 7 days. Each bucket: `{day_offset, rooms,
-        duration_min, diamonds}`. Cached for 60 s — the 7-day window
-        joins `tiktok_events` with `tiktok_rooms` over a wide
-        timeframe (the diamonds scan) and would otherwise add ~600 ms
-        to every cache-miss summary call."""
-        key = tuple(sorted(handles))
+        the last 7 calendar days IN THE GIVEN TIMEZONE.
+
+        Each bucket: `{day_offset, rooms, duration_min, diamonds}`.
+        `day_offset` 0 = today (in `tz`), 6 = six days ago. After the
+        reverse-on-return below the strip reads oldest → newest.
+
+        Semantics:
+          * `rooms` is keyed by `r.first_seen_at AT TIME ZONE :tz`
+            — a broadcast counts on the calendar day it STARTED in zone.
+          * `duration_min` is summed alongside `rooms` (same anchor).
+          * `diamonds` is keyed by EVENT timestamp `e.ts AT TIME ZONE :tz`
+            — every gift counts toward the calendar day it happened on.
+            This is the critical fix: a stream that started Wed 23:00
+            and ran to Thu 01:54 contributes 23:00–24:00 events to Wed
+            and 00:00–01:54 events to Thu, instead of dumping the whole
+            broadcast onto Wed.
+
+        Multi-host attribution: gifts whose `payload.to_user.user_id`
+        is set AND != the host's own `profile_user_id` are excluded —
+        same predicate the other host-aggregation queries use.
+
+        Cache: 60 s TTL, keyed on `(tz, handle-set)` so different TZ
+        choices don't share data.
+        """
+        cache_key = (tz, tuple(sorted(handles)))
         now = time.monotonic()
-        hit = self._week_calendar_cache.get(key)
+        hit = self._week_calendar_cache.get(cache_key)
         if hit and (now - hit[0]) < self._WEEK_CALENDAR_TTL_S:
             return hit[1]
 
@@ -4916,13 +4942,19 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
             ] for h in handles
         }
         if not self._is_postgres() or not handles:
-            self._week_calendar_cache[key] = (now, week_by_host)
+            self._week_calendar_cache[cache_key] = (now, week_by_host)
             return week_by_host
 
         with self._get_session() as s:
+            # day_offset = days between TODAY-IN-TZ and the row's
+            # calendar day IN TZ. Computed as
+            #   floor((today_local - row_local_date) days)
+            # via `(NOW() AT TIME ZONE :tz)::date - (col AT TIME ZONE :tz)::date`
+            # — `date - date` in Postgres yields integer days.
             wk_rooms = s.execute(text("""
                 SELECT r.host_unique_id,
-                       FLOOR(EXTRACT(EPOCH FROM (NOW() - r.first_seen_at)) / 86400.0)::int AS day_offset,
+                       ((NOW() AT TIME ZONE :tz)::date
+                        - (r.first_seen_at AT TIME ZONE :tz)::date) AS day_offset,
                        COUNT(*) AS n_rooms,
                        COALESCE(
                          SUM(EXTRACT(EPOCH FROM (
@@ -4932,9 +4964,9 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                        ) AS duration_min
                 FROM tiktok_rooms r
                 WHERE r.host_unique_id = ANY(:hs)
-                  AND r.first_seen_at > NOW() - INTERVAL '7 days'
+                  AND r.first_seen_at > NOW() - INTERVAL '8 days'
                 GROUP BY 1, 2
-            """), {"hs": handles}).all()
+            """), {"hs": handles, "tz": tz}).all()
             for h, off, nr, dur in wk_rooms:
                 if h in week_by_host and 0 <= int(off) < 7:
                     bucket = week_by_host[h][int(off)]
@@ -4942,7 +4974,8 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                     bucket["duration_min"] = int(dur or 0)
             wk_diam = s.execute(text("""
                 SELECT r.host_unique_id,
-                       FLOOR(EXTRACT(EPOCH FROM (NOW() - r.first_seen_at)) / 86400.0)::int AS day_offset,
+                       ((NOW() AT TIME ZONE :tz)::date
+                        - (e.ts AT TIME ZONE :tz)::date) AS day_offset,
                        COALESCE(SUM(
                          COALESCE((e.payload->>'diamond_count')::int, 0)
                            * COALESCE((e.payload->>'repeat_count')::int, 1)
@@ -4951,7 +4984,7 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                 JOIN tiktok_events e ON e.room_id = r.room_id
                 JOIN tiktok_subscriptions sub ON sub.unique_id = r.host_unique_id
                 WHERE r.host_unique_id = ANY(:hs)
-                  AND r.first_seen_at > NOW() - INTERVAL '7 days'
+                  AND e.ts > NOW() - INTERVAL '8 days'
                   AND e.type = 'gift'
                   AND (
                     sub.profile_user_id IS NULL
@@ -4959,7 +4992,7 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                        IN ('0', sub.profile_user_id::text)
                   )
                 GROUP BY 1, 2
-            """), {"hs": handles}).all()
+            """), {"hs": handles, "tz": tz}).all()
             for h, off, d in wk_diam:
                 if h in week_by_host and 0 <= int(off) < 7:
                     week_by_host[h][int(off)]["diamonds"] = int(d or 0)
@@ -4967,7 +5000,7 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
         # Reverse so the array reads oldest → newest (left → right on
         # the heatmap strip), matching the diamond sparkline.
         result = {h: list(reversed(days)) for h, days in week_by_host.items()}
-        self._week_calendar_cache[key] = (now, result)
+        self._week_calendar_cache[cache_key] = (now, result)
         return result
 
     # ── Per-section helpers for `get_lives_summary`.  ────────────
@@ -5882,8 +5915,19 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
             pass
         return slice_
 
-    def get_lives_summary(self, handles: list[str]) -> dict[str, dict[str, Any]]:
+    def get_lives_summary(
+        self,
+        handles: list[str],
+        *,
+        tz: str = "UTC",
+    ) -> dict[str, dict[str, Any]]:
         """Returns `{handle: {...}}` keyed by lowercased handle.
+
+        `tz` is the IANA zone used for the `week_calendar` buckets so
+        the 7-day mini-strip reads as calendar days in the operator's
+        zone rather than rolling 24h windows from UTC midnight. Default
+        UTC preserves backward-compat for callers that haven't been
+        updated.
 
         Per-handle keys:
           - active_room_id  (str | None)
@@ -5968,7 +6012,7 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
             f_avgs     = ex.submit(self._lives_summary_30d_averages, norm)
             f_recon    = ex.submit(self._lives_summary_reconnects, norm)
             f_daily    = ex.submit(self._daily_buckets_cached, norm)
-            f_week     = ex.submit(self._week_calendar_cached, norm)
+            f_week     = ex.submit(self._week_calendar_cached, norm, tz=tz)
 
             # Gate Phase 1 on the anchor result.  Everything else in
             # Phase 0 continues running in the background while we

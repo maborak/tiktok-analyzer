@@ -3191,7 +3191,13 @@ class TikTokService:
     # widens by ~25 s, which is acceptable for the rollup-style
     # numbers on the card (per-event freshness comes from the WS feed).
     _LIVES_SUMMARY_TTL_S = 60.0
-    _lives_summary_cache: dict[tuple[str, ...], tuple[float, dict[str, Any]]] = {}
+    # Key shape: `(tz, sorted_handles_tuple)`. tz is part of the key
+    # because `week_calendar` buckets vary per TZ; the rest of the
+    # summary is TZ-agnostic, but caching two slightly-different
+    # results separately is cheaper than burning the right one.
+    _lives_summary_cache: dict[
+        tuple[str, tuple[str, ...]], tuple[float, dict[str, Any]],
+    ] = {}
     # Per-key singleflight locks. When N concurrent callers race for
     # the same cache key on a cold miss (warm-up + first user request,
     # or multiple admin tabs opening at once), only one runs the SQL;
@@ -3199,7 +3205,9 @@ class TikTokService:
     # Without this the warm-up I added on startup duplicates work with
     # whoever hits the route first. The meta-lock guards lock-creation
     # so two callers don't each instantiate a fresh per-key lock.
-    _lives_summary_locks: dict[tuple[str, ...], threading.Lock] = {}
+    _lives_summary_locks: dict[
+        tuple[str, tuple[str, ...]], threading.Lock,
+    ] = {}
     _lives_summary_meta_lock = threading.Lock()
 
     # Phase 9C: fields the state cache provably maintains in lock-step
@@ -3243,20 +3251,20 @@ class TikTokService:
         (`PHOVEU_BACKEND_TIKTOK_WS_STATE_PUSH=off`)."""
         return getattr(self._persistence, "_state_cache", None)
 
-    def get_lives_summary(self, handles: list[str]) -> dict[str, Any]:
+    def get_lives_summary(
+        self,
+        handles: list[str],
+        *,
+        tz: str = "UTC",
+    ) -> dict[str, Any]:
         """Returns the per-host summary dict.
 
         SQL fan-out runs with the existing 60s TTL + singleflight (the
-        cache key is `tuple(sorted(handles))`). Phase 9C: when a state
-        cache is wired, every returned slice is overlaid with the
-        cache's session-incremental fields and tagged with a monotonic
-        `version` integer. Without a state cache, behavior is
-        identical to Phase 9A (no `version` field on slices).
-
-        The overlay is a fresh dict per call — the TTL cache stores
-        the raw SQL result so we don't poison it across calls. Overlay
-        cost is sub-ms (in-process or Redis HGET)."""
-        key = tuple(sorted(handles))
+        cache key now includes `tz` so the TZ-sensitive `week_calendar`
+        field doesn't get poisoned across operators on different
+        zones). Phase 9C overlay still applies; tz only changes the
+        SQL plan that populates `week_calendar`."""
+        key = (tz, tuple(sorted(handles)))
         now = time.monotonic()
         sql_result: dict[str, Any]
         hit = self._lives_summary_cache.get(key)
@@ -3278,7 +3286,7 @@ class TikTokService:
                 if hit2 and (now2 - hit2[0]) < self._LIVES_SUMMARY_TTL_S:
                     sql_result = hit2[1]
                 else:
-                    sql_result = self._persistence.get_lives_summary(handles)
+                    sql_result = self._persistence.get_lives_summary(handles, tz=tz)
                     self._lives_summary_cache[key] = (now2, sql_result)
 
         # Phase 9C: state-cache overlay + per-host version.
@@ -3421,7 +3429,12 @@ class TikTokService:
     # than admin operators, and the page can fan out to N anonymous
     # tabs so the savings matter.
     _PUBLIC_LIVES_SUMMARY_TTL_S = 30.0
-    _public_lives_summary_cache: tuple[float, dict[str, Any]] | None = None
+    # Per-tz cache slot — public viewers on different zones get
+    # different `week_calendar` buckets, so we cache one entry per tz.
+    # `None` is the initial state before the first call materialises
+    # the dict (kept as `None` instead of `{}` to detect "never
+    # populated" in tests that monkeypatch the type-annotation default).
+    _public_lives_summary_cache: dict[str, tuple[float, dict[str, Any]]] | None = None
 
     # Public-handle set: the lowercased `unique_id`s of every
     # subscription with `is_public=True`. Used by the public WS
@@ -3513,7 +3526,7 @@ class TikTokService:
             out[k] = v
         return out
 
-    def get_public_lives_summary(self) -> dict[str, Any]:
+    def get_public_lives_summary(self, *, tz: str = "UTC") -> dict[str, Any]:
         """Sanitized public-lives payload for /public/tiktok/lives.
 
         Response shape:
@@ -3534,9 +3547,13 @@ class TikTokService:
         added to `_PUBLIC_SUBSCRIPTION_FIELDS` or `_PUBLIC_SUMMARY_FIELDS`.
         """
         now = time.monotonic()
-        cached = self._public_lives_summary_cache
-        if cached is not None and (now - cached[0]) < self._PUBLIC_LIVES_SUMMARY_TTL_S:
-            return cached[1]
+        # Cache slot is per-tz so a request from a Lima-zone viewer
+        # doesn't get a UTC-bucketed payload (or vice versa). The
+        # cached shape is a `dict[str (tz), tuple[float, dict]]`.
+        cached_for_tz = self._public_lives_summary_cache.get(tz) \
+            if isinstance(self._public_lives_summary_cache, dict) else None
+        if cached_for_tz is not None and (now - cached_for_tz[0]) < self._PUBLIC_LIVES_SUMMARY_TTL_S:
+            return cached_for_tz[1]
 
         # 1. Pull just the public-flagged subscriptions. Profile fields
         #    (nickname/avatar/follower_count/is_live/...) live on this
@@ -3545,14 +3562,16 @@ class TikTokService:
         handles = [s.unique_id for s in publics if s.unique_id]
         if not handles:
             result = {"items": []}
-            self._public_lives_summary_cache = (now, result)
+            if not isinstance(self._public_lives_summary_cache, dict):
+                self._public_lives_summary_cache = {}
+            self._public_lives_summary_cache[tz] = (now, result)
             return result
 
         # 2. Re-use the admin summary path — same SQL fan-out, shares
         #    the 10s TTL cache when admin + public callers overlap on
         #    the same handle set. Then sanitize each entry so nothing
         #    operator-only escapes.
-        summary = self.get_lives_summary(handles)
+        summary = self.get_lives_summary(handles, tz=tz)
 
         items: list[dict[str, Any]] = []
         for sub in publics:
@@ -3575,7 +3594,9 @@ class TikTokService:
             )
 
         result = {"items": items}
-        self._public_lives_summary_cache = (now, result)
+        if not isinstance(self._public_lives_summary_cache, dict):
+            self._public_lives_summary_cache = {}
+        self._public_lives_summary_cache[tz] = (now, result)
         return result
 
     # `get_lives_totals` is polled every 30 s by the /admin/tiktok
@@ -3641,8 +3662,12 @@ class TikTokService:
         "median_diamonds_30d",
     )
 
-    async def get_lives_bundle(self) -> dict[str, Any]:
+    async def get_lives_bundle(self, *, tz: str = "UTC") -> dict[str, Any]:
         """Single round-trip rollup for the /admin/tiktok Lives page.
+
+        `tz` is the operator's selected IANA zone (from the TZ pill at
+        the top of the page); passed through to `get_lives_summary`
+        for tz-aware `week_calendar` bucketing.
 
         Returns `{"subs", "summary", "totals"}` — everything the page
         needs on first paint and on each 30 s poll. Consolidates what
@@ -3673,7 +3698,7 @@ class TikTokService:
         # singleflight lock so concurrent tabs / cold-miss races
         # collapse to one DB round-trip per cache window.
         summary, totals = await asyncio.gather(
-            asyncio.to_thread(self.get_lives_summary, handles),
+            asyncio.to_thread(lambda: self.get_lives_summary(handles, tz=tz)),
             asyncio.to_thread(self.get_lives_totals),
         )
         # Strip dead-weight fields from each per-host slice. Done as

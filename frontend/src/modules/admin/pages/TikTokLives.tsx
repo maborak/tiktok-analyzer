@@ -31,7 +31,11 @@ import { TikTokCommonGiftersTable } from '@admin/components/TikTokCommonGiftersT
 import { TikTokFavoriteGiftersTable } from '@admin/components/TikTokFavoriteGiftersTable';
 import { TikTokRealtimeIndicator } from '@admin/components/TikTokRealtimeIndicator';
 import { TikTokTimezonePill } from '@admin/components/TikTokTimezonePill';
-import { TikTokTimezoneProvider } from '@admin/contexts/TikTokTimezoneContext';
+import {
+  TikTokTimezoneProvider,
+  useTikTokTimezone,
+  partsInZone,
+} from '@admin/contexts/TikTokTimezoneContext';
 import {
   TikTokRuntimeConfigProvider,
   useTikTokRuntimeConfig,
@@ -68,6 +72,10 @@ function TikTokLivesBody() {
   // value from typed config (default 30000), clamped server-side
   // to [1000, 600000] so a misconfig can't DDOS our own backend.
   const { pollIntervalMs } = useTikTokRuntimeConfig();
+  // Active operator timezone — threaded into livesBundle so the
+  // per-host `week_calendar` strip buckets by calendar day in this
+  // zone (e.g. Lima) instead of rolling-24h-UTC.
+  const { tz } = useTikTokTimezone();
   const [subs, setSubs] = useState<TikTokSubscription[]>([]);
   const [loading, setLoading] = useState(true);
   const [adding, setAdding] = useState(false);
@@ -265,7 +273,7 @@ function TikTokLivesBody() {
     let cancelled = false;
     const fetchOnce = () => {
       tiktokApi
-        .livesBundle()
+        .livesBundle({ tz })
         .then(({ subs: nextSubs, summary: nextSummary, totals: nextTotals }) => {
           if (cancelled) return;
           setSubs(nextSubs);
@@ -325,7 +333,7 @@ function TikTokLivesBody() {
       stop();
       document.removeEventListener('visibilitychange', onVis);
     };
-  }, [tab, reconcileIntervalMs]);
+  }, [tab, reconcileIntervalMs, tz]);
 
   // ── actions ───────────────────────────────────────────────────────
 
@@ -1511,13 +1519,19 @@ function ActivityStrip({
  *  initial inside and is tinted by diamond intensity on the same
  *  sky-blue ramp the live calendar + profile heatmap use. */
 function WeekHeatmap({ days }: { days: NonNullable<TikTokLiveSummary['week_calendar']> }) {
+  // Active operator timezone — labels must match the buckets the
+  // backend just sent (which were computed in this same zone).
+  const { tz } = useTikTokTimezone();
   const maxDiamonds = Math.max(0, ...days.map((d) => d.diamonds));
   const total = days.reduce((acc, d) => acc + d.diamonds, 0);
 
-  // Anchor "today" as a fake-UTC Date (date bag — never .toISOString'd).
-  const now = new Date();
+  // Anchor "today" as the date components of NOW in the active tz,
+  // packed into a fake-UTC Date (date bag — never .toISOString'd).
+  // This is what makes "today's box" + "today's weekday letter" agree
+  // with the operator's wall-clock calendar instead of the browser's.
+  const todayParts = partsInZone(new Date(), tz);
   const todayAnchor = new Date(Date.UTC(
-    now.getFullYear(), now.getMonth(), now.getDate(),
+    todayParts.year, todayParts.month - 1, todayParts.day,
   ));
 
   const LEVEL_COLOR = [

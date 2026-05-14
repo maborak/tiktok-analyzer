@@ -182,6 +182,13 @@ def _need_admin():
 @router.get("/lives/bundle")
 async def lives_bundle(
     response: Response,
+    tz: str = Query(
+        "UTC",
+        description=(
+            "IANA timezone for the per-host `week_calendar` 7-day mini-strip "
+            "(e.g. `America/Lima`). UTC default preserves legacy callers."
+        ),
+    ),
     _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
 ):
     """Single round-trip rollup for the /admin/tiktok Lives page.
@@ -207,7 +214,7 @@ async def lives_bundle(
     entirely."""
     svc = _require_service()
     response.headers["Cache-Control"] = "private, max-age=30"
-    return await svc.get_lives_bundle()
+    return await svc.get_lives_bundle(tz=tz)
 
 
 @router.get("/lives", response_model=list[SubscriptionResponse])

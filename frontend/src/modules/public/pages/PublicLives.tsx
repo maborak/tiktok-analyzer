@@ -19,7 +19,10 @@ import {
   TikTokApiProvider,
   type TikTokApi,
 } from '@admin/contexts/TikTokApiContext';
-import { TikTokTimezoneProvider } from '@admin/contexts/TikTokTimezoneContext';
+import {
+  TikTokTimezoneProvider,
+  useTikTokTimezone,
+} from '@admin/contexts/TikTokTimezoneContext';
 import { TikTokTimezonePill } from '@admin/components/TikTokTimezonePill';
 import { publicTiktokApi, type PublicLivesPayload } from '../services/publicTiktok';
 
@@ -44,15 +47,30 @@ import { publicTiktokApi, type PublicLivesPayload } from '../services/publicTikt
  *  `visibilitychange: hidden` so background tabs don't burn API
  *  capacity. Initial fetch happens regardless of visibility so a
  *  cold visit shows data without waiting for the next tick. */
+// Wider payload: `subscription` is a TikTokSubscription-shaped dict
+// (operator-only fields stripped server-side), `summary` is a
+// TikTokLiveSummary-shaped dict (top_gifters, hourly_buckets,
+// week_calendar, etc.) so the shared card has everything it needs.
+type PublicEntry = {
+  subscription: TikTokSubscription;
+  summary: TikTokLiveSummary;
+};
+
+/** Outer shell — mounts the providers that PublicLivesBody's hooks
+ *  depend on. Splitting Outer/Inner lets the body call
+ *  `useTikTokTimezone()` inside the provider it sits in. */
 export function PublicLives() {
-  // Wider payload: `subscription` is a TikTokSubscription-shaped dict
-  // (operator-only fields stripped server-side), `summary` is a
-  // TikTokLiveSummary-shaped dict (top_gifters, hourly_buckets,
-  // week_calendar, etc.) so the shared card has everything it needs.
-  type PublicEntry = {
-    subscription: TikTokSubscription;
-    summary: TikTokLiveSummary;
-  };
+  return (
+    <TikTokTimezoneProvider>
+      <TikTokApiProvider value={publicTiktokApi as unknown as TikTokApi}>
+        <PublicLivesBody />
+      </TikTokApiProvider>
+    </TikTokTimezoneProvider>
+  );
+}
+
+function PublicLivesBody() {
+  const { tz } = useTikTokTimezone();
   const [entries, setEntries] = useState<PublicEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -75,7 +93,7 @@ export function PublicLives() {
     let cancelled = false;
     const fetchOnce = async () => {
       try {
-        const r = await publicTiktokApi.listLives();
+        const r = await publicTiktokApi.listLives({ tz });
         if (cancelled) return;
         const next = normalizePayload(r);
         // Structural sharing across polls — same pattern as the admin
@@ -150,7 +168,11 @@ export function PublicLives() {
       stop();
       document.removeEventListener('visibilitychange', onVis);
     };
-  }, []);
+  // Re-mount the poller when the active TZ changes so the next fetch
+  // sends the new `tz=…` query param and rebuilds the per-host
+  // week-calendar buckets immediately.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tz]);
 
   // Live hosts first, then offline; within each bucket, viewers desc.
   // Mirrors the admin page's default "live first → by live_checked_at"
@@ -170,14 +192,8 @@ export function PublicLives() {
   }, [entries]);
 
   return (
-    /* Wrap the page in the public TikTok-API namespace so every
-       descendant `useTikTokApi()` call (notably inside the gifter
-       modal, which now spans Current + Profile tabs) hits
-       `/public/tiktok/*` instead of falling back to the admin
-       default — without this the modal's data fetches 401 for
-       anonymous viewers. */
-    <TikTokTimezoneProvider>
-    <TikTokApiProvider value={publicTiktokApi as unknown as TikTokApi}>
+    // Providers (TZ + public API namespace) are mounted by the
+    // exported `PublicLives` outer shell so hooks here can read them.
     <PageShell className="max-w-6xl mx-auto px-4 py-6">
       <PageHeader
         title="Live Streams"
@@ -245,8 +261,6 @@ export function PublicLives() {
         )}
       </Suspense>
     </PageShell>
-    </TikTokApiProvider>
-    </TikTokTimezoneProvider>
   );
 }
 

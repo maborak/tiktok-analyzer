@@ -291,7 +291,16 @@ def _sanitize_match(match_dict: Any) -> dict[str, Any]:
 
 
 @router.get("/tiktok/lives")
-def public_lives(response: Response):
+def public_lives(
+    response: Response,
+    tz: str = Query(
+        "UTC",
+        description=(
+            "IANA timezone for the per-host `week_calendar` 7-day mini-strip. "
+            "Frontend passes the active TZ-pill selection."
+        ),
+    ),
+):
     """Public payload for every subscription marked `is_public=True`.
 
     Response shape:
@@ -315,7 +324,7 @@ def public_lives(response: Response):
     """
     svc = _require_service()
     _set_cache_headers(response)
-    return svc.get_public_lives_summary()
+    return svc.get_public_lives_summary(tz=tz)
 
 
 @router.get("/tiktok/lives/{handle}")

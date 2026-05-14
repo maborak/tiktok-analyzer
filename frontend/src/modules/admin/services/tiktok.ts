@@ -1359,12 +1359,18 @@ export const tiktokApi = {
   // paid for two parallel `list_subscriptions()` queries on every
   // cold mount.
 
-  livesBundle(): Promise<{
+  livesBundle(opts?: { tz?: string }): Promise<{
     subs: TikTokSubscription[];
     summary: Record<string, TikTokLiveSummary>;
     totals: TikTokLivesTotals;
   }> {
-    return apiRequest({ method: 'GET', url: `${BASE}/lives/bundle` });
+    return apiRequest({
+      method: 'GET',
+      url: `${BASE}/lives/bundle`,
+      // Pass the active TZ so per-host `week_calendar` buckets render
+      // as calendar days in the operator's zone instead of UTC.
+      params: opts?.tz ? { tz: opts.tz } : undefined,
+    });
   },
 
   // ─── Notifications history ────────────────────────────────────

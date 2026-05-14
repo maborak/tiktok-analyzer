@@ -61,8 +61,14 @@ export interface PublicHostSummary {
  *  identical so the shared `TikTokLiveDetail` component can switch
  *  namespaces via context without any branching. */
 export const publicTiktokApi = {
-  listLives(): Promise<PublicLivesPayload> {
-    return apiRequest({ method: 'GET', url: `${BASE}/lives` });
+  listLives(opts?: { tz?: string }): Promise<PublicLivesPayload> {
+    return apiRequest({
+      method: 'GET',
+      url: `${BASE}/lives`,
+      // Active TZ pill selection — backend uses it to bucket per-host
+      // week_calendar by calendar day in the viewer's zone.
+      params: opts?.tz ? { tz: opts.tz } : undefined,
+    });
   },
 
   /** Fetch a single host's subscription record. Public endpoint
