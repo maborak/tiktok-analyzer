@@ -315,6 +315,15 @@ What's a module (delete if not needed):
 
 ## TikTok module (read + write to TikTok lives)
 
+**Deep-dive docs** (read these when touching the TikTok module):
+- `backend/docs/DB_ARCHITECTURE.md` — engine routing, hexagonal layers,
+  schema layout, caching tiers, migration strategy.
+- `backend/docs/WORKER.md` — listener-pool deployment, capacity + claim
+  model, lifecycle, recycle logic, the known stuck-slot bug.
+- `backend/docs/EVENTS_LOGGER.md` — event capture pipeline, dedup,
+  pre-aggregation, two-channel fan-out (legacy events + Phase 9 state
+  deltas), failure modes.
+
 This is the project's primary feature module. Architecturally it
 follows the framework conventions — but it has one unusual constraint:
 **posting to TikTok must happen on the user's machine** (their
