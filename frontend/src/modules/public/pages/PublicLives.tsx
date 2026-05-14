@@ -19,6 +19,8 @@ import {
   TikTokApiProvider,
   type TikTokApi,
 } from '@admin/contexts/TikTokApiContext';
+import { TikTokTimezoneProvider } from '@admin/contexts/TikTokTimezoneContext';
+import { TikTokTimezonePill } from '@admin/components/TikTokTimezonePill';
 import { publicTiktokApi, type PublicLivesPayload } from '../services/publicTiktok';
 
 /** Unauthenticated public-lives index — surfaces the operator's
@@ -174,12 +176,18 @@ export function PublicLives() {
        `/public/tiktok/*` instead of falling back to the admin
        default — without this the modal's data fetches 401 for
        anonymous viewers. */
+    <TikTokTimezoneProvider>
     <TikTokApiProvider value={publicTiktokApi as unknown as TikTokApi}>
     <PageShell className="max-w-6xl mx-auto px-4 py-6">
       <PageHeader
         title="Live Streams"
         icon={<Radio className="w-5 h-5" />}
         description="Streams being tracked right now."
+        actions={
+          <div className="flex items-center gap-2">
+            <TikTokTimezonePill compact />
+          </div>
+        }
       />
 
       {loading && entries.length === 0 && (
@@ -238,6 +246,7 @@ export function PublicLives() {
       </Suspense>
     </PageShell>
     </TikTokApiProvider>
+    </TikTokTimezoneProvider>
   );
 }
 

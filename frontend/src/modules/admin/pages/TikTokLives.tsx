@@ -30,6 +30,8 @@ const TikTokGifterDetailModal = lazy(() =>
 import { TikTokCommonGiftersTable } from '@admin/components/TikTokCommonGiftersTable';
 import { TikTokFavoriteGiftersTable } from '@admin/components/TikTokFavoriteGiftersTable';
 import { TikTokRealtimeIndicator } from '@admin/components/TikTokRealtimeIndicator';
+import { TikTokTimezonePill } from '@admin/components/TikTokTimezonePill';
+import { TikTokTimezoneProvider } from '@admin/contexts/TikTokTimezoneContext';
 import {
   TikTokRuntimeConfigProvider,
   useTikTokRuntimeConfig,
@@ -50,9 +52,11 @@ export function TikTokLives() {
   // realtime mode + public realtime mode). The public mirror only
   // returns the trimmed slice; the admin endpoint is the truth.
   return (
-    <TikTokRuntimeConfigProvider audience="admin">
-      <TikTokLivesBody />
-    </TikTokRuntimeConfigProvider>
+    <TikTokTimezoneProvider>
+      <TikTokRuntimeConfigProvider audience="admin">
+        <TikTokLivesBody />
+      </TikTokRuntimeConfigProvider>
+    </TikTokTimezoneProvider>
   );
 }
 
@@ -462,7 +466,8 @@ function TikTokLivesBody() {
             : 'Subscribe to TikTok creators and gather their live events. Posting is read-only here — open in the desktop client to send chat.'
         }
         actions={
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
+            <TikTokTimezonePill compact />
             <TikTokRealtimeIndicator audience="admin" />
             <Button
               variant="ghost"
