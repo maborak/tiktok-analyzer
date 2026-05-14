@@ -85,6 +85,106 @@ def list_lives_cmd() -> None:
     asyncio.run(_list_lives())
 
 
+@tiktok_group.command(name="gaps")
+@click.option(
+    "--hours", type=int, default=96, show_default=True,
+    help="Look-back window in hours.",
+)
+@click.option(
+    "--min-gap-s", type=int, default=120, show_default=True,
+    help="Minimum gap length (seconds) to report.",
+)
+@click.option(
+    "--min-hosts", type=int, default=3, show_default=True,
+    help="Only report gap-start minutes affecting at least this many hosts (treat as a global outage).",
+)
+@click.option(
+    "--host", "host_filter", type=str, default=None,
+    help="Only report gaps for one specific host (overrides --min-hosts).",
+)
+def gaps_cmd(hours: int, min_gap_s: int, min_hosts: int, host_filter: str | None) -> None:
+    """Detect event-flow gaps in TikTok ingestion.
+
+    Finds windows where an active room produced no events for at least
+    --min-gap-s seconds. With --min-hosts >= 2 the report rolls up by
+    gap-start minute so simultaneous outages across many hosts (worker
+    restart, network blip) surface as a single row.
+
+    Useful when investigating diamond discrepancies — visible
+    score-update jumps after a gap are TikTok's WS replay catching the
+    state up, but the individual gift events that produced the score
+    are lost forever.
+    """
+    from database.core.connection import create_database_engine
+    from sqlalchemy import text as _text
+    engine = create_database_engine()
+    with engine.connect() as c:
+        if host_filter:
+            rows = c.execute(_text("""
+              WITH flow AS (
+                SELECT e.room_id, r.host_unique_id AS host, e.ts,
+                       LAG(e.ts) OVER (
+                         PARTITION BY e.room_id ORDER BY e.ts
+                       ) AS prev_ts
+                FROM tiktok_events e
+                JOIN tiktok_rooms r ON r.room_id = e.room_id
+                WHERE e.ts > NOW() - (:hrs || ' hours')::interval
+                  AND r.host_unique_id = :h
+                  AND e.type IN ('gift','comment','like','join',
+                                 'match_update','viewer_count')
+              )
+              SELECT host, room_id, prev_ts, ts,
+                     EXTRACT(EPOCH FROM (ts - prev_ts))::int AS gap_s
+              FROM flow
+              WHERE prev_ts IS NOT NULL
+                AND EXTRACT(EPOCH FROM (ts - prev_ts)) > :gs
+              ORDER BY gap_s DESC
+              LIMIT 50
+            """), {"hrs": hours, "gs": min_gap_s, "h": host_filter}).fetchall()
+            click.echo(f"Gaps for @{host_filter} (last {hours}h, ≥{min_gap_s}s):")
+            click.echo(f"{'prev_ts':<32} | {'ts':<32} | {'gap_min':>7} | room")
+            for r in rows:
+                click.echo(
+                    f"{str(r.prev_ts):<32} | {str(r.ts):<32} | "
+                    f"{r.gap_s/60:>7.1f} | {r.room_id}"
+                )
+            return
+        rows = c.execute(_text("""
+          WITH flow AS (
+            SELECT e.room_id, r.host_unique_id AS host, e.ts,
+                   LAG(e.ts) OVER (
+                     PARTITION BY e.room_id ORDER BY e.ts
+                   ) AS prev_ts
+            FROM tiktok_events e
+            JOIN tiktok_rooms r ON r.room_id = e.room_id
+            WHERE e.ts > NOW() - (:hrs || ' hours')::interval
+              AND e.type IN ('gift','comment','like','join',
+                             'match_update','viewer_count')
+          )
+          SELECT date_trunc('minute', prev_ts) AS gap_start_min,
+                 COUNT(DISTINCT host) AS n_hosts_affected,
+                 AVG(EXTRACT(EPOCH FROM (ts - prev_ts)))::int AS avg_gap_s,
+                 MAX(EXTRACT(EPOCH FROM (ts - prev_ts)))::int AS max_gap_s
+          FROM flow
+          WHERE prev_ts IS NOT NULL
+            AND EXTRACT(EPOCH FROM (ts - prev_ts)) > :gs
+          GROUP BY 1
+          HAVING COUNT(DISTINCT host) >= :mh
+          ORDER BY n_hosts_affected DESC, avg_gap_s DESC
+          LIMIT 30
+        """), {"hrs": hours, "gs": min_gap_s, "mh": min_hosts}).fetchall()
+        click.echo(
+            f"Global outage windows (last {hours}h, ≥{min_gap_s}s gap, "
+            f"≥{min_hosts} hosts):"
+        )
+        click.echo(f"{'gap_start':<26} | hosts | avg_min | max_min")
+        for r in rows:
+            click.echo(
+                f"{str(r.gap_start_min):<26} | {r.n_hosts_affected:>5} | "
+                f"{r.avg_gap_s/60:>7.1f} | {r.max_gap_s/60:>7.1f}"
+            )
+
+
 @tiktok_group.command(name="debug")
 @click.argument("handle")
 @click.option(
