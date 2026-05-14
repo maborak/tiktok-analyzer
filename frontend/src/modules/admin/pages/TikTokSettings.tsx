@@ -19,6 +19,7 @@ import { useEffect, useMemo, useState } from 'react';
 import {
   Activity,
   AlertTriangle,
+  BarChart2,
   Check,
   Eye,
   EyeOff,
@@ -107,12 +108,13 @@ const SIGN_PROVIDER_OPTIONS = [
   { value: 'local', label: 'Local Electron broker' },
 ];
 
-type SettingsSubTab = 'general' | 'sign-engine' | 'worker';
+type SettingsSubTab = 'general' | 'sign-engine' | 'worker' | 'api-history';
 
 const SUB_TAB_KEYS: ReadonlySet<SettingsSubTab> = new Set([
   'general',
   'sign-engine',
   'worker',
+  'api-history',
 ]);
 
 export function TikTokSettings() {
@@ -277,6 +279,10 @@ export function TikTokSettings() {
           <Activity className="w-3.5 h-3.5" />
           Worker
         </SettingsTabButton>
+        <SettingsTabButton active={subTab === 'api-history'} onClick={() => setSubTab('api-history')}>
+          <BarChart2 className="w-3.5 h-3.5" />
+          API History
+        </SettingsTabButton>
       </div>
 
       <div className="pt-4 flex flex-col gap-6">
@@ -327,17 +333,11 @@ export function TikTokSettings() {
         </>
       )}
 
-      {subTab === 'sign-engine' && (
-        <>
-          <TikTokSignConfigBody />
-          {/* Quota visibility — shows the live Euler-call histogram so
-              admins can correlate quota burn with worker activity (a
-              restart storm, a probe loop, etc.). */}
-          <TikTokEulerHistory />
-        </>
-      )}
+      {subTab === 'sign-engine' && <TikTokSignConfigBody />}
 
       {subTab === 'worker' && <TikTokListenerStatusCard refreshKey={workerRefreshKey} />}
+
+      {subTab === 'api-history' && <TikTokEulerHistory />}
 
       </div>
     </PageShell>
