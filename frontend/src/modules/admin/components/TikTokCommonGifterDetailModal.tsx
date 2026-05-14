@@ -16,8 +16,15 @@
  * understands HOW a viewer bridges multiple creators.
  */
 
-import { useEffect, useMemo, useState } from 'react';
+import { lazy, Suspense, useEffect, useMemo, useState } from 'react';
 import { Link } from '@tanstack/react-router';
+// Lazy — the Add-Live preview modal is only mounted when the operator
+// clicks "Add to monitor", same pattern as `TikTokCommonGiftersTable`.
+const TikTokAddLiveModal = lazy(() =>
+  import('@admin/components/TikTokAddLiveModal').then((m) => ({
+    default: m.TikTokAddLiveModal,
+  })),
+);
 
 import { TikTokDailyHeatmap30 } from '@admin/components/TikTokDailyHeatmap30';
 import toast from 'react-hot-toast';
@@ -276,6 +283,14 @@ export function TikTokCommonGifterDetailModal({
   // the star reflects the current truth without a flicker.
   const [isFavorite, setIsFavorite] = useState<boolean | null>(null);
   const [favoriteBusy, setFavoriteBusy] = useState(false);
+  // Add-to-monitor wiring — checks the subscription list for the
+  // gifter's @handle and either shows the "Add to monitor" button or
+  // the "✓ Monitoring" link to their live page. The pair lives on
+  // this Profile tab (not the Current tab) because both Favourites
+  // and Monitoring are identity-level concerns — about the person
+  // across every live they've gifted in, not this session.
+  const [isMonitored, setIsMonitored] = useState<boolean>(false);
+  const [addMonitorOpen, setAddMonitorOpen] = useState<boolean>(false);
 
   useEffect(() => {
     if (!isOpenEff || !userId) {
@@ -365,6 +380,50 @@ export function TikTokCommonGifterDetailModal({
   const uniqueId = data?.unique_id ?? initialUniqueId ?? null;
   const avatarUrl = data?.avatar_url ?? initialAvatarUrl ?? null;
   const display = nickname || uniqueId || (userId ? `User ${userId}` : 'Viewer');
+
+  // Refresh `isMonitored` whenever the modal opens with a known handle.
+  // Mirrors the pattern in TikTokGifterModal — read from listLives so a
+  // freshly-added handle reflects without a hard refresh. Skip on
+  // public audience (listLives is admin-only). Placed AFTER `uniqueId`
+  // is declared above to avoid the JS temporal-dead-zone error
+  // (`Cannot access 'uniqueId' before initialization`).
+  useEffect(() => {
+    if (!isAdmin) {
+      setIsMonitored(false);
+      return;
+    }
+    if (!isOpenEff || !uniqueId) {
+      setIsMonitored(false);
+      return;
+    }
+    let cancelled = false;
+    tiktokApi
+      .listLives()
+      .then((rows) => {
+        if (cancelled) return;
+        const handle = uniqueId.toLowerCase();
+        setIsMonitored(rows.some((r) => r.unique_id?.toLowerCase() === handle));
+      })
+      .catch(() => {
+        // Silent — `createLive` guards against dupes server-side.
+      });
+    return () => { cancelled = true; };
+  }, [isOpenEff, uniqueId, isAdmin]);
+
+  const confirmAddMonitor = async () => {
+    if (!uniqueId) return;
+    try {
+      await tiktokApi.createLive(uniqueId, true);
+      setIsMonitored(true);
+      toast.success(`Now monitoring @${uniqueId}`);
+      setAddMonitorOpen(false);
+    } catch (e) {
+      toast.error(
+        (e as Error).message || `Failed to add @${uniqueId} to monitor`,
+      );
+      throw e;  // surface to TikTokAddLiveModal so it stays open
+    }
+  };
 
   const modalFooter = (
     <div className="flex items-center justify-between gap-2 w-full">
@@ -687,12 +746,29 @@ export function TikTokCommonGifterDetailModal({
   );
 
   // Embedded mode: the wrapper (`TikTokGifterDetailModal`) renders its
-  // own modal + Close button; we lose the standalone footer. Append
-  // the Favourites action inline so admins keep the affordance when
-  // viewing this content via the Profile tab of the unified shell.
+  // own modal + Close button; we lose the standalone footer. Append a
+  // dedicated identity-action bar so the Profile tab carries BOTH the
+  // Favourites toggle AND the Add-to-monitor affordance — these are
+  // person-level concerns and live here, not on the Current tab.
   if (embedded) {
     return (
       <>
+        {/* The TikTokAddLiveModal stacks above the unified shell via
+            React portal; mounting it as a sibling here works because
+            the lazy-loaded chunk doesn't fetch until the operator
+            actually clicks "Add to monitor". */}
+        {isAdmin && uniqueId && (
+          <Suspense fallback={null}>
+            {addMonitorOpen && (
+              <TikTokAddLiveModal
+                isOpen
+                handle={uniqueId}
+                onCancel={() => setAddMonitorOpen(false)}
+                onConfirm={confirmAddMonitor}
+              />
+            )}
+          </Suspense>
+        )}
         {body}
         {isAdmin && (
           <div className="flex items-center justify-end gap-2 pt-3 mt-3 border-t border-gray-200/60 dark:border-white/10">
@@ -711,6 +787,29 @@ export function TikTokCommonGifterDetailModal({
               />
               {isFavorite ? 'Favourited' : 'Add to Favourites'}
             </Button>
+            {uniqueId && (
+              isMonitored ? (
+                <Link
+                  to="/admin/tiktok/$handle"
+                  params={{ handle: uniqueId }}
+                  onClick={onClose}
+                  className="inline-flex items-center gap-1 px-3 py-2 rounded text-xs font-mono uppercase tracking-wider bg-emerald-100 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-500/30 hover:bg-emerald-200 dark:hover:bg-emerald-500/25 transition-colors"
+                  title="Open this creator's live page"
+                >
+                  <Radio className="w-3.5 h-3.5" />
+                  ✓ Monitoring
+                </Link>
+              ) : (
+                <Button
+                  variant="ghost"
+                  onClick={() => setAddMonitorOpen(true)}
+                  title="Start monitoring this creator's lives"
+                >
+                  <Radio className="w-4 h-4 mr-1.5" />
+                  Add to monitor
+                </Button>
+              )
+            )}
           </div>
         )}
       </>
