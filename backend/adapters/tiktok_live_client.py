@@ -136,6 +136,46 @@ def _lookup_recent_room_id(unique_id: str, *, max_age_s: float) -> int | None:
         return None
 
 
+def _load_age_restricted_count(unique_id: str) -> int:
+    """Count consecutive AgeRestrictedError rows in `tiktok_worker_log`
+    for this handle since the last `CONNECTED` or session_start row,
+    capped at 16 (enough to reach the 4h max backoff).
+
+    Used at session-supervisor construction so a worker restart doesn't
+    reset every host's exponential-backoff ramp back to the 30-min
+    base — losing the carefully-grown ~4h waits we earned over the
+    previous hours. Lookup is a single indexed range scan on
+    (event, ts DESC); cheap enough to run per-handle at boot.
+    """
+    handle = unique_id.lstrip("@")
+    try:
+        from database.core.connection import create_database_engine
+        from sqlalchemy import text as _text
+        eng = create_database_engine()
+        with eng.connect() as c:
+            # Find the most recent successful-connect marker (or
+            # absence thereof — the COALESCE handles a never-connected
+            # host).
+            row = c.execute(_text("""
+              SELECT COUNT(*)::int AS n
+              FROM tiktok_worker_log
+              WHERE event = 'session_terminal'
+                AND detail->>'kind' = 'AgeRestrictedError'
+                AND handle = :h
+                AND ts > COALESCE(
+                  (
+                    SELECT MAX(ts) FROM tiktok_worker_log
+                    WHERE event = 'session_start' AND handle = :h
+                  ),
+                  NOW() - INTERVAL '24 hours'
+                )
+            """), {"h": handle}).first()
+        return min(int(row.n) if row else 0, 16)
+    except Exception:
+        # Hydration failure is non-fatal — fall back to fresh ramp.
+        return 0
+
+
 def invalidate_sign_settings_cache() -> None:
     """Drop the 30s DB cache so the next `_read_sign_settings()` call
     re-reads. Call after a config write if you need the new value to
@@ -641,13 +681,25 @@ class TikTokLiveSession(TikTokLiveSessionPort):
     SIGN_RATE_LIMIT_INITIAL_BACKOFF = 120.0  # 2 min
     SIGN_RATE_LIMIT_MAX_BACKOFF = 1800.0  # 30 min
     # Park time for terminal errors that have a chance of recovering.
-    # `AgeRestrictedError` is per-handshake (not per-stream) — TikTok can
-    # serve a non-restricted response on the next attempt depending on
-    # sign cookie / rate-limit state, so polling a few minutes later is
-    # cheaper than waiting a half-hour. `UserNotFoundError` doesn't
-    # recover, so it stays on the long backoff to avoid spinning.
-    AGE_RESTRICTED_RETRY_BACKOFF = 180.0  # 3 min
-    USER_NOT_FOUND_BACKOFF = 1800.0       # 30 min
+    # `AgeRestrictedError` was thought to be per-handshake (TikTok
+    # flapping based on sign cookie state). Observed behaviour during
+    # the May 2026 TikTok-wide AgeRestricted wave is that EVERY connect
+    # attempt to certain hosts returns age_restricted=true persistently
+    # — burning 1 Euler call per retry across dozens of hosts and 12+
+    # retries/hour each adds up to 4 keys/day. So:
+    #
+    #   - Base backoff is now 30 min (was 3) so a steady-state Age
+    #     wave is cheap to ride out.
+    #   - Per-host exponential ramp: each consecutive AgeRestrictedError
+    #     doubles the wait up to `AGE_RESTRICTED_MAX_BACKOFF` (4h).
+    #     The first successful CONNECTED transition resets the counter
+    #     so a recovered host returns to fast polling.
+    #
+    # `UserNotFoundError` doesn't recover, so it stays on the long
+    # backoff to avoid spinning.
+    AGE_RESTRICTED_INITIAL_BACKOFF = 1800.0   # 30 min
+    AGE_RESTRICTED_MAX_BACKOFF     = 14400.0  # 4 h
+    USER_NOT_FOUND_BACKOFF         = 1800.0   # 30 min
 
     # Room-id reuse window. `tiktok_rooms` keeps the most-recent
     # `room_id` per handle even after the broadcast ends. If
@@ -680,6 +732,13 @@ class TikTokLiveSession(TikTokLiveSessionPort):
         # Set to True after a connect attempt with a cached room_id
         # fails; the next attempt forces a fresh probe.
         self._reused_room_id_failed = False
+        # Consecutive AgeRestrictedError count for this host. Each fail
+        # doubles the retry backoff (starting from
+        # AGE_RESTRICTED_INITIAL_BACKOFF, capped at …_MAX_BACKOFF).
+        # Resets to 0 on the first CONNECTED transition. Hydrated
+        # from `tiktok_worker_log` on construction so a worker
+        # restart doesn't drop the ramp back to base.
+        self._age_restricted_consecutive = _load_age_restricted_count(unique_id)
 
     @property
     def unique_id(self) -> str:
@@ -793,6 +852,16 @@ class TikTokLiveSession(TikTokLiveSessionPort):
                 # Connect succeeded — reset the "force fresh probe"
                 # flag so the next reconnect can try reuse again.
                 self._reused_room_id_failed = False
+                # Reset the AgeRestricted consecutive counter on the
+                # first successful connect — this host is no longer
+                # age-restricted, so the next failure (if any) starts
+                # the ramp from the base backoff again.
+                if self._age_restricted_consecutive > 0:
+                    logger.info(
+                        "@%s recovered from AgeRestrictedError after %d consecutive fails.",
+                        self._unique_id, self._age_restricted_consecutive,
+                    )
+                    self._age_restricted_consecutive = 0
                 self._heartbeat = heartbeat
                 self._room_id = client.room_id
                 await self._notify_state("CONNECTED")
@@ -809,20 +878,38 @@ class TikTokLiveSession(TikTokLiveSessionPort):
             except (UserNotFoundError, AgeRestrictedError) as e:
                 # Terminal handshake error. UserNotFound never recovers
                 # (handle doesn't exist), so we park on the slow 30-min
-                # cadence. AgeRestricted is per-request — TikTok's
-                # response depends on sign cookie / WAF state and may
-                # flip on the next attempt — so we retry on a much
-                # tighter cadence (3 min) so the listener actually
-                # picks events back up when the gate clears.
+                # cadence. AgeRestrictedError used to retry at 3 min
+                # under the theory that TikTok's response flapped per
+                # call — but the May 2026 wave proves it's persistent
+                # per-host once flagged. We now ramp the backoff
+                # exponentially per host (30m → 1h → 2h → 4h cap) so
+                # one host can't burn the Euler budget while still
+                # picking up the recovery within a few hours of the
+                # gate clearing.
                 kind = e.__class__.__name__
                 if isinstance(e, AgeRestrictedError):
-                    backoff = self.AGE_RESTRICTED_RETRY_BACKOFF
+                    self._age_restricted_consecutive += 1
+                    # 2^(n-1) * base, capped at MAX.
+                    multiplier = 2 ** (self._age_restricted_consecutive - 1)
+                    backoff = min(
+                        self.AGE_RESTRICTED_INITIAL_BACKOFF * multiplier,
+                        self.AGE_RESTRICTED_MAX_BACKOFF,
+                    )
                 else:
                     backoff = self.USER_NOT_FOUND_BACKOFF
-                logger.error(
-                    "@%s terminal: %s — parking for %.0fs before retry.",
-                    self._unique_id, kind, backoff,
-                )
+                if isinstance(e, AgeRestrictedError):
+                    logger.error(
+                        "@%s terminal: AgeRestrictedError (#%d consecutive) — "
+                        "parking for %.0fs (%.1f min) before retry.",
+                        self._unique_id,
+                        self._age_restricted_consecutive,
+                        backoff, backoff / 60.0,
+                    )
+                else:
+                    logger.error(
+                        "@%s terminal: %s — parking for %.0fs before retry.",
+                        self._unique_id, kind, backoff,
+                    )
                 # Push the reason up so the service can persist it to
                 # tiktok_worker_log and the listener status snapshot —
                 # otherwise the UI just sees "ERROR" with no hint why.
