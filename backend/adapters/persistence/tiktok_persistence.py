@@ -629,6 +629,22 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                 # which it had at least one event in zone, so a room
                 # that ran from 23:55 May 6 → 02:00 May 7 (zone) shows
                 # up in BOTH days' rows.
+                # Look up the host's TikTok user_id once — used by the
+                # `diamond_days` CTE to filter OUT gifts that landed in
+                # this host's room but were targeted at someone else
+                # (multi-host guest, PK opponent). Without this filter
+                # we credit @host with the rival anchor's diamonds when
+                # they share a room, inflating the daily total versus
+                # what TikTok's own per-host stat shows. NULL fallback:
+                # if we don't know the host's user_id (unprobed handle),
+                # count everything (legacy behaviour).
+                host_user_id_row = s.execute(text(
+                    "SELECT profile_user_id FROM tiktok_subscriptions "
+                    "WHERE unique_id = :host"
+                ), {"host": host_unique_id}).first()
+                host_user_id = (
+                    host_user_id_row.profile_user_id if host_user_id_row else None
+                )
                 rows = s.execute(text("""
                     WITH host_rooms AS (
                       SELECT room_id, first_seen_at, last_seen_at
@@ -655,6 +671,17 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                       WHERE e.type = 'gift'
                         AND e.room_id IN (SELECT room_id FROM host_rooms)
                         AND e.ts >= :since AND e.ts <= :until
+                        AND (
+                          -- Legacy fall-through: host_user_id NULL =
+                          -- unprobed handle, sum every gift (old behaviour).
+                          CAST(:host_user_id AS TEXT) IS NULL
+                          -- Match TikTok's per-host accounting:
+                          --   gift to host themselves OR
+                          --   gift with no specific recipient (popular
+                          --   vote / unattributed = goes to host).
+                          OR COALESCE(e.payload->'to_user'->>'user_id', '0')
+                             IN ('0', CAST(:host_user_id AS TEXT))
+                        )
                       GROUP BY day
                     ),
                     match_days AS (
@@ -697,6 +724,7 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                     "since": since,
                     "until": until,
                     "tz": zone,
+                    "host_user_id": str(host_user_id) if host_user_id else None,
                 }).mappings().all()
                 out: list[dict[str, Any]] = []
                 for r in rows:
