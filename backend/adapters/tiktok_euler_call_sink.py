@@ -72,25 +72,59 @@ def _fingerprint_api_key(raw: str | None) -> str:
     return f"len={len(s)}"
 
 
-def _endpoint_from_url(url: str) -> str | None:
-    """Classify a URL into a short endpoint label. Returns None for
-    URLs we don't care about (so the hook can early-return)."""
+def _classify_url(url: str) -> tuple[str, str] | None:
+    """Classify an outbound HTTP URL into `(endpoint, kind)`. Returns
+    None for URLs we don't care about so the hook short-circuits.
+
+    `endpoint` is a stable short label used as the series key in the
+    dashboard. `kind` is the higher-level bucket:
+
+      * `euler-sign`         — direct calls to EulerStream's sign API
+                               (each consumes 1 sign quota slot).
+      * `webcast`            — Euler-signed `webcast.*.tiktok.com/webcast/*`
+                               calls. Each consumes 1 Euler sign slot
+                               (the sign happens upstream of the GET).
+      * `tiktok-direct`      — anonymous unsigned `www.tiktok.com/@…`
+                               and `m.tiktok.com/@…` scrapes used by the
+                               profile / live-page probe. DON'T consume
+                               Euler quota but DO hit the public-site WAF
+                               so they're worth showing in the dashboard
+                               for separate troubleshooting.
+    """
     try:
         p = urlparse(url)
     except Exception:
         return None
     host = (p.hostname or "").lower()
     path = p.path or ""
-    # EulerStream direct: the sign API itself.
     if "eulerstream.com" in host:
-        # /webcast/fetch  →  "webcast/fetch"
-        return path.strip("/").replace("//", "/") or "eulerstream"
-    # TikTok webcast endpoints — these are signed by EulerStream on
-    # our behalf (each call consumes 1 sign quota slot).
+        ep = path.strip("/").rstrip("/") or "eulerstream"
+        return (ep, "euler-sign")
     if host.endswith("tiktok.com") and "/webcast/" in path:
-        # /webcast/room/info/ → "webcast/room/info"
-        return path.strip("/").rstrip("/") or "webcast"
+        ep = path.strip("/").rstrip("/") or "webcast"
+        return (ep, "webcast")
+    # Direct anonymous tiktok.com pages (profile scraper + live URL
+    # probe). We care about /@<handle>… and /@<handle>/live… — the
+    # profile and live-page scrapes — but NOT the asset CDN
+    # (p16-…, sf16-…, *.akamaized.net etc.) which would flood the log.
+    if (
+        host == "www.tiktok.com" or host == "m.tiktok.com"
+    ) and path.startswith("/@"):
+        # "/@user"          → "tiktok/profile"
+        # "/@user/live"     → "tiktok/live"
+        # "/@user/video/12" → "tiktok/video"
+        tail = path.split("/")
+        if len(tail) >= 3 and tail[2]:
+            return (f"tiktok/{tail[2]}", "tiktok-direct")
+        return ("tiktok/profile", "tiktok-direct")
     return None
+
+
+# Backward-compat alias for code that still calls the old name. New
+# callers should use `_classify_url` directly.
+def _endpoint_from_url(url: str) -> str | None:
+    hit = _classify_url(url)
+    return hit[0] if hit else None
 
 
 def _handle_from_url(url: str) -> str | None:
@@ -148,24 +182,31 @@ def attach_to_client(client: Any, api_key_fp: str) -> None:
     # request extensions dict; response hook reads it and computes
     # latency. httpx exposes `request.extensions` for free-form use.
     async def on_request(req):  # type: ignore[no-untyped-def]
-        ep = _endpoint_from_url(str(req.url))
-        if not ep:
-            return  # not an Euler-bound call — skip
-        req.extensions["_euler_t0"] = time.monotonic()
-        req.extensions["_euler_ep"] = ep
-        req.extensions["_euler_handle"] = _handle_from_url(str(req.url))
+        hit = _classify_url(str(req.url))
+        if not hit:
+            return  # not a TikTok / Euler URL — skip (CDN assets, etc.)
+        ep, kind = hit
+        req.extensions["_call_t0"] = time.monotonic()
+        req.extensions["_call_ep"] = ep
+        req.extensions["_call_kind"] = kind
+        req.extensions["_call_handle"] = _handle_from_url(str(req.url))
 
     async def on_response(resp):  # type: ignore[no-untyped-def]
-        ep = resp.request.extensions.get("_euler_ep")
+        ep = resp.request.extensions.get("_call_ep")
         if not ep:
             return
-        t0 = resp.request.extensions.get("_euler_t0")
+        t0 = resp.request.extensions.get("_call_t0")
         latency_ms = int((time.monotonic() - t0) * 1000) if t0 else None
+        # The `_call_kind` is carried in the endpoint string via a
+        # prefix convention so the DB schema doesn't need a new column;
+        # the service layer parses it back out at query time. Format:
+        # the bare endpoint label (no prefix). Kind is reconstructed
+        # from the endpoint at query time using the same rules.
         await _enqueue(_Sample(
             ts_iso=_now_iso_z(),
             api_key_fp=api_key_fp,
             endpoint=ep,
-            handle=resp.request.extensions.get("_euler_handle"),
+            handle=resp.request.extensions.get("_call_handle"),
             status_code=int(resp.status_code) if resp.status_code else None,
             latency_ms=latency_ms,
             error_kind=None,

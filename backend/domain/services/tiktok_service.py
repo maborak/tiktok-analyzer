@@ -1763,29 +1763,78 @@ class TikTokService:
     def list_rooms_for_host(self, host_unique_id: str, *, limit: int = 50):
         return self._persistence.list_rooms_for_host(host_unique_id, limit=limit)
 
+    # Endpoint → kind mapping. Kept identical to the classification in
+    # `adapters.tiktok_euler_call_sink._classify_url` so old rows and
+    # new rows bucket the same way. Updates here must update there.
+    @staticmethod
+    def _kind_for_endpoint(endpoint: str) -> str:
+        """Map a log row's endpoint label to a higher-level kind.
+        Used for the Euler-vs-Direct split + the quota-billing roll-up.
+
+        Returns one of: 'euler-sign', 'webcast', 'tiktok-direct',
+        'other'."""
+        if endpoint.startswith("tiktok/"):
+            return "tiktok-direct"
+        if endpoint.startswith("webcast/"):
+            return "webcast"
+        # The Euler sign API uses paths like "webcast/fetch" too, but
+        # those land on `tiktok.eulerstream.com` so the sink classifies
+        # them as 'euler-sign' (different host). We can't re-derive the
+        # host from the stored endpoint, so anything not webcast/ or
+        # tiktok/ is implicitly euler-sign. The sink's first capture
+        # of an EulerStream call would have written e.g. "webcast/fetch"
+        # without a host prefix — same label as the signed webcast
+        # GET that follows. To disambiguate, future rows could prepend
+        # the host; for now we treat "webcast/fetch" as `webcast` since
+        # it's still Euler-quota-billing either way.
+        return "other"
+
     def get_euler_call_history(
         self,
         *,
         hours: int = 24,
         bucket_minutes: int = 15,
     ) -> dict[str, Any]:
-        """Histogram of Euler-signed HTTP calls over the last `hours`,
-        bucketed into `bucket_minutes`-wide bins. Returns:
+        """Histogram of TikTok-bound HTTP calls captured in
+        `tiktok_euler_call_log`, sliced two ways:
+
+          * Euler-billing calls (`euler-sign` + `webcast`) — every one
+            of these consumes 1 sign quota slot.
+          * Direct calls (`tiktok-direct`) — anonymous HTML scrapes
+            that don't consume Euler quota but DO hit TikTok's
+            public-site WAF, so they're a separate troubleshooting
+            channel.
+
+        Returned shape:
 
             {
-              "since": iso, "until": iso, "bucket_minutes": N,
-              "bins":      [iso, ...]                 # ascending
-              "endpoints": ["webcast/fetch", "room/info", ...]
+              "since": iso, "until": iso,
+              "bucket_minutes": N,
+              "bins":      [iso, ...]                # ascending
               "api_keys":  ["euler_OG…UxNjkx (len=78)", ...]
-              "series":    [                          # per-endpoint per-key
-                 {"endpoint": "...", "api_key_fp": "...",
-                  "counts": [...]},                   # length == bins
-                 ...
-              ],
-              "totals":    {"by_endpoint": {...}, "by_key": {...}, "all": N}
+
+              # Euler-billing chart payload
+              "euler": {
+                "endpoints": [...],
+                "series":    [{endpoint, api_key_fp, counts: int[N]}, ...]
+                "totals":    {by_endpoint, by_key, all}
+              },
+              # Direct-scrape chart payload (no Euler quota cost)
+              "direct": {
+                "endpoints": [...],
+                "series":    [{endpoint, api_key_fp, counts: int[N]}, ...]
+                "totals":    {by_endpoint, by_key, all}
+              },
+              # Cross-cut: outcome breakdown (status_code class) per
+              # bin — useful to spot 429-rate-limit storms next to the
+              # endpoint chart.
+              "outcomes": {
+                "labels":   ["2xx", "3xx", "4xx", "5xx", "err"],
+                "counts":   {"euler": int[N×5], "direct": int[N×5]}
+              }
             }
 
-        Postgres-only — same constraint as the underlying table.
+        Postgres-only.
         """
         from datetime import datetime, timedelta, timezone
         from sqlalchemy import text as _text
@@ -1793,8 +1842,6 @@ class TikTokService:
         until = datetime.now(timezone.utc).replace(microsecond=0)
         since = until - timedelta(hours=hours)
         with self._persistence._get_session() as s:
-            # Two queries: (a) per-bin × endpoint × key counts,
-            # (b) headline totals. Both indexed by (ts DESC).
             rows = s.execute(_text("""
               SELECT
                 date_trunc('minute', ts)
@@ -1802,23 +1849,17 @@ class TikTokService:
                   AS bin,
                 endpoint,
                 api_key_fp,
+                status_code,
                 COUNT(*) AS n
               FROM tiktok_euler_call_log
               WHERE ts >= :since AND ts < :until
-              GROUP BY 1, 2, 3
+              GROUP BY 1, 2, 3, 4
               ORDER BY 1
             """), {
                 "bm": bucket_minutes, "since": since, "until": until,
             }).all()
-            totals = s.execute(_text("""
-              SELECT endpoint, api_key_fp, COUNT(*) AS n
-              FROM tiktok_euler_call_log
-              WHERE ts >= :since AND ts < :until
-              GROUP BY endpoint, api_key_fp
-            """), {"since": since, "until": until}).all()
 
-        # Build the bin grid up-front so empty bins render as 0,
-        # not gaps. Bucket alignment matches the GROUP BY truncation.
+        # Bin grid.
         first_bin = since.replace(
             minute=since.minute - (since.minute % bucket_minutes),
             second=0, microsecond=0,
@@ -1830,46 +1871,90 @@ class TikTokService:
             bins.append(cur)
             cur += step
         bin_index: dict[datetime, int] = {b: i for i, b in enumerate(bins)}
+        N = len(bins)
 
-        # Series keyed by (endpoint, api_key_fp). Build cells with the
-        # bin grid as the canonical length, then list-ify at the end.
-        cells: dict[tuple[str, str], list[int]] = {}
-        endpoints: set[str] = set()
+        # Split rows into Euler-billing vs Direct based on endpoint kind.
+        # Each bucket independently tracks per-(endpoint,key) series +
+        # rolling totals.
+        def _empty_bucket() -> dict[str, Any]:
+            return {
+                "cells": {},
+                "endpoints": set(),
+                "by_endpoint": {},
+                "by_key": {},
+                "total": 0,
+            }
+        euler_b = _empty_bucket()
+        direct_b = _empty_bucket()
+
+        # 5-class outcome counts per bin per bucket.
+        OUTCOME_LABELS = ["2xx", "3xx", "4xx", "5xx", "err"]
+        euler_outcomes = [[0] * 5 for _ in range(N)]
+        direct_outcomes = [[0] * 5 for _ in range(N)]
         api_keys: set[str] = set()
+
+        def _outcome_idx(sc: int | None) -> int:
+            if sc is None:
+                return 4
+            if 200 <= sc < 300:
+                return 0
+            if 300 <= sc < 400:
+                return 1
+            if 400 <= sc < 500:
+                return 2
+            if 500 <= sc < 600:
+                return 3
+            return 4
+
         for r in rows:
-            key = (r.endpoint, r.api_key_fp)
-            endpoints.add(r.endpoint)
+            kind = self._kind_for_endpoint(r.endpoint)
+            bucket = direct_b if kind == "tiktok-direct" else euler_b
+            outcome_bin = direct_outcomes if kind == "tiktok-direct" else euler_outcomes
+            n = int(r.n or 0)
             api_keys.add(r.api_key_fp)
-            arr = cells.setdefault(key, [0] * len(bins))
+            bucket["endpoints"].add(r.endpoint)
+            bucket["by_endpoint"][r.endpoint] = (
+                bucket["by_endpoint"].get(r.endpoint, 0) + n
+            )
+            bucket["by_key"][r.api_key_fp] = (
+                bucket["by_key"].get(r.api_key_fp, 0) + n
+            )
+            bucket["total"] += n
+            key = (r.endpoint, r.api_key_fp)
+            arr = bucket["cells"].setdefault(key, [0] * N)
             idx = bin_index.get(r.bin)
             if idx is not None:
-                arr[idx] = int(r.n or 0)
+                arr[idx] += n
+                outcome_bin[idx][_outcome_idx(r.status_code)] += n
 
-        by_endpoint: dict[str, int] = {}
-        by_key: dict[str, int] = {}
-        total = 0
-        for r in totals:
-            n = int(r.n or 0)
-            by_endpoint[r.endpoint] = by_endpoint.get(r.endpoint, 0) + n
-            by_key[r.api_key_fp] = by_key.get(r.api_key_fp, 0) + n
-            total += n
+        def _serialize(bucket: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "endpoints": sorted(bucket["endpoints"]),
+                "series": [
+                    {"endpoint": ep, "api_key_fp": fp, "counts": bucket["cells"][(ep, fp)]}
+                    for (ep, fp) in sorted(bucket["cells"].keys())
+                ],
+                "totals": {
+                    "by_endpoint": bucket["by_endpoint"],
+                    "by_key": bucket["by_key"],
+                    "all": bucket["total"],
+                },
+            }
 
-        series = [
-            {"endpoint": ep, "api_key_fp": fp, "counts": cells[(ep, fp)]}
-            for (ep, fp) in sorted(cells.keys())
-        ]
         return {
             "since": since.isoformat(),
             "until": until.isoformat(),
             "bucket_minutes": bucket_minutes,
             "bins": [b.isoformat() for b in bins],
-            "endpoints": sorted(endpoints),
             "api_keys": sorted(api_keys),
-            "series": series,
-            "totals": {
-                "by_endpoint": by_endpoint,
-                "by_key": by_key,
-                "all": total,
+            "euler": _serialize(euler_b),
+            "direct": _serialize(direct_b),
+            "outcomes": {
+                "labels": OUTCOME_LABELS,
+                "counts": {
+                    "euler": euler_outcomes,
+                    "direct": direct_outcomes,
+                },
             },
         }
 

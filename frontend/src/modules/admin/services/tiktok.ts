@@ -97,18 +97,30 @@ export interface TikTokEulerHistorySeries {
   counts: number[];
 }
 
-export interface TikTokEulerHistory {
-  since: string;
-  until: string;
-  bucket_minutes: number;
-  bins: string[];
+export interface TikTokEulerHistoryBucket {
   endpoints: string[];
-  api_keys: string[];
   series: TikTokEulerHistorySeries[];
   totals: {
     by_endpoint: Record<string, number>;
     by_key: Record<string, number>;
     all: number;
+  };
+}
+
+export interface TikTokEulerHistory {
+  since: string;
+  until: string;
+  bucket_minutes: number;
+  bins: string[];
+  api_keys: string[];
+  euler: TikTokEulerHistoryBucket;
+  direct: TikTokEulerHistoryBucket;
+  outcomes: {
+    labels: string[];                              // ["2xx","3xx","4xx","5xx","err"]
+    counts: {
+      euler: number[][];                           // [N bins][5 classes]
+      direct: number[][];
+    };
   };
 }
 

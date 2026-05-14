@@ -1,13 +1,16 @@
 /**
- * Euler API call history — stacked bar histogram for the
- * Sign Engine tab. Answers "what burned my quota?" with hard data
- * sliced by endpoint (and grouped by API key when more than one is
- * present in the window — i.e. across a key rotation).
+ * Euler / TikTok HTTP call history — Admin → TikTok → Settings →
+ * API History tab.
  *
- *   <TikTokEulerHistory />
+ * Two stacked-bar histograms side by side:
+ *   1. Euler-billing (sign API + signed `webcast/*` endpoints). Each
+ *      bar segment = one slot of quota burned.
+ *   2. Direct TikTok scrapes (profile / live HTML). No quota cost
+ *      but they hit the public-site WAF, so worth tracking separately.
  *
- * Self-fetching; refreshes when the user picks a different look-back
- * window or bucket width.
+ * A thin "outcomes" strip below each chart shows status-code class
+ * counts per bin (2xx / 3xx / 4xx / 5xx / network err). Lets you
+ * spot 429-rate-limit storms next to the endpoint stack.
  */
 
 import { useEffect, useMemo, useState } from 'react';
@@ -26,7 +29,11 @@ import { RefreshCw } from 'lucide-react';
 
 import { Button } from '@/components/ui/Button';
 import { Select } from '@/components/ui/Select';
-import { tiktokApi, type TikTokEulerHistory } from '@admin/services/tiktok';
+import {
+  tiktokApi,
+  type TikTokEulerHistory,
+  type TikTokEulerHistoryBucket,
+} from '@admin/services/tiktok';
 
 echarts.use([
   BarChart,
@@ -37,22 +44,38 @@ echarts.use([
   CanvasRenderer,
 ]);
 
-// Stable palette per endpoint so re-renders keep the same colour
-// assignment — easier to spot trends visually. Sky / amber / rose /
-// teal / violet etc. — accessible against both light and dark mode.
-const ENDPOINT_PALETTE: Record<string, string> = {
-  'webcast/fetch': '#0ea5e9',                 // sky-500
-  'webcast/room/info': '#f59e0b',              // amber-500
-  'webcast/room/check_alive': '#10b981',       // emerald-500
-  'webcast/room/enter': '#a855f7',             // violet-500
+// Palette — one stable colour per endpoint label. ECharts won't
+// reshuffle on every re-render because we set itemStyle.color
+// explicitly per series. Falls back to a rotation for any endpoint
+// we haven't seen before.
+const ENDPOINT_COLOR: Record<string, string> = {
+  // Euler-billing
+  'webcast/fetch':                  '#0ea5e9', // sky-500
+  'webcast/room/info':               '#f59e0b', // amber-500
+  'webcast/room/info_by_user':       '#f97316', // orange-500
+  'webcast/room/check_alive':        '#10b981', // emerald-500
+  'webcast/room/enter':              '#a855f7', // violet-500
+  'eulerstream':                     '#6366f1', // indigo-500
+  // Direct TikTok
+  'tiktok/profile':                  '#14b8a6', // teal-500
+  'tiktok/live':                     '#ec4899', // pink-500
+  'tiktok/video':                    '#d97706', // amber-600
 };
-const FALLBACK_PALETTE = [
-  '#ec4899', '#6366f1', '#14b8a6', '#ef4444', '#0d9488', '#7c3aed',
-];
-
-function colorForEndpoint(ep: string, fallbackIdx: number): string {
-  return ENDPOINT_PALETTE[ep] ?? FALLBACK_PALETTE[fallbackIdx % FALLBACK_PALETTE.length];
+const FALLBACK = ['#ef4444', '#7c3aed', '#0d9488', '#65a30d', '#b91c1c'];
+function colorFor(ep: string, i: number): string {
+  return ENDPOINT_COLOR[ep] ?? FALLBACK[i % FALLBACK.length];
 }
+
+// Outcome class colours — green = 2xx, blue = 3xx, amber = 4xx,
+// red = 5xx, gray = network/timeout. Stays subdued on the strip
+// chart so it doesn't fight the main bar chart above it.
+const OUTCOME_COLOR: Record<string, string> = {
+  '2xx': '#10b981',
+  '3xx': '#0ea5e9',
+  '4xx': '#f59e0b',
+  '5xx': '#ef4444',
+  'err': '#94a3b8',
+};
 
 interface WindowChoice {
   label: string;
@@ -61,15 +84,15 @@ interface WindowChoice {
 }
 
 const WINDOW_CHOICES: WindowChoice[] = [
-  { label: 'Last hour (1 min bins)',    hours: 1,   bucketMinutes: 1 },
-  { label: 'Last 6 hours (5 min bins)', hours: 6,   bucketMinutes: 5 },
-  { label: 'Last 24 hours (15 min)',    hours: 24,  bucketMinutes: 15 },
-  { label: 'Last 3 days (1 hour bins)', hours: 72,  bucketMinutes: 60 },
-  { label: 'Last 7 days (1 hour bins)', hours: 168, bucketMinutes: 60 },
+  { label: 'Last hour (1 min bins)',     hours: 1,   bucketMinutes: 1 },
+  { label: 'Last 6 hours (5 min bins)',  hours: 6,   bucketMinutes: 5 },
+  { label: 'Last 24 hours (15 min)',     hours: 24,  bucketMinutes: 15 },
+  { label: 'Last 3 days (1 hour bins)',  hours: 72,  bucketMinutes: 60 },
+  { label: 'Last 7 days (1 hour bins)',  hours: 168, bucketMinutes: 60 },
 ];
 
 export function TikTokEulerHistory() {
-  const [choiceIdx, setChoiceIdx] = useState(2); // default = 24h / 15-min
+  const [choiceIdx, setChoiceIdx] = useState(2);
   const [data, setData] = useState<TikTokEulerHistory | null>(null);
   const [loading, setLoading] = useState(false);
   const choice = WINDOW_CHOICES[choiceIdx];
@@ -83,7 +106,7 @@ export function TikTokEulerHistory() {
       });
       setData(out);
     } catch (e) {
-      toast.error('Failed to load Euler call history.');
+      toast.error('Failed to load API call history.');
       // eslint-disable-next-line no-console
       console.error(e);
     } finally {
@@ -96,44 +119,10 @@ export function TikTokEulerHistory() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [choiceIdx]);
 
-  // Build ECharts series. We stack endpoint slices vertically so the
-  // bar height for each bin reads as the total quota use that bin.
-  // When multiple API keys exist in the window (a key was rotated),
-  // we emit one series PER (endpoint, key) so the user can see which
-  // key absorbed each slice — the key is appended to the series name
-  // and surfaced in the tooltip + legend.
-  const option = useMemo(() => {
-    if (!data) return null;
-    const hasMultipleKeys = data.api_keys.length > 1;
-    const epsSorted = [...data.endpoints].sort();
-    const epIndex = new Map<string, number>(
-      epsSorted.map((ep, i) => [ep, i] as const),
-    );
-
-    type SeriesItem = {
-      name: string;
-      type: 'bar';
-      stack: string;
-      data: number[];
-      itemStyle: { color: string };
-      emphasis: { focus: 'series' };
-    };
-    const series: SeriesItem[] = data.series.map((s) => ({
-      name: hasMultipleKeys
-        ? `${s.endpoint} · ${s.api_key_fp}`
-        : s.endpoint,
-      type: 'bar' as const,
-      stack: hasMultipleKeys ? s.api_key_fp : 'total',
-      data: s.counts,
-      itemStyle: {
-        color: colorForEndpoint(s.endpoint, epIndex.get(s.endpoint) ?? 0),
-      },
-      emphasis: { focus: 'series' as const },
-    }));
-
-    const xLabels = data.bins.map((iso) => {
+  const xLabels = useMemo(() => {
+    if (!data) return [] as string[];
+    return data.bins.map((iso) => {
       const d = new Date(iso);
-      // Compact label: HH:MM for short windows, MM-DD HH:MM for ≥24h
       if (choice.hours >= 24) {
         return d.toLocaleString(undefined, {
           month: '2-digit', day: '2-digit',
@@ -144,47 +133,28 @@ export function TikTokEulerHistory() {
         hour: '2-digit', minute: '2-digit',
       });
     });
-
-    return {
-      animation: false,
-      tooltip: {
-        trigger: 'axis',
-        axisPointer: { type: 'shadow' },
-      },
-      legend: {
-        type: 'scroll',
-        bottom: 0,
-        textStyle: { fontSize: 11 },
-      },
-      grid: { left: 50, right: 16, top: 20, bottom: hasMultipleKeys ? 56 : 40 },
-      xAxis: {
-        type: 'category',
-        data: xLabels,
-        axisLabel: { fontSize: 10, rotate: choice.hours >= 24 ? 35 : 0 },
-      },
-      yAxis: {
-        type: 'value',
-        name: 'calls',
-        axisLabel: { fontSize: 10 },
-      },
-      series,
-    };
   }, [data, choice.hours]);
 
-  const totalCalls = data?.totals.all ?? 0;
-  const epTotals = data?.totals.by_endpoint ?? {};
-  const keyTotals = data?.totals.by_key ?? {};
-
   return (
-    <section className="card">
-      <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+    <section className="flex flex-col gap-4">
+      {/* Controls strip. Window picker + refresh, plus the headline
+          "total in window" badge for quick comparison across windows. */}
+      <div className="card flex flex-wrap items-center justify-between gap-2">
         <div>
-          <h3 className="auth-mono-label">API History</h3>
+          <h3 className="auth-mono-label">API call history</h3>
           <p className="text-xs text-gray-500 mt-0.5">
-            Euler-signed HTTP calls — every probe, every reconnect.
+            Every HTTP call we make to TikTok / EulerStream. Top = quota
+            cost; bottom = direct scrapes (no quota, WAF-bait).
           </p>
         </div>
         <div className="flex items-center gap-2">
+          {data && (
+            <span className="px-2 py-0.5 rounded font-mono text-xs bg-gray-50 dark:bg-gray-100/30">
+              euler {data.euler.totals.all.toLocaleString()}
+              {' · '}
+              direct {data.direct.totals.all.toLocaleString()}
+            </span>
+          )}
           <Select
             value={String(choiceIdx)}
             onChange={(e) => setChoiceIdx(Number(e.target.value))}
@@ -199,70 +169,216 @@ export function TikTokEulerHistory() {
         </div>
       </div>
 
-      {/* Headline stats. The "by endpoint" + "by key" breakdowns help
-          spot the top quota burner at a glance without reading the
-          chart's stacked colours. */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4 text-sm">
-        <div className="px-3 py-2 rounded border border-gray-200">
-          <div className="auth-mono-label text-[10px]">Total in window</div>
-          <div className="font-mono text-lg">{totalCalls.toLocaleString()}</div>
+      {/* Empty state. Logs only start once the worker boots and makes
+          its first call — boot lag is friendlier than an awkward
+          empty chart. */}
+      {loading && !data && (
+        <div className="card text-center text-sm text-gray-500 py-12">
+          Loading…
         </div>
-        {Object.entries(epTotals)
+      )}
+      {!loading && data && data.euler.totals.all === 0 && data.direct.totals.all === 0 && (
+        <div className="card text-center text-sm text-gray-500 py-12">
+          No calls captured in this window yet. Logging starts when the
+          listener pool connects — boot the worker and check back in a
+          minute.
+        </div>
+      )}
+
+      {data && (data.euler.totals.all > 0 || data.direct.totals.all > 0) && (
+        <>
+          <ChartCard
+            title="Euler-billing calls"
+            subtitle={
+              'Every bar segment = 1 sign-quota slot. '
+              + 'Sign API (eulerstream.com) + signed webcast.* endpoints.'
+            }
+            bucket={data.euler}
+            apiKeys={data.api_keys}
+            xLabels={xLabels}
+            outcomes={data.outcomes.counts.euler}
+            outcomeLabels={data.outcomes.labels}
+            countTotal={data.euler.totals.all}
+          />
+          <ChartCard
+            title="Direct TikTok scrapes"
+            subtitle={
+              'Anonymous HTML fetches (profile + live page). '
+              + 'No Euler quota, but every call hits the public-site WAF.'
+            }
+            bucket={data.direct}
+            apiKeys={data.api_keys}
+            xLabels={xLabels}
+            outcomes={data.outcomes.counts.direct}
+            outcomeLabels={data.outcomes.labels}
+            countTotal={data.direct.totals.all}
+            muted
+          />
+        </>
+      )}
+    </section>
+  );
+}
+
+interface ChartCardProps {
+  title: string;
+  subtitle: string;
+  bucket: TikTokEulerHistoryBucket;
+  apiKeys: string[];
+  xLabels: string[];
+  outcomes: number[][];               // [N bins][5]
+  outcomeLabels: string[];
+  countTotal: number;
+  /** Renders with slightly subdued chrome for the secondary chart. */
+  muted?: boolean;
+}
+
+/** A single endpoint-stacked histogram with headline cards above and
+ *  an outcome-class strip below. Memoised by data identity so a
+ *  re-render of the parent doesn't reflow the chart instance. */
+function ChartCard({
+  title, subtitle, bucket, apiKeys, xLabels,
+  outcomes, outcomeLabels, countTotal, muted,
+}: ChartCardProps) {
+  const hasMultipleKeys = apiKeys.length > 1;
+
+  const stackOption = useMemo(() => {
+    if (countTotal === 0) return null;
+    const series = bucket.series.map((s, i) => ({
+      name: hasMultipleKeys ? `${s.endpoint} · ${s.api_key_fp}` : s.endpoint,
+      type: 'bar' as const,
+      stack: hasMultipleKeys ? s.api_key_fp : 'total',
+      data: s.counts,
+      itemStyle: { color: colorFor(s.endpoint, i) },
+      emphasis: { focus: 'series' as const },
+      barCategoryGap: '15%',
+    }));
+    return {
+      animation: false,
+      tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+      legend: {
+        type: 'scroll' as const,
+        bottom: 0,
+        textStyle: { fontSize: 11 },
+      },
+      grid: {
+        left: 50, right: 16, top: 12,
+        bottom: hasMultipleKeys ? 50 : 36,
+      },
+      xAxis: {
+        type: 'category' as const,
+        data: xLabels,
+        axisLabel: {
+          fontSize: 10,
+          rotate: xLabels.length > 24 ? 35 : 0,
+          interval: xLabels.length > 60 ? 'auto' : 0,
+        },
+      },
+      yAxis: {
+        type: 'value' as const,
+        name: 'calls',
+        axisLabel: { fontSize: 10 },
+      },
+      series,
+    };
+  }, [bucket.series, xLabels, hasMultipleKeys, countTotal]);
+
+  const outcomeOption = useMemo(() => {
+    if (countTotal === 0) return null;
+    // Transform [N][5] → 5 series of length N.
+    const classes = outcomeLabels;
+    const series = classes.map((label, ci) => ({
+      name: label,
+      type: 'bar' as const,
+      stack: 'outcome',
+      data: outcomes.map((row) => row[ci] ?? 0),
+      itemStyle: { color: OUTCOME_COLOR[label] ?? '#9ca3af' },
+      emphasis: { focus: 'series' as const },
+      barCategoryGap: '15%',
+    }));
+    return {
+      animation: false,
+      tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+      legend: { bottom: 0, textStyle: { fontSize: 10 } },
+      grid: { left: 50, right: 16, top: 8, bottom: 26 },
+      xAxis: {
+        type: 'category' as const,
+        data: xLabels,
+        show: false,
+      },
+      yAxis: {
+        type: 'value' as const,
+        axisLabel: { fontSize: 10 },
+        splitNumber: 2,
+      },
+      series,
+    };
+  }, [outcomes, xLabels, outcomeLabels, countTotal]);
+
+  return (
+    <div className={'card ' + (muted ? 'bg-gray-50/40 dark:bg-gray-100/10' : '')}>
+      <div className="flex items-start justify-between gap-3 mb-3">
+        <div>
+          <h3 className="auth-mono-label">{title}</h3>
+          <p className="text-xs text-gray-500 mt-0.5">{subtitle}</p>
+        </div>
+        <span className="px-2 py-0.5 rounded font-mono text-xs whitespace-nowrap bg-gray-50 dark:bg-gray-100/30">
+          {countTotal.toLocaleString()} in window
+        </span>
+      </div>
+
+      {/* Top-3 endpoint totals — instant "where did it go" answer
+          without parsing colour blocks. */}
+      <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-2 mb-3 text-xs">
+        {Object.entries(bucket.totals.by_endpoint)
           .sort(([, a], [, b]) => b - a)
-          .slice(0, 3)
+          .slice(0, 5)
           .map(([ep, n]) => (
-            <div key={ep} className="px-3 py-2 rounded border border-gray-200">
-              <div className="auth-mono-label text-[10px] truncate" title={ep}>
-                {ep.replace('webcast/', '')}
-              </div>
-              <div className="font-mono text-lg">{n.toLocaleString()}</div>
+            <div
+              key={ep}
+              className="px-2 py-1 rounded border border-gray-200 flex items-center justify-between gap-2 min-w-0"
+            >
+              <span
+                className="inline-block w-2 h-2 rounded-full shrink-0"
+                style={{ backgroundColor: ENDPOINT_COLOR[ep] ?? '#9ca3af' }}
+              />
+              <span className="truncate font-mono text-[10px] flex-1" title={ep}>
+                {ep.replace(/^webcast\//, '').replace(/^tiktok\//, '')}
+              </span>
+              <span className="font-mono">{n.toLocaleString()}</span>
             </div>
           ))}
       </div>
 
-      {/* Per-API-key breakdown when ≥1 key appeared in the window —
-          useful right after a key rotation: lets you see the old key
-          still being called by stale processes. Collapsed to a single
-          line when only one key exists. */}
-      {data && data.api_keys.length > 0 && (
-        <div className="mb-4 text-xs flex flex-wrap gap-2">
-          {Object.entries(keyTotals)
-            .sort(([, a], [, b]) => b - a)
-            .map(([fp, n]) => (
-              <span
-                key={fp}
-                className="px-2 py-0.5 rounded font-mono bg-gray-50 text-gray-700 dark:bg-gray-100/30"
-                title={fp}
-              >
-                {fp} → {n.toLocaleString()}
-              </span>
-            ))}
-        </div>
-      )}
-
-      {/* The chart. ECharts collapses gracefully on 0 series — but
-          we still hide it when there's truly no data so the empty-state
-          message reads as the primary content. */}
-      {loading && !data && (
-        <div className="text-center text-sm text-gray-500 py-12">Loading…</div>
-      )}
-      {!loading && totalCalls === 0 && (
-        <div className="text-center text-sm text-gray-500 py-12">
-          No Euler calls captured in this window yet. Logging starts when
-          the listener pool connects — boot the worker and check back in
-          a minute.
-        </div>
-      )}
-      {option && totalCalls > 0 && (
+      {/* Main stacked chart. */}
+      {stackOption && (
         <ReactECharts
           echarts={echarts}
-          option={option}
-          style={{ height: 320, width: '100%' }}
+          option={stackOption}
+          style={{ height: 240, width: '100%' }}
           notMerge
           lazyUpdate
         />
       )}
-    </section>
+
+      {/* Outcome strip — only worth showing when there's at least one
+          non-2xx call in the window (otherwise it's a flat green bar
+          that wastes vertical space). */}
+      {outcomeOption && outcomes.some((row) => (row[1] + row[2] + row[3] + row[4]) > 0) && (
+        <div className="mt-2 pt-2 border-t border-gray-200">
+          <div className="text-[10px] font-mono text-gray-500 mb-1">
+            Outcomes (2xx / 3xx / 4xx / 5xx / err)
+          </div>
+          <ReactECharts
+            echarts={echarts}
+            option={outcomeOption}
+            style={{ height: 100, width: '100%' }}
+            notMerge
+            lazyUpdate
+          />
+        </div>
+      )}
+    </div>
   );
 }
 
