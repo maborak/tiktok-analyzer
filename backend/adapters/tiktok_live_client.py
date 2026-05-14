@@ -102,40 +102,6 @@ def _read_sign_settings() -> dict[str, str]:
     }
 
 
-def _lookup_recent_room_id(unique_id: str, *, max_age_s: float) -> int | None:
-    """Return the most-recent `room_id` for this handle from
-    `tiktok_rooms`, but ONLY if `last_seen_at` is within `max_age_s`.
-
-    Pass through to `TikTokLiveClient.start(room_id=…,
-    fetch_room_info=False)` to skip the Euler-signed
-    `webcast/room/info` probe on reconnect. None means "we don't have
-    a fresh-enough room_id — full probe is needed".
-
-    Cheap query: covered by the `(host_unique_id, last_seen_at DESC)`
-    partial index added in `add_tiktok_lives_summary_indexes.py`.
-    """
-    try:
-        from database.core.connection import create_database_engine
-        from sqlalchemy import text as _text
-        eng = create_database_engine()
-        with eng.connect() as c:
-            handle = unique_id.lstrip("@")
-            row = c.execute(_text("""
-              SELECT room_id, last_seen_at
-              FROM tiktok_rooms
-              WHERE host_unique_id = :h
-                AND last_seen_at > NOW() - (:s || ' seconds')::interval
-              ORDER BY last_seen_at DESC
-              LIMIT 1
-            """), {"h": handle, "s": max_age_s}).first()
-        if row is None:
-            return None
-        return int(row.room_id)
-    except Exception:
-        # Lookup failures are non-fatal — fall through to full probe.
-        return None
-
-
 def _load_age_restricted_count(unique_id: str) -> int:
     """Count consecutive AgeRestrictedError rows in `tiktok_worker_log`
     for this handle since the last `CONNECTED` or session_start row,
@@ -701,18 +667,6 @@ class TikTokLiveSession(TikTokLiveSessionPort):
     AGE_RESTRICTED_MAX_BACKOFF     = 14400.0  # 4 h
     USER_NOT_FOUND_BACKOFF         = 1800.0   # 30 min
 
-    # Room-id reuse window. `tiktok_rooms` keeps the most-recent
-    # `room_id` per handle even after the broadcast ends. If
-    # `last_seen_at` is within this window, the broadcast is very
-    # likely still live and we can pass the cached room_id straight to
-    # `TikTokLiveClient.start(room_id=…, fetch_room_info=False)`,
-    # SKIPPING the Euler-signed `webcast/room/info` probe entirely
-    # (saves ~1 Euler call per session start). If the cached id is
-    # stale (broadcast ended), TikTokLive raises UserOfflineError on
-    # connect; we catch it and fall back to the full handshake on the
-    # next retry, paying the probe cost only once.
-    ROOM_ID_REUSE_MAX_AGE_S = 600.0  # 10 min
-
     def __init__(
         self,
         unique_id: str,
@@ -729,9 +683,6 @@ class TikTokLiveSession(TikTokLiveSessionPort):
         self._heartbeat: asyncio.Task[Any] | None = None
         self._supervisor: asyncio.Task[None] | None = None
         self._stopped = False
-        # Set to True after a connect attempt with a cached room_id
-        # fails; the next attempt forces a fresh probe.
-        self._reused_room_id_failed = False
         # Consecutive AgeRestrictedError count for this host. Each fail
         # doubles the retry backoff (starting from
         # AGE_RESTRICTED_INITIAL_BACKOFF, capped at …_MAX_BACKOFF).
@@ -798,10 +749,6 @@ class TikTokLiveSession(TikTokLiveSessionPort):
         CONNECT_TIMEOUT = 45.0
         while not self._stopped:
             await self._notify_state("CONNECTING")
-            # Defined before the try so the except blocks can read it
-            # without risking UnboundLocalError on early-throwing
-            # exceptions inside the body.
-            cached_room_id: int | None = None
             try:
                 _apply_sign_globals()
                 client = TikTokLiveClient(unique_id=handle)
@@ -809,49 +756,26 @@ class TikTokLiveSession(TikTokLiveSessionPort):
                 attach_euler_logging(client)
                 self._wire_handlers(client)
                 self._client = client
-                # Try the room-id reuse fast path. If `tiktok_rooms`
-                # has a fresh row for this handle, pass it to
-                # `start(room_id=…, fetch_room_info=False)` and skip
-                # the Euler-signed `webcast/room/info` probe. Saves
-                # ~1 Euler call per session start on the common case
-                # (reconnect within 10 min of last event).
-                if not self._reused_room_id_failed:
-                    cached_room_id = _lookup_recent_room_id(
-                        self._unique_id,
-                        max_age_s=self.ROOM_ID_REUSE_MAX_AGE_S,
-                    )
                 # `fetch_live_check=False` skips the
-                # `webcast/room/check_alive` Euler-signed probe. If
-                # the room is dead, the subsequent `webcast/fetch`
-                # (WS URL sign) returns UserOfflineError anyway —
-                # same outcome, one fewer Euler call. Only worth
-                # paying when we'd otherwise be blind to a dead room
-                # before opening the WS, which we aren't here.
-                if cached_room_id is not None:
-                    logger.info(
-                        "TikTokLive reusing cached room_id=%d for @%s "
-                        "(skipping room/info + check_alive probes)",
-                        cached_room_id, self._unique_id,
-                    )
-                    heartbeat = await asyncio.wait_for(
-                        client.start(
-                            room_id=cached_room_id,
-                            fetch_room_info=False,
-                            fetch_live_check=False,
-                        ),
-                        timeout=CONNECT_TIMEOUT,
-                    )
-                else:
-                    heartbeat = await asyncio.wait_for(
-                        client.start(
-                            fetch_room_info=True,
-                            fetch_live_check=False,
-                        ),
-                        timeout=CONNECT_TIMEOUT,
-                    )
-                # Connect succeeded — reset the "force fresh probe"
-                # flag so the next reconnect can try reuse again.
-                self._reused_room_id_failed = False
+                # `webcast/room/check_alive` Euler-signed probe. If the
+                # room is dead, the subsequent `webcast/fetch` (WS URL
+                # sign) returns UserOfflineError anyway — same outcome,
+                # one fewer Euler call.
+                #
+                # We DON'T pass a cached `room_id` here. An earlier
+                # attempt to do that traded `webcast/room/info` (by
+                # unique_id) for `webcast/room/info_by_user` (by
+                # room_id) — same Euler cost, same response shape, no
+                # actual savings — and during the AgeRestrictedError
+                # storm it just doubled the failure surface. Just let
+                # TikTokLive do its standard handshake.
+                heartbeat = await asyncio.wait_for(
+                    client.start(
+                        fetch_room_info=True,
+                        fetch_live_check=False,
+                    ),
+                    timeout=CONNECT_TIMEOUT,
+                )
                 # Reset the AgeRestricted consecutive counter on the
                 # first successful connect — this host is no longer
                 # age-restricted, so the next failure (if any) starts
@@ -941,22 +865,11 @@ class TikTokLiveSession(TikTokLiveSessionPort):
                     )
                 last_offline = True
                 last_sign_limited = False
-                # A stale cached room_id can manifest as either of
-                # these (the room id maps to a dead session). Force a
-                # full probe next attempt.
-                if cached_room_id is not None:
-                    self._reused_room_id_failed = True
             except UserOfflineError:
                 if not last_offline:
                     logger.info("@%s is offline; will retry on a slow cadence.", self._unique_id)
                 last_offline = True
                 last_sign_limited = False
-                # If we tried the cached-room_id fast path and got
-                # UserOffline, the broadcast may have ended — force a
-                # fresh probe on the next attempt so we don't keep
-                # banging on a dead room.
-                if cached_room_id is not None:
-                    self._reused_room_id_failed = True
             except SignatureRateLimitError:
                 # EulerStream's sign API rate-limited us. Free tier is tiny;
                 # retrying fast only deepens the hole. Back off HARD and
