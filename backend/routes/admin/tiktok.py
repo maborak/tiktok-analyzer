@@ -444,6 +444,20 @@ async def euler_call_history(
     )
 
 
+@router.get("/worker/telemetry")
+async def worker_telemetry(
+    hours: int = Query(24, ge=1, le=168,
+                       description="Look-back window (1–168 hours)."),
+    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+):
+    """Bundled worker-dashboard payload: heartbeat history (sessions /
+    CPU / mem), per-event-type ingest, WAF pressure, and reconcile
+    cadence. One round-trip so the dashboard mount cost is a single
+    SELECT-fan-out, not four sequential."""
+    svc = _require_service()
+    return svc.get_worker_telemetry(hours=hours)
+
+
 @router.get("/lives/{handle}/calendar")
 async def host_calendar(
     handle: str,

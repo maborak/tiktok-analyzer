@@ -45,6 +45,7 @@ import {
 import { TikTokSignConfigBody } from '@admin/pages/TikTokSignConfig';
 import { TikTokListenerStatusCard } from '@admin/components/TikTokListenerStatusCard';
 import { TikTokEulerHistory } from '@admin/components/TikTokEulerHistory';
+import { TikTokWorkerTelemetry } from '@admin/components/TikTokWorkerTelemetry';
 
 interface Section {
   /** Stable id, used as the section heading anchor. */
@@ -335,7 +336,16 @@ export function TikTokSettings() {
 
       {subTab === 'sign-engine' && <TikTokSignConfigBody />}
 
-      {subTab === 'worker' && <TikTokListenerStatusCard refreshKey={workerRefreshKey} />}
+      {subTab === 'worker' && (
+        <>
+          <TikTokListenerStatusCard refreshKey={workerRefreshKey} />
+          {/* Historical telemetry — sessions, CPU/mem, event-type
+              ingest, WAF pressure, reconcile cadence. Backed by the
+              `tiktok_worker_heartbeat_log` + `_event_type_hour_counts`
+              + `_worker_log` (waf_detected / reconcile_pass) tables. */}
+          <TikTokWorkerTelemetry />
+        </>
+      )}
 
       {subTab === 'api-history' && <TikTokEulerHistory />}
 

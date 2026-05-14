@@ -126,6 +126,38 @@ export interface TikTokEulerHistory {
   };
 }
 
+export interface TikTokWorkerTelemetry {
+  since: string;
+  until: string;
+  hours: number;
+  bucket_minutes: number;
+  heartbeat: {
+    bins: string[];
+    sessions:  (number | null)[];
+    connected: (number | null)[];
+    cpu_pct:   (number | null)[];
+    memory_mb: (number | null)[];
+  };
+  event_types: {
+    types: string[];
+    totals: Record<string, number>;
+    bins: string[];
+    series: { type: string; counts: number[] }[];
+  };
+  waf: {
+    totals: Record<string, number>;
+    all: number;
+  };
+  reconcile: {
+    bins: string[];
+    pass_count:   number[];
+    duration_p50: (number | null)[];
+    duration_p95: (number | null)[];
+    claimed_total: number;
+    lost_total:    number;
+  };
+}
+
 export type TikTokSignProvider = 'euler' | 'session' | 'local';
 
 export interface TikTokSignConfig {
@@ -944,6 +976,16 @@ export const tiktokApi = {
   },
 
   // Rooms + events
+
+  getWorkerTelemetry(
+    opts?: { hours?: number },
+  ): Promise<TikTokWorkerTelemetry> {
+    return apiRequest({
+      method: 'GET',
+      url: `${BASE}/worker/telemetry`,
+      params: { hours: opts?.hours ?? 24 },
+    });
+  },
 
   getEulerHistory(
     opts?: { hours?: number; bucketMinutes?: number },

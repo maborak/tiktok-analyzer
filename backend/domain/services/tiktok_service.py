@@ -1763,6 +1763,244 @@ class TikTokService:
     def list_rooms_for_host(self, host_unique_id: str, *, limit: int = 50):
         return self._persistence.list_rooms_for_host(host_unique_id, limit=limit)
 
+    def get_worker_telemetry(
+        self,
+        *,
+        hours: int = 24,
+    ) -> dict[str, Any]:
+        """Bundled payload for the worker dashboard. One round-trip,
+        four series — the listener-pool's whole "what's it doing"
+        picture for the last `hours`. Postgres-only.
+
+        Returns:
+            {
+              "since": iso, "until": iso, "hours": N,
+              "heartbeat": {
+                  "bins":      [iso, ...],
+                  "sessions":  [int|None, ...],
+                  "connected": [int|None, ...],
+                  "cpu_pct":   [float|None, ...],
+                  "memory_mb": [int|None, ...]
+              },
+              "event_types": {
+                  "types":   [...],         # top-N by total
+                  "totals":  {type: int},
+                  "bins":    [iso, ...],
+                  "series":  [{type, counts: int[B]}, ...]
+              },
+              "waf": {
+                  "totals": {handle: int},  # top-30 by count
+                  "all":    int             # total detections in window
+              },
+              "reconcile": {
+                  "bins":         [iso, ...],
+                  "pass_count":   [int, ...],    # passes per bin
+                  "duration_p50": [int|None, ...],  # median ms per bin
+                  "duration_p95": [int|None, ...],
+                  "claimed_total": int,
+                  "lost_total":   int
+              }
+            }
+        """
+        from datetime import datetime, timedelta, timezone
+        from sqlalchemy import text as _text
+
+        until = datetime.now(timezone.utc).replace(microsecond=0)
+        since = until - timedelta(hours=hours)
+        # Bucket width scales with the window so the chart always has
+        # ~120 points at most. Same UX as the API History chart.
+        if hours <= 1:
+            bucket_min = 1
+        elif hours <= 6:
+            bucket_min = 5
+        elif hours <= 24:
+            bucket_min = 15
+        elif hours <= 72:
+            bucket_min = 60
+        else:
+            bucket_min = 60
+        step = timedelta(minutes=bucket_min)
+
+        def _bin_grid() -> list[datetime]:
+            first = since.replace(
+                minute=since.minute - (since.minute % bucket_min),
+                second=0, microsecond=0,
+            )
+            out: list[datetime] = []
+            cur = first
+            while cur < until:
+                out.append(cur)
+                cur += step
+            return out
+
+        bins = _bin_grid()
+        N = len(bins)
+        bin_index = {b: i for i, b in enumerate(bins)}
+
+        with self._persistence._get_session() as s:
+            # 1. Heartbeat — AVG over each bin since multiple workers may
+            #    log into the same window. NULL bins (worker offline) stay
+            #    NULL on the chart so a gap reads as "no heartbeats".
+            hb_rows = s.execute(_text("""
+              SELECT
+                date_trunc('minute', ts)
+                  - MOD(EXTRACT(MINUTE FROM ts)::int, :bm) * INTERVAL '1 minute'
+                  AS bin,
+                AVG(sessions_count)::float  AS s,
+                AVG(connected_count)::float AS c,
+                AVG(memory_rss_mb)::float   AS mem,
+                AVG(cpu_pct)::float         AS cpu
+              FROM tiktok_worker_heartbeat_log
+              WHERE ts >= :since AND ts < :until
+              GROUP BY 1
+              ORDER BY 1
+            """), {"bm": bucket_min, "since": since, "until": until}).all()
+            # 2. Event-type totals + per-bin series. Top-N to keep the
+            #    chart legible. Bucket on `hour_bucket` directly since
+            #    the source table is pre-bucketed to hours; we then
+            #    map each hour onto whichever finer-grained bin it
+            #    starts in.
+            et_totals_rows = s.execute(_text("""
+              SELECT type, SUM(n)::bigint AS n
+              FROM tiktok_event_type_hour_counts
+              WHERE hour_bucket >= date_trunc('hour', :since)
+                AND hour_bucket <  :until
+              GROUP BY type
+              ORDER BY n DESC
+              LIMIT 12
+            """), {"since": since, "until": until}).all()
+            top_types = [r.type for r in et_totals_rows]
+            et_totals = {r.type: int(r.n) for r in et_totals_rows}
+            et_rows = []
+            if top_types:
+                et_rows = s.execute(_text("""
+                  SELECT hour_bucket, type, SUM(n)::bigint AS n
+                  FROM tiktok_event_type_hour_counts
+                  WHERE hour_bucket >= date_trunc('hour', :since)
+                    AND hour_bucket <  :until
+                    AND type = ANY(:types)
+                  GROUP BY 1, 2
+                  ORDER BY 1
+                """), {
+                    "since": since, "until": until, "types": top_types,
+                }).all()
+            # 3. WAF per-handle totals (top 30).
+            waf_rows = s.execute(_text("""
+              SELECT handle, COUNT(*)::int AS n
+              FROM tiktok_worker_log
+              WHERE event = 'waf_detected'
+                AND ts >= :since AND ts < :until
+                AND handle IS NOT NULL
+              GROUP BY handle
+              ORDER BY n DESC
+              LIMIT 30
+            """), {"since": since, "until": until}).all()
+            waf_total = s.execute(_text("""
+              SELECT COUNT(*)::int AS n FROM tiktok_worker_log
+              WHERE event = 'waf_detected'
+                AND ts >= :since AND ts < :until
+            """), {"since": since, "until": until}).scalar() or 0
+            # 4. Reconcile — pass count + p50/p95 duration per bin +
+            #    overall claimed/lost. PERCENTILE_CONT is exact (small
+            #    row counts) and indexed by ts.
+            recon_rows = s.execute(_text("""
+              SELECT
+                date_trunc('minute', ts)
+                  - MOD(EXTRACT(MINUTE FROM ts)::int, :bm) * INTERVAL '1 minute'
+                  AS bin,
+                COUNT(*)::int AS passes,
+                PERCENTILE_CONT(0.5) WITHIN GROUP (
+                  ORDER BY (detail->>'duration_ms')::int
+                )::int AS p50,
+                PERCENTILE_CONT(0.95) WITHIN GROUP (
+                  ORDER BY (detail->>'duration_ms')::int
+                )::int AS p95
+              FROM tiktok_worker_log
+              WHERE event = 'reconcile_pass'
+                AND ts >= :since AND ts < :until
+                AND detail ? 'duration_ms'
+              GROUP BY 1
+              ORDER BY 1
+            """), {"bm": bucket_min, "since": since, "until": until}).all()
+            recon_totals = s.execute(_text("""
+              SELECT
+                COALESCE(SUM(jsonb_array_length(detail->'claimed')), 0)::int AS claimed,
+                COALESCE(SUM(jsonb_array_length(detail->'lost')),    0)::int AS lost
+              FROM tiktok_worker_log
+              WHERE event = 'reconcile_pass'
+                AND ts >= :since AND ts < :until
+            """), {"since": since, "until": until}).first()
+
+        # ── Pack heartbeat into bin-aligned arrays ─────────────────
+        sessions = [None] * N
+        connected = [None] * N
+        cpu = [None] * N
+        memory = [None] * N
+        for r in hb_rows:
+            idx = bin_index.get(r.bin)
+            if idx is None:
+                continue
+            sessions[idx] = round(r.s, 1) if r.s is not None else None
+            connected[idx] = round(r.c, 1) if r.c is not None else None
+            cpu[idx] = round(r.cpu, 1) if r.cpu is not None else None
+            memory[idx] = int(round(r.mem)) if r.mem is not None else None
+
+        # ── Pack event-type series ──────────────────────────────────
+        et_cells: dict[str, list[int]] = {t: [0] * N for t in top_types}
+        for r in et_rows:
+            idx = bin_index.get(r.hour_bucket)
+            if idx is None:
+                continue
+            et_cells[r.type][idx] = int(r.n or 0)
+
+        # ── Pack reconcile per-bin ─────────────────────────────────
+        passes_arr = [0] * N
+        p50_arr: list[int | None] = [None] * N
+        p95_arr: list[int | None] = [None] * N
+        for r in recon_rows:
+            idx = bin_index.get(r.bin)
+            if idx is None:
+                continue
+            passes_arr[idx] = int(r.passes or 0)
+            p50_arr[idx] = int(r.p50) if r.p50 is not None else None
+            p95_arr[idx] = int(r.p95) if r.p95 is not None else None
+
+        bin_iso = [b.isoformat() for b in bins]
+        return {
+            "since": since.isoformat(),
+            "until": until.isoformat(),
+            "hours": hours,
+            "bucket_minutes": bucket_min,
+            "heartbeat": {
+                "bins": bin_iso,
+                "sessions":  sessions,
+                "connected": connected,
+                "cpu_pct":   cpu,
+                "memory_mb": memory,
+            },
+            "event_types": {
+                "types": top_types,
+                "totals": et_totals,
+                "bins": bin_iso,
+                "series": [
+                    {"type": t, "counts": et_cells[t]}
+                    for t in top_types
+                ],
+            },
+            "waf": {
+                "totals": {r.handle: int(r.n) for r in waf_rows},
+                "all": int(waf_total),
+            },
+            "reconcile": {
+                "bins": bin_iso,
+                "pass_count": passes_arr,
+                "duration_p50": p50_arr,
+                "duration_p95": p95_arr,
+                "claimed_total": int(recon_totals.claimed if recon_totals else 0),
+                "lost_total":    int(recon_totals.lost if recon_totals else 0),
+            },
+        }
+
     # Endpoint → kind mapping. Kept identical to the classification in
     # `adapters.tiktok_euler_call_sink._classify_url` so old rows and
     # new rows bucket the same way. Updates here must update there.
