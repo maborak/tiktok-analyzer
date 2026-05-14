@@ -97,6 +97,10 @@ def _backfill_from_events(c, dialect: str) -> None:
         "This is a one-time aggregate scan; can take a minute on a large DB."
     )
     if dialect == "postgresql":
+        # Filter multi-host guest gifts so a gifter's per-host roll-up
+        # only credits the host they actually sent to. When the host's
+        # profile_user_id is unknown (unprobed handle) fall through to
+        # legacy "count everything" so the row still exists.
         c.execute(text("""
             INSERT INTO tiktok_user_host_summary
                 (user_id, host_unique_id, diamonds, gifts,
@@ -115,9 +119,15 @@ def _backfill_from_events(c, dialect: str) -> None:
                 MAX(e.ts) AS last_seen_at
             FROM tiktok_events e
             JOIN tiktok_rooms r ON r.room_id = e.room_id
+            JOIN tiktok_subscriptions sub ON sub.unique_id = r.host_unique_id
             WHERE e.type = 'gift'
               AND e.user_id IS NOT NULL
               AND r.host_unique_id IS NOT NULL
+              AND (
+                sub.profile_user_id IS NULL
+                OR COALESCE(e.payload->'to_user'->>'user_id', '0')
+                   IN ('0', sub.profile_user_id::text)
+              )
             GROUP BY e.user_id, r.host_unique_id
             ON CONFLICT (user_id, host_unique_id) DO NOTHING
         """))

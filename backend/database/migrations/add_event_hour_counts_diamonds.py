@@ -96,6 +96,12 @@ def _backfill_diamonds(engine) -> None:
             "SELECT count(*) FROM tiktok_event_hour_counts "
             "WHERE diamonds > 0"
         )).scalar() or 0
+        # Multi-host guest gifts (to_user.user_id set and != host's
+        # profile_user_id) must be excluded — they go to a different
+        # recipient, not the room host. Same predicate as the read-path
+        # aggregations + write-path filter. Hosts without a probed
+        # profile_user_id (sub.profile_user_id NULL) fall through to
+        # legacy "count everything" behaviour.
         c.execute(text("""
             INSERT INTO tiktok_event_hour_counts (host_unique_id, hour_bucket, n, diamonds)
             SELECT
@@ -108,8 +114,14 @@ def _backfill_diamonds(engine) -> None:
                 )::bigint AS diamonds
             FROM tiktok_events e
             JOIN tiktok_rooms r ON r.room_id = e.room_id
+            JOIN tiktok_subscriptions sub ON sub.unique_id = r.host_unique_id
             WHERE e.type = 'gift'
               AND r.host_unique_id IS NOT NULL
+              AND (
+                sub.profile_user_id IS NULL
+                OR COALESCE(e.payload->'to_user'->>'user_id', '0')
+                   IN ('0', sub.profile_user_id::text)
+              )
             GROUP BY r.host_unique_id, date_trunc('hour', e.ts)
             ON CONFLICT (host_unique_id, hour_bucket) DO UPDATE
                 SET diamonds = EXCLUDED.diamonds

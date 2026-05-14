@@ -223,6 +223,59 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
         # without modification.
         super().__init__(*args, **kwargs)
         self._state_cache = state_cache
+        # Lazy host → profile_user_id cache. Populated on first
+        # `_should_count_gift_for_host` lookup. Invalidated when a
+        # subscription's `profile_user_id` is rewritten by the scraper
+        # (see `upsert_profile_facets`). NULL value means "lookup ran
+        # but row was missing / unprobed handle"; we treat that as a
+        # legacy fall-through (count everything).
+        self._host_profile_user_id: dict[str, int | None] = {}
+
+    def _resolve_host_profile_user_id(self, s, host_unique_id: str) -> int | None:
+        """Return the host's TikTok profile user_id, or None when
+        unknown / unprobed. Cached for the lifetime of the adapter."""
+        if host_unique_id in self._host_profile_user_id:
+            return self._host_profile_user_id[host_unique_id]
+        row = s.execute(text(
+            "SELECT profile_user_id FROM tiktok_subscriptions "
+            "WHERE unique_id = :host"
+        ), {"host": host_unique_id}).first()
+        uid = int(row.profile_user_id) if (row and row.profile_user_id) else None
+        self._host_profile_user_id[host_unique_id] = uid
+        return uid
+
+    def _gift_is_for_host(
+        self,
+        s,
+        host_unique_id: str,
+        payload: dict | None,
+    ) -> bool:
+        """True when this gift should be credited to `host_unique_id`.
+
+        Multi-host TikTok lives stream every guest's gifts into the
+        host's room with `to_user.user_id` set to the actual recipient.
+        Crediting those toward the host's totals inflates the per-host
+        diamond count vs TikTok's own number. We match the same
+        predicate the read-path aggregations use: host_user_id NULL
+        means unprobed (legacy fall-through); otherwise the gift counts
+        only when `to_user.user_id` matches the host or is missing/zero
+        (popular vote / unattributed = the host).
+        """
+        if not isinstance(payload, dict):
+            return True
+        host_uid = self._resolve_host_profile_user_id(s, host_unique_id)
+        if host_uid is None:
+            return True
+        to_user = payload.get("to_user")
+        if not isinstance(to_user, dict):
+            return True
+        raw = to_user.get("user_id")
+        if raw in (None, "", 0, "0"):
+            return True
+        try:
+            return int(raw) == host_uid
+        except (TypeError, ValueError):
+            return True
 
     # ── Subscriptions ────────────────────────────────────────────────
 
@@ -347,6 +400,9 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                 for f in self._PROFILE_FIELDS:
                     if f in profile:
                         setattr(row, f, profile[f])
+                # Invalidate the host→profile_user_id cache so write
+                # paths pick up a freshly-resolved user_id immediately.
+                self._host_profile_user_id.pop(unique_id, None)
             s.commit()
 
     def delete_subscription(self, unique_id: str) -> bool:
@@ -355,6 +411,7 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
             if row is None:
                 return False
             s.delete(row)
+            self._host_profile_user_id.pop(unique_id, None)
             s.commit()
             return True
 
@@ -2024,6 +2081,11 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
             return
         if not host_unique_id:
             return
+        # Multi-host guest gifts (to_user.user_id set + != host's
+        # profile_user_id) must NOT bump this host's summary — they go
+        # to a different recipient. Same predicate the read paths use.
+        if not self._gift_is_for_host(s, host_unique_id, payload):
+            return
         p = payload if isinstance(payload, dict) else {}
         try:
             d_per = int(p.get("diamond_count") or 0)
@@ -2237,12 +2299,16 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
             return
         diamonds_delta = 0
         if event_type == "gift" and isinstance(payload, dict):
-            try:
-                dc = int(payload.get("diamond_count") or 0)
-                rc = int(payload.get("repeat_count") or 1)
-                diamonds_delta = max(0, dc * rc)
-            except (TypeError, ValueError):
-                diamonds_delta = 0
+            # Only credit diamonds when the gift's to_user matches the
+            # host. The `n` event count still increments — the rhythm
+            # strip shows raw event flow regardless of attribution.
+            if self._gift_is_for_host(s, host_unique_id, payload):
+                try:
+                    dc = int(payload.get("diamond_count") or 0)
+                    rc = int(payload.get("repeat_count") or 1)
+                    diamonds_delta = max(0, dc * rc)
+                except (TypeError, ValueError):
+                    diamonds_delta = 0
         s.execute(text("""
             INSERT INTO tiktok_event_hour_counts (host_unique_id, hour_bucket, n, diamonds)
             VALUES (:h, date_trunc('hour', NOW()), 1, :d)
@@ -2479,6 +2545,15 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
     ) -> None:
         """The big one — diamonds + top_gifters + unique gifters +
         first-timer detection."""
+        # Multi-host guest gifts: only bump the last-event clock so the
+        # rhythm strip / momentum heuristic still react, but skip the
+        # diamond + gifter book-keeping. Same predicate as the read-path
+        # aggregations.
+        if not self._gift_is_for_host(s, host, payload):
+            self._state_cache.apply_patch(host, {
+                "_last_event_at": _now_iso(),
+            })
+            return
         dc = int(payload.get("diamond_count") or 0)
         rc = int(payload.get("repeat_count") or 1)
         value = max(0, dc * rc)
@@ -3992,6 +4067,10 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
             # ── 8. Daily timeseries — diamonds + gifts per host per day,
             #     last 90 days. Drives the stacked-area + cumulative
             #     curves on the timeline tab. ──
+            #     Multi-host guest gifts (to_user.user_id != primary
+            #     host's profile_user_id) are excluded so this gifter's
+            #     per-host attribution stays consistent with the
+            #     host-side aggregations.
             daily_series: list[dict[str, Any]] = []
             if is_pg:
                 ds = s.execute(text("""
@@ -4002,9 +4081,15 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                            SUM(COALESCE((e.payload->>'repeat_count')::int, 1)) AS g
                     FROM tiktok_events e
                     JOIN tiktok_rooms r ON r.room_id = e.room_id
+                    JOIN tiktok_subscriptions sub ON sub.unique_id = r.host_unique_id
                     WHERE e.user_id = :uid AND e.type = 'gift'
                       AND e.ts >= NOW() - INTERVAL '90 days'
                       AND r.host_unique_id IS NOT NULL
+                      AND (
+                        sub.profile_user_id IS NULL
+                        OR COALESCE(e.payload->'to_user'->>'user_id', '0')
+                           IN ('0', sub.profile_user_id::text)
+                      )
                     GROUP BY day, host
                     ORDER BY day
                 """), {"uid": int(user_id)}).all()
@@ -4810,9 +4895,15 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                        ), 0) AS d
                 FROM tiktok_rooms r
                 JOIN tiktok_events e ON e.room_id = r.room_id
+                JOIN tiktok_subscriptions sub ON sub.unique_id = r.host_unique_id
                 WHERE r.host_unique_id = ANY(:hs)
                   AND r.first_seen_at > NOW() - INTERVAL '7 days'
                   AND e.type = 'gift'
+                  AND (
+                    sub.profile_user_id IS NULL
+                    OR COALESCE(e.payload->'to_user'->>'user_id', '0')
+                       IN ('0', sub.profile_user_id::text)
+                  )
                 GROUP BY 1, 2
             """), {"hs": handles}).all()
             for h, off, d in wk_diam:
@@ -4967,6 +5058,13 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
         Uses generate_series + LEFT JOIN so empty minutes come back
         as zero (sparkline needs the gaps)."""
         with self._get_session() as s:
+            # `to_user.user_id` filter (multi-host gift attribution):
+            # only count gifts that the host themselves received, OR
+            # gifts without a specific recipient (`to_user.user_id = 0`
+            # / NULL = popular-vote / unattributed = credited to host).
+            # See `host_calendar` for the full rationale. Joining
+            # through `tiktok_subscriptions` lets each per-host SUM
+            # know its own profile_user_id.
             hourly = s.execute(text("""
                 WITH minute_bins AS (
                     SELECT generate_series(0, 59) AS bin
@@ -4978,9 +5076,15 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                                * COALESCE((e.payload->>'repeat_count')::int, 1)) AS d
                     FROM tiktok_events e
                     JOIN tiktok_rooms r ON r.room_id = e.room_id
+                    JOIN tiktok_subscriptions sub ON sub.unique_id = r.host_unique_id
                     WHERE r.host_unique_id = ANY(:hs)
                       AND e.type = 'gift'
                       AND e.ts > NOW() - INTERVAL '60 minutes'
+                      AND (
+                        sub.profile_user_id IS NULL
+                        OR COALESCE(e.payload->'to_user'->>'user_id', '0')
+                           IN ('0', sub.profile_user_id::text)
+                      )
                     GROUP BY host, bin
                 )
                 SELECT host, bin, d FROM gifts
@@ -5478,22 +5582,43 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                 else:
                     other_room_ids.append(int(rid))
             stats_by_room: dict[int, dict[str, int]] = {}
+            # Multi-host guest gifts (to_user.user_id != host's profile
+            # user id) must NOT be counted toward this creator's
+            # diamonds. When sub.profile_user_id is NULL we can't
+            # resolve attribution → leave the room unfiltered (legacy
+            # behaviour preserved).
             if latest_room_ids:
                 dbr = s.execute(text("""
-                    SELECT room_id,
+                    SELECT e.room_id,
                            COALESCE(SUM(
-                             COALESCE((payload->>'diamond_count')::int, 0)
-                               * COALESCE((payload->>'repeat_count')::int, 1)
-                           ) FILTER (WHERE type = 'gift'), 0)            AS diamonds,
-                           COUNT(*) FILTER (WHERE type = 'gift')         AS n_gifts,
-                           COUNT(*) FILTER (WHERE type = 'comment')      AS n_comments,
-                           MAX((payload->>'total')::int) FILTER (
-                               WHERE type = 'viewer_count'
-                           )                                             AS peak_viewers
-                    FROM tiktok_events
-                    WHERE room_id = ANY(:rids)
-                      AND type IN ('gift', 'comment', 'viewer_count')
-                    GROUP BY room_id
+                             COALESCE((e.payload->>'diamond_count')::int, 0)
+                               * COALESCE((e.payload->>'repeat_count')::int, 1)
+                           ) FILTER (
+                               WHERE e.type = 'gift'
+                                 AND (
+                                   sub.profile_user_id IS NULL
+                                   OR COALESCE(e.payload->'to_user'->>'user_id', '0')
+                                      IN ('0', sub.profile_user_id::text)
+                                 )
+                           ), 0)                                          AS diamonds,
+                           COUNT(*) FILTER (
+                               WHERE e.type = 'gift'
+                                 AND (
+                                   sub.profile_user_id IS NULL
+                                   OR COALESCE(e.payload->'to_user'->>'user_id', '0')
+                                      IN ('0', sub.profile_user_id::text)
+                                 )
+                           )                                              AS n_gifts,
+                           COUNT(*) FILTER (WHERE e.type = 'comment')     AS n_comments,
+                           MAX((e.payload->>'total')::int) FILTER (
+                               WHERE e.type = 'viewer_count'
+                           )                                              AS peak_viewers
+                    FROM tiktok_events e
+                    JOIN tiktok_rooms r ON r.room_id = e.room_id
+                    JOIN tiktok_subscriptions sub ON sub.unique_id = r.host_unique_id
+                    WHERE e.room_id = ANY(:rids)
+                      AND e.type IN ('gift', 'comment', 'viewer_count')
+                    GROUP BY e.room_id
                 """), {"rids": latest_room_ids}).all()
                 for rid, d, ng, nc, pv in dbr:
                     stats_by_room[int(rid)] = {
@@ -5504,12 +5629,20 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                     }
             if other_room_ids:
                 dbr = s.execute(text("""
-                    SELECT room_id,
-                           SUM(COALESCE((payload->>'diamond_count')::int, 0)
-                               * COALESCE((payload->>'repeat_count')::int, 1)) AS d
-                    FROM tiktok_events
-                    WHERE room_id = ANY(:rids) AND type = 'gift'
-                    GROUP BY room_id
+                    SELECT e.room_id,
+                           SUM(COALESCE((e.payload->>'diamond_count')::int, 0)
+                               * COALESCE((e.payload->>'repeat_count')::int, 1)) AS d
+                    FROM tiktok_events e
+                    JOIN tiktok_rooms r ON r.room_id = e.room_id
+                    JOIN tiktok_subscriptions sub ON sub.unique_id = r.host_unique_id
+                    WHERE e.room_id = ANY(:rids)
+                      AND e.type = 'gift'
+                      AND (
+                        sub.profile_user_id IS NULL
+                        OR COALESCE(e.payload->'to_user'->>'user_id', '0')
+                           IN ('0', sub.profile_user_id::text)
+                      )
+                    GROUP BY e.room_id
                 """), {"rids": other_room_ids}).all()
                 for rid, d in dbr:
                     stats_by_room[int(rid)] = {
@@ -5579,18 +5712,26 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
             # them separate lets the 30-day window stay independent.
             avg_d = s.execute(text("""
                 WITH host_rooms AS (
-                    SELECT room_id, host_unique_id
-                    FROM tiktok_rooms
-                    WHERE host_unique_id = ANY(:hs)
-                      AND ended_at IS NOT NULL
-                      AND first_seen_at > NOW() - INTERVAL '30 days'
+                    SELECT r.room_id, r.host_unique_id, sub.profile_user_id
+                    FROM tiktok_rooms r
+                    JOIN tiktok_subscriptions sub ON sub.unique_id = r.host_unique_id
+                    WHERE r.host_unique_id = ANY(:hs)
+                      AND r.ended_at IS NOT NULL
+                      AND r.first_seen_at > NOW() - INTERVAL '30 days'
                 )
                 SELECT hr.host_unique_id,
                        SUM(COALESCE((e.payload->>'diamond_count')::int, 0)
                            * COALESCE((e.payload->>'repeat_count')::int, 1))::bigint AS total_d,
                        COUNT(DISTINCT hr.room_id) AS n_rooms
                 FROM host_rooms hr
-                LEFT JOIN tiktok_events e ON e.room_id = hr.room_id AND e.type = 'gift'
+                LEFT JOIN tiktok_events e
+                  ON e.room_id = hr.room_id
+                 AND e.type = 'gift'
+                 AND (
+                   hr.profile_user_id IS NULL
+                   OR COALESCE(e.payload->'to_user'->>'user_id', '0')
+                      IN ('0', hr.profile_user_id::text)
+                 )
                 GROUP BY hr.host_unique_id
             """), {"hs": norm}).all()
         for h, total_d, n in avg_d:
@@ -5630,15 +5771,23 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
         with self._get_session() as s:
             med = s.execute(text("""
                 WITH per_room AS (
-                    SELECT r.host_unique_id AS host, e.room_id,
+                    SELECT r.host_unique_id AS host, r.room_id,
                            SUM(COALESCE((e.payload->>'diamond_count')::int, 0)
                                * COALESCE((e.payload->>'repeat_count')::int, 1)) AS d
                     FROM tiktok_rooms r
-                    LEFT JOIN tiktok_events e ON e.room_id = r.room_id AND e.type = 'gift'
+                    JOIN tiktok_subscriptions sub ON sub.unique_id = r.host_unique_id
+                    LEFT JOIN tiktok_events e
+                      ON e.room_id = r.room_id
+                     AND e.type = 'gift'
+                     AND (
+                       sub.profile_user_id IS NULL
+                       OR COALESCE(e.payload->'to_user'->>'user_id', '0')
+                          IN ('0', sub.profile_user_id::text)
+                     )
                     WHERE r.host_unique_id = ANY(:hs)
                       AND r.ended_at IS NOT NULL
                       AND r.first_seen_at > NOW() - INTERVAL '30 days'
-                    GROUP BY r.host_unique_id, e.room_id
+                    GROUP BY r.host_unique_id, r.room_id
                 )
                 SELECT host,
                        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY d)::bigint AS median_d,
