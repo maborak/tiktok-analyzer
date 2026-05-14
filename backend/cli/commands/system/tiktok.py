@@ -103,16 +103,26 @@ def list_lives_cmd() -> None:
     help="Also list every outage window beyond the daily totals.",
 )
 def downtime_cmd(days: int, tz_name: str, min_window_s: int, show_windows: bool) -> None:
-    """How much data did we MISS today? (and previous days)
+    """How much data did we MISS while users were live?
 
-    A minute counts as "down" only when at least one tracked room was
-    OPEN (i.e. some host was live) AND we ingested zero events that
-    minute. The "rooms were open" gate avoids counting low-traffic
-    hours where no host was streaming.
+    A minute counts as "down" when at least one room had events both
+    BEFORE and AFTER that minute (proving the user kept streaming
+    through it) AND we ingested zero events that minute.
 
-    Daily rollup uses the per-day boundary in --tz so "today" matches
-    what shows up in the UI for a US-east admin. Outages straddling
-    midnight are credited to the day each minute falls in.
+    Why bracketed-by-events instead of `tiktok_rooms.last_seen_at`:
+    `last_seen_at` only advances when WE ingest. If the worker dies
+    mid-broadcast, `last_seen_at` freezes at the time of our last
+    event and the room looks "closed" to the DB — masking exactly the
+    downtime we want to detect. Using the actual event stream as the
+    liveness gate exposes those gaps directly: events at T1 and at
+    T3 mean the user kept streaming through T2, so any zero-event
+    minute in (T1, T3) is real missed data.
+
+    Limitation: if a broadcast ended while the worker was still
+    offline (worker died at T, broadcast ended at T+10, worker came
+    back at T+20), the user's last-event timestamp from our DB is T,
+    so minutes (T, T+10) are not counted as live. There's no way to
+    recover this without an external probe.
 
     Examples:
         python cli.py system tiktok downtime              # today, ET
@@ -123,21 +133,27 @@ def downtime_cmd(days: int, tz_name: str, min_window_s: int, show_windows: bool)
     from sqlalchemy import text as _text
     engine = create_database_engine()
     with engine.connect() as c:
-        # Per-minute series, classified into:
-        #   - "active"  : at least one room was open this minute
-        #                 (first_seen_at <= m < COALESCE(ended_at, last_seen_at + 5m))
-        #   - "events_n": events ingested this minute
-        # "Down" minute = active > 0 AND events_n == 0.
+        # Per-room event window (first_event_min, last_event_min)
+        # within the look-back. Then a minute is "live" iff some room
+        # had `first_min <= minute <= last_min`. The room's user was
+        # PROVABLY streaming at that minute because we saw events from
+        # them later — even if the worker died and missed everything
+        # in between.
         rows = c.execute(_text("""
           WITH bounds AS (
             SELECT date_trunc('day', NOW() AT TIME ZONE :tz)
                    - (:days - 1) * INTERVAL '1 day' AS start_local,
                    date_trunc('minute', NOW() AT TIME ZONE :tz) AS end_local
           ),
+          win AS (
+            SELECT (SELECT start_local AT TIME ZONE :tz FROM bounds) AS lo,
+                   (SELECT end_local   AT TIME ZONE :tz FROM bounds)
+                     + INTERVAL '1 minute' AS hi
+          ),
           grid AS (
             SELECT generate_series(
-                     (SELECT start_local AT TIME ZONE :tz FROM bounds),
-                     (SELECT end_local   AT TIME ZONE :tz FROM bounds),
+                     (SELECT lo FROM win),
+                     (SELECT hi FROM win) - INTERVAL '1 minute',
                      INTERVAL '1 minute'
                    ) AS minute_utc
           ),
@@ -145,35 +161,38 @@ def downtime_cmd(days: int, tz_name: str, min_window_s: int, show_windows: bool)
             SELECT date_trunc('minute', ts) AS minute_utc,
                    COUNT(*) AS n
             FROM tiktok_events
-            WHERE ts >= (SELECT start_local AT TIME ZONE :tz FROM bounds)
-              AND ts <  (SELECT end_local   AT TIME ZONE :tz FROM bounds)
-                       + INTERVAL '1 minute'
+            WHERE ts >= (SELECT lo FROM win)
+              AND ts <  (SELECT hi FROM win)
             GROUP BY 1
           ),
-          -- For each room, expand its open interval into the minute
-          -- grid. `ended_at` is NULL for rooms that never got a clean
-          -- end event; fall back to `last_seen_at + 5 min` (the same
-          -- 5-min liveness rule used elsewhere).
-          rooms_active AS (
+          -- First & last ingested-event minute PER ROOM in the window.
+          -- A room appears here only if we got AT LEAST one event from
+          -- it. Singleton rooms (first = last) contribute 1 live
+          -- minute, no possible downtime — they don't bracket anything.
+          room_event_window AS (
+            SELECT room_id,
+                   date_trunc('minute', MIN(ts)) AS first_min,
+                   date_trunc('minute', MAX(ts)) AS last_min
+            FROM tiktok_events
+            WHERE ts >= (SELECT lo FROM win)
+              AND ts <  (SELECT hi FROM win)
+            GROUP BY room_id
+          ),
+          live_rooms_per_min AS (
             SELECT g.minute_utc, COUNT(*) AS n_rooms
             FROM grid g
-            JOIN tiktok_rooms r
-              ON r.first_seen_at <= g.minute_utc
-             AND COALESCE(r.ended_at, r.last_seen_at + INTERVAL '5 minutes')
-                 > g.minute_utc
-            WHERE r.first_seen_at <
-                  (SELECT end_local AT TIME ZONE :tz FROM bounds) + INTERVAL '1 day'
-              AND COALESCE(r.ended_at, r.last_seen_at) >=
-                  (SELECT start_local AT TIME ZONE :tz FROM bounds) - INTERVAL '1 day'
+            JOIN room_event_window rew
+              ON rew.first_min <= g.minute_utc
+             AND rew.last_min  >= g.minute_utc
             GROUP BY g.minute_utc
           )
           SELECT g.minute_utc,
                  COALESCE(e.n, 0)       AS n_events,
-                 COALESCE(ra.n_rooms, 0) AS n_active_rooms,
+                 COALESCE(lr.n_rooms, 0) AS n_active_rooms,
                  (g.minute_utc AT TIME ZONE :tz)::date AS local_day
           FROM grid g
-          LEFT JOIN events_per_min e USING (minute_utc)
-          LEFT JOIN rooms_active ra USING (minute_utc)
+          LEFT JOIN events_per_min   e  USING (minute_utc)
+          LEFT JOIN live_rooms_per_min lr USING (minute_utc)
           ORDER BY g.minute_utc
         """), {"tz": tz_name, "days": days}).fetchall()
 
@@ -253,12 +272,13 @@ def downtime_cmd(days: int, tz_name: str, min_window_s: int, show_windows: bool)
     )
     click.echo(
         "\n  Capture % = (live minutes − down minutes) / live minutes."
-        "\n  'Down' counts only minutes when ≥1 room was open AND we got 0 events."
+        "\n  A minute is 'live' when ≥1 room had events both before AND after it"
+        "\n  (proves the user kept streaming through it); 'down' = live AND 0 events."
     )
 
     if not show_windows or not windows:
         return
-    click.echo(f"\nOutage windows (≥{min_window_s}s, rooms open at the time):")
+    click.echo(f"\nOutage windows (≥{min_window_s}s, rooms confirmed live then):")
     click.echo(f"  {'Start (UTC)':<22} | {'End (UTC)':<22} | {'Duration':>10} | rooms")
     click.echo("  " + "-" * 70)
     for start, end, mins, peak in windows:
