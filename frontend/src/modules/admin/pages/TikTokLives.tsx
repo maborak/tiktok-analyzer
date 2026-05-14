@@ -3,6 +3,8 @@ import { Link } from '@tanstack/react-router';
 import { Globe, Plus, RefreshCw, RotateCcw, Search, Star, Trash2, Power, PowerOff, Send, Radio, BarChart3, Users, X } from 'lucide-react';
 import toast from 'react-hot-toast';
 
+import { useTikTokLivesSocket } from '@admin/hooks/useTikTokLivesSocket';
+
 import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Input';
 import { PageShell, PageHeader } from '@/components/ui/PageShell';
@@ -210,12 +212,50 @@ function TikTokLivesBody() {
     }
   }, []);
 
-  // Single bundled fetch — replaces the previous three-call fan-out
-  // (list/summary/totals). On cold mount this is one HTTP round-trip
-  // and one RBAC dependency resolution, vs three of each before.
-  // Structural sharing on `summary` keeps per-host object identity
-  // stable across polls when nothing changed, so `React.memo` on
-  // `SubscriptionCard` can short-circuit unchanged hosts.
+  // Phase 9.E — WS-pushed per-host state. The hook subscribes to the
+  // `tiktok:lives:delta:admin` channel via the existing
+  // `/admin/tiktok/ws` endpoint. Every state-cache mutation on the
+  // server publishes a `summary-delta` frame; the hook applies it
+  // here via `onSocketUpdate`. Status drives the reconciliation
+  // cadence below: WS-live → 5-min safety-net fetch; WS-degraded →
+  // fall back to 30-s polling so the UI doesn't go stale.
+  const onSocketUpdate = useCallback(
+    (host: string, slice: TikTokLiveSummary, version: number) => {
+      setSummary((prev) => {
+        const existing = prev[host];
+        // Same structural-share rule as the bundle merge — preserve
+        // per-host reference identity when the merged value is byte-
+        // equivalent so `React.memo(SubscriptionCard)` short-circuits.
+        const merged: TikTokLiveSummary = {
+          ...(existing ?? {}),
+          ...slice,
+          version,
+        };
+        if (
+          existing &&
+          JSON.stringify(existing) === JSON.stringify(merged)
+        ) {
+          return prev;
+        }
+        return { ...prev, [host]: merged };
+      });
+    },
+    [],
+  );
+
+  const wsStatus = useTikTokLivesSocket({
+    audience: 'admin',
+    onUpdate: onSocketUpdate,
+  });
+
+  // Single bundled fetch — provides initial subs + summary + totals.
+  // After Phase 9.E this also acts as the periodic safety-net
+  // reconciliation: when the WS is live (driving deltas) we re-fetch
+  // every 5 min just to catch any drift; when the WS is degraded we
+  // fall back to the old 30-s cadence so the UI doesn't go stale.
+  const reconcileIntervalMs =
+    wsStatus.status === 'live' ? 5 * 60 * 1000 : pollIntervalMs;
+
   useEffect(() => {
     if (tab !== 'lives') return;
     let cancelled = false;
@@ -257,7 +297,7 @@ function TikTokLivesBody() {
     let interval: ReturnType<typeof setInterval> | null = null;
     const start = () => {
       if (interval == null && document.visibilityState === 'visible') {
-        interval = setInterval(fetchOnce, pollIntervalMs);
+        interval = setInterval(fetchOnce, reconcileIntervalMs);
       }
     };
     const stop = () => {
@@ -281,7 +321,7 @@ function TikTokLivesBody() {
       stop();
       document.removeEventListener('visibilitychange', onVis);
     };
-  }, [tab, pollIntervalMs]);
+  }, [tab, reconcileIntervalMs]);
 
   // ── actions ───────────────────────────────────────────────────────
 

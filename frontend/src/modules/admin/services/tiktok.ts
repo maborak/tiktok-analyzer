@@ -1655,7 +1655,17 @@ export function openTikTokWebSocket(
   const path = audience === 'admin' ? '/admin/tiktok/ws' : '/public/tiktok/ws';
   let url = `${wsBase}${path}`;
   if (audience === 'admin') {
-    const token = localStorage.getItem('token') || sessionStorage.getItem('token');
+    // Framework's auth context stores the JWT under `auth_token` (see
+    // `AuthContext.tsx:41 const TOKEN_KEY = 'auth_token'`). The legacy
+    // `'token'` key never existed in this codebase — reading it
+    // returned null so the admin WS connected with an empty `?token=`
+    // and the backend returned 4401 (close code surfaces in browser
+    // as HTTP 403 on the upgrade). Fixes the long-standing FE-H4 in
+    // `.claude/tracking/OPEN_ISSUES.md`. Phase 9.E makes the WS
+    // load-bearing for state push, so this had to land here.
+    const token =
+      localStorage.getItem('auth_token') ||
+      sessionStorage.getItem('auth_token');
     if (token) url += `?token=${encodeURIComponent(token)}`;
   }
   // Tell the telemetry singleton a WS attempt is starting. This is
@@ -1677,7 +1687,7 @@ export function openTikTokWebSocket(
     } catch { return true; }
   })();
   const tokenTail = audience === 'admin'
-    ? (localStorage.getItem('token') || sessionStorage.getItem('token') || '')
+    ? (localStorage.getItem('auth_token') || sessionStorage.getItem('auth_token') || '')
         .slice(-6) || '(none)'
     : '(public — no token)';
   if (debugWs) {
