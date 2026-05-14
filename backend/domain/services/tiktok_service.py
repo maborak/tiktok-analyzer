@@ -173,8 +173,17 @@ class TikTokService:
     # the simultaneous N-connect burst that trips TikTok's per-IP
     # anti-bot (DEVICE_BLOCKED). 500ms spreads 30 connects over ~15s.
     STARTUP_STAGGER_SECONDS = 0.5
-    # A profile is considered stale this long after its last successful fetch.
+    # A profile is considered stale this long after its last successful
+    # fetch (default; applies when `is_live=True` or unknown).
     PROFILE_STALE_AFTER_SECONDS = 60 * 60
+    # Stretched cadence for handles whose probe says they're NOT live.
+    # Chronically-offline hosts get refreshed at 1/4 the rate — saves a
+    # lot of Euler quota that was going to "is @offline_host still
+    # offline?" probes that almost always answer "yes, still offline".
+    # If the host comes back online, the live-status scraper picks it
+    # up immediately on its own cadence (60s TTL) — this longer window
+    # only governs the rich-profile refresh (followers / bio / etc).
+    PROFILE_STALE_AFTER_SECONDS_OFFLINE = 60 * 60 * 4
     # How long between API calls when refreshing a batch — be a polite scraper.
     PROFILE_REFRESH_PER_HANDLE_DELAY_SECONDS = 1.0
 
@@ -518,10 +527,32 @@ class TikTokService:
                 "failed to seed reconnect_processed_id; "
                 "worker may briefly replay stale reconnect signals",
             )
+        # Capture the sign-provider config in effect for THIS worker
+        # boot. Surfaces it in both the console log and the
+        # tiktok_worker_log audit row so we can confirm which Euler
+        # key (or local broker / session cookie) the worker is using
+        # without grepping config.
+        try:
+            from adapters.tiktok_live_client import _read_sign_settings
+            sign_cfg = _read_sign_settings()
+        except Exception:
+            sign_cfg = {}
+        provider = sign_cfg.get("TIKTOK_SIGN_PROVIDER") or "euler"
+        api_key = sign_cfg.get("TIKTOK_EULER_API_KEY") or ""
+        # Fingerprint: show enough to match against .env without
+        # dumping the full credential to disk on every restart.
+        if api_key:
+            if len(api_key) > 16:
+                key_fp = f"{api_key[:8]}…{api_key[-6:]} (len={len(api_key)})"
+            else:
+                key_fp = f"len={len(api_key)}"
+        else:
+            key_fp = "(none)"
         logger.info(
-            "Worker registered: id=%s key=%s host=%s pid=%d capacity=%d",
+            "Worker registered: id=%s key=%s host=%s pid=%d capacity=%d "
+            "sign_provider=%s euler_api_key=%s",
             worker.id, self._worker_key, self._worker_host, os.getpid(),
-            self._worker_capacity,
+            self._worker_capacity, provider, key_fp,
         )
         self._log_worker(
             "startup",
@@ -530,6 +561,8 @@ class TikTokService:
                 "host": self._worker_host,
                 "pid": os.getpid(),
                 "capacity": self._worker_capacity,
+                "sign_provider": provider,
+                "euler_api_key_fp": key_fp,
             },
         )
 
@@ -1373,8 +1406,16 @@ class TikTokService:
         writes; if it falls behind, we tolerate slight log latency
         rather than starving the loop.
         """
-        py_logger_method = getattr(logger, level if level in ("info", "warning", "error", "debug") else "info")
-        py_logger_method(
+        # Every audit row is persisted to `tiktok_worker_log` (the source
+        # of truth). The console mirror at INFO produced ~1 line per
+        # session lifecycle event — pure duplicate noise. Keep WARNING+
+        # at the original level so real issues still surface; downgrade
+        # the routine INFO-level lifecycle events (session_start,
+        # session_stop, etc.) to DEBUG.
+        py_level = level if level in ("info", "warning", "error", "debug") else "info"
+        if py_level == "info":
+            py_level = "debug"
+        getattr(logger, py_level)(
             "[worker_log] event=%s handle=%s detail=%s",
             event, handle or "-", detail or {},
         )
@@ -1820,17 +1861,61 @@ class TikTokService:
     ) -> int:
         """Refresh every subscription whose profile is stale. Returns the
         number of refresh attempts (regardless of success). Spaces calls
-        out to avoid hammering TikTok."""
+        out to avoid hammering TikTok.
+
+        Euler-quota optimization: handles with an actively CONNECTED
+        listener (events flowing right now) are skipped entirely —
+        events arriving via the WebSocket are proof of liveness, so
+        burning an Euler-signed probe to confirm what we already know
+        is pure waste. Their `profile_refreshed_at` stays stale, but
+        as soon as the WS drops the handle moves out of CONNECTED and
+        becomes eligible again on the next pass.
+        """
         if stale_after_seconds is None:
             stale_after_seconds = self.PROFILE_STALE_AFTER_SECONDS
+        # Fetch at the SHORTER window; the offline-backoff predicate
+        # below decides which rows to actually refresh. (Asking the DB
+        # for the longer window would miss handles that just went from
+        # live → offline.)
         stale = self._persistence.list_subscriptions_with_stale_profiles(
             stale_after_seconds=stale_after_seconds
         )[:limit]
+        connected_now = {
+            h for h, st in self._states.items()
+            if st == SubscriptionState.CONNECTED.value
+        }
+        now = _utcnow()
+        offline_cutoff = timedelta(
+            seconds=self.PROFILE_STALE_AFTER_SECONDS_OFFLINE
+        )
+        skipped_connected = 0
+        skipped_offline = 0
         count = 0
         for sub in stale:
+            if sub.unique_id in connected_now:
+                skipped_connected += 1
+                continue
+            # Offline backoff: if the probe says is_live=False, only
+            # refresh every PROFILE_STALE_AFTER_SECONDS_OFFLINE
+            # instead of …_SECONDS. The live-status scraper has its
+            # own faster cadence (60s TTL) and will flip is_live=True
+            # the moment the host starts streaming — at which point
+            # this handle qualifies again on the next pass.
+            if sub.is_live is False and sub.profile_refreshed_at is not None:
+                age = now - sub.profile_refreshed_at
+                if age < offline_cutoff:
+                    skipped_offline += 1
+                    continue
             await self.refresh_profile(sub.unique_id)
             count += 1
             await asyncio.sleep(self.PROFILE_REFRESH_PER_HANDLE_DELAY_SECONDS)
+        if skipped_connected or skipped_offline:
+            logger.info(
+                "Profile refresh: skipped %d connected + %d offline-backoff "
+                "= %d Euler call(s) saved (refreshed %d).",
+                skipped_connected, skipped_offline,
+                skipped_connected + skipped_offline, count,
+            )
         return count
 
     # Live-status scraper config.

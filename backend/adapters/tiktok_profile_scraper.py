@@ -31,9 +31,18 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# WAF warnings rate-limiter. The scraper hits a WAF wall on most handles
+# during a global TikTok anti-bot wave, and logging "WAF detected on …"
+# every 60s per handle is pure log spam (a 200-char HTML preview each
+# time, identical body). Cache the last-warned timestamp per handle and
+# downgrade to DEBUG within the cooldown.
+_WAF_WARN_LAST: dict[str, float] = {}
+_WAF_WARN_COOLDOWN_S = 600.0  # 10 min
 
 # Modern profile URL ships this; live URL ships it too but the scope
 # structure is different (it doesn't include webapp.user-detail).
@@ -381,10 +390,25 @@ async def _fetch_profile_page(
     status = getattr(resp, "status_code", None)
     text = getattr(resp, "text", "") or ""
     if _detect_waf(text):
-        logger.warning(
-            "WAF detected on %s for @%s (status=%s len=%d); first 200 chars: %s",
-            url, handle, status, len(text), text[:200].replace("\n", " "),
-        )
+        # Rate-limit: WARNING once per handle per 10 min so a global
+        # WAF wave doesn't drown the log. Subsequent hits within the
+        # window go to DEBUG. The 200-char body preview only fires
+        # alongside the WARNING (the cheap reason field stays).
+        now = time.monotonic()
+        last = _WAF_WARN_LAST.get(handle, 0.0)
+        if (now - last) >= _WAF_WARN_COOLDOWN_S:
+            _WAF_WARN_LAST[handle] = now
+            logger.warning(
+                "WAF detected on %s for @%s (status=%s len=%d); first 200 chars: %s",
+                url, handle, status, len(text), text[:200].replace("\n", " "),
+            )
+        else:
+            logger.debug(
+                "WAF detected on %s for @%s (status=%s, suppressed; "
+                "next warn in %.0fs)",
+                url, handle, status,
+                _WAF_WARN_COOLDOWN_S - (now - last),
+            )
         if debug_sink is not None:
             debug_sink.append(_probe_debug(
                 url=url, status=status, body=text, reason="waf",

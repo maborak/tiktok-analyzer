@@ -516,6 +516,57 @@ async def _main(*, reconcile_seconds: int) -> None:
     # Set up logging before anything else so init failures are visible.
     _configure_logging()
 
+    # Sign-provider banner. Printed BEFORE any TikTokLive connect so you
+    # can immediately confirm which Euler key / local broker / session
+    # cookie this worker boot is using AND where it came from (DB
+    # typed-config vs legacy env). Uses plain print() instead of the
+    # structured logger so the line is impossible to miss even when the
+    # logger renders JSON.
+    try:
+        from adapters.tiktok_live_client import (
+            _read_sign_settings,
+            _read_sign_settings_from_db,
+        )
+        _sign_cfg = _read_sign_settings()
+        _db_vals = _read_sign_settings_from_db()
+    except Exception:
+        _sign_cfg, _db_vals = {}, {}
+
+    def _src(key: str) -> str:
+        v = _db_vals.get(key)
+        if v:
+            return "db"
+        from config import CONFIG as _C
+        return "env" if (_C.get(key) or "") else "default"
+
+    _provider = _sign_cfg.get("TIKTOK_SIGN_PROVIDER") or "euler"
+    _api_key = _sign_cfg.get("TIKTOK_EULER_API_KEY") or ""
+    if _api_key and len(_api_key) > 16:
+        _key_fp = f"{_api_key[:12]}…{_api_key[-8:]} (len={len(_api_key)})"
+    elif _api_key:
+        _key_fp = f"len={len(_api_key)}"
+    else:
+        _key_fp = "(NONE — anonymous, harsh rate limit)"
+    print("─" * 76, flush=True)
+    print(f"  Reconcile     : every {reconcile_seconds}s", flush=True)
+    print(f"  Sign provider : {_provider:<60} [{_src('TIKTOK_SIGN_PROVIDER')}]",
+          flush=True)
+    print(f"  Euler API key : {_key_fp:<60} [{_src('TIKTOK_EULER_API_KEY')}]",
+          flush=True)
+    if _provider == "session":
+        _sid = _sign_cfg.get("TIKTOK_SESSION_ID") or ""
+        _sid_fp = (
+            f"{_sid[:8]}…{_sid[-6:]} (len={len(_sid)})"
+            if _sid and len(_sid) > 16 else (f"len={len(_sid)}" if _sid else "(none)")
+        )
+        print(f"  Session cookie: {_sid_fp:<60} [{_src('TIKTOK_SESSION_ID')}]",
+              flush=True)
+    elif _provider == "local":
+        _local = _sign_cfg.get('TIKTOK_LOCAL_SIGN_URL') or '(default)'
+        print(f"  Local broker  : {_local:<60} [{_src('TIKTOK_LOCAL_SIGN_URL')}]",
+              flush=True)
+    print("─" * 76, flush=True)
+
     # The framework's structured logger drops asyncio's default
     # `exception` payload, so unhandled exceptions in pyee event
     # callbacks show up as a single "Exception in callback ..." line
@@ -532,8 +583,6 @@ async def _main(*, reconcile_seconds: int) -> None:
         else:
             sys.stderr.write(f"[asyncio uncaught] {context.get('message','')}\n")
     asyncio.get_running_loop().set_exception_handler(_asyncio_exc_handler)
-
-    logger.info("Starting TikTok listener worker (reconcile=%ds)", reconcile_seconds)
 
     from adapters.persistence.tiktok_persistence import TikTokPersistenceAdapter
     from adapters.tiktok_event_bus import EventPublisher
@@ -673,12 +722,22 @@ async def _main(*, reconcile_seconds: int) -> None:
             name="tiktok-state-tick",
         )
 
-    logger.info("Worker ready (pid=%d). Waiting for events / SIGINT.", os.getpid())
+    # Operator-facing status line. Prints one summary line every 30s
+    # so you can tell at a glance the worker is healthy WITHOUT
+    # grepping through framework debug noise.
+    status_task = asyncio.create_task(
+        _status_loop(service, stop, period=30),
+        name="tiktok-status",
+    )
+
+    logger.info("Worker ready (pid=%d).", os.getpid())
     try:
         await stop.wait()
     finally:
         logger.info("Shutting down listener pool...")
-        _tasks_to_cancel = [reconcile_task, db_heartbeat_task, stop_watcher_task]
+        _tasks_to_cancel = [
+            reconcile_task, db_heartbeat_task, stop_watcher_task, status_task,
+        ]
         if tick_task is not None:
             _tasks_to_cancel.append(tick_task)
         for t in _tasks_to_cancel:
@@ -707,6 +766,93 @@ async def _db_stop_watcher(service, stop: asyncio.Event, *, period: float = 1.0)
             continue
 
 
+async def _status_loop(service, stop: asyncio.Event, *, period: int = 30) -> None:
+    """Print one operator-facing status line per `period` seconds.
+
+    The only periodic line you should see in a healthy worker. Shape:
+
+        ⚙ STATUS  conn=29/30  sess=29  ingest=2104 ev/30s  last_event=2s
+                  errors=1 waf=3 (last 30s)
+
+    `conn`        — sessions in CONNECTED state (events actively flowing)
+    `sess`        — sessions held by this worker (CONNECTED + reconnecting)
+    `ingest`      — `tiktok_events` rows inserted in the last `period`s
+                    across ALL workers (cheap COUNT, indexed by ts)
+    `last_event`  — age of the most recent ingested event (any worker)
+    `errors`/`waf`— terminal + WAF rows from `tiktok_worker_log` in the
+                    last `period`s (so a quiet line still proves the
+                    pipeline is healthy at a glance)
+    """
+    from sqlalchemy import text as _text
+    loop = asyncio.get_running_loop()
+
+    def _query() -> dict[str, Any]:
+        # Single round-trip to the read engine. Two COUNTs + a MAX(ts)
+        # over the period window; the (ts DESC) index covers it.
+        with service._persistence._get_session() as s:
+            r = s.execute(_text("""
+              WITH e AS (
+                SELECT ts FROM tiktok_events
+                WHERE ts > NOW() - (:p || ' seconds')::interval
+              ),
+              w AS (
+                SELECT level FROM tiktok_worker_log
+                WHERE ts > NOW() - (:p || ' seconds')::interval
+                  AND event IN ('session_terminal','profile_probe_failed')
+              )
+              SELECT
+                (SELECT COUNT(*) FROM e)                     AS ingest,
+                (SELECT MAX(ts)  FROM tiktok_events)         AS last_evt,
+                (SELECT COUNT(*) FROM w
+                   WHERE level = 'error')                    AS errors,
+                (SELECT COUNT(*) FROM w
+                   WHERE level = 'warning')                  AS waf
+            """), {"p": period}).first()
+        return {
+            "ingest": int(r.ingest or 0),
+            "last_evt": r.last_evt,
+            "errors": int(r.errors or 0),
+            "waf": int(r.waf or 0),
+        }
+
+    # Skip the first immediate print so the boot banner and connect
+    # transitions appear before the first status snapshot.
+    try:
+        await asyncio.wait_for(stop.wait(), timeout=period)
+        return
+    except asyncio.TimeoutError:
+        pass
+
+    from datetime import datetime as _dt, timezone as _tz
+    while not stop.is_set():
+        try:
+            snap = service.get_listener_status_local()
+            conn = int(snap.get("connected_session_count") or 0)
+            sess = int(snap.get("active_session_count") or 0)
+            cap = int(getattr(service, "_worker_capacity", 30))
+            data = await loop.run_in_executor(None, _query)
+            last_evt = data["last_evt"]
+            if last_evt is not None:
+                if last_evt.tzinfo is None:
+                    last_evt = last_evt.replace(tzinfo=_tz.utc)
+                age_s = int((_dt.now(_tz.utc) - last_evt).total_seconds())
+                age_str = f"{age_s}s" if age_s < 60 else f"{age_s // 60}m{age_s % 60:02d}s"
+            else:
+                age_str = "never"
+            logger.info(
+                "⚙ STATUS  conn=%d/%d  sess=%d  ingest=%d ev/%ds  "
+                "last_event=%s  errors=%d  waf=%d",
+                conn, cap, sess, data["ingest"], period,
+                age_str, data["errors"], data["waf"],
+            )
+        except Exception:
+            logger.exception("status snapshot failed")
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=period)
+        except asyncio.TimeoutError:
+            continue
+
+
 async def _db_heartbeat_loop(service, stop: asyncio.Event, *, period: int = 5) -> None:
     """Periodically write the worker's listener-status snapshot into
     `tiktok_workers` (DB registry).
@@ -725,10 +871,15 @@ async def _db_heartbeat_loop(service, stop: asyncio.Event, *, period: int = 5) -
     tick = 0
     while not stop.is_set():
         tick += 1
-        logger.info("[hb] tick %d: building snapshot", tick)
+        # Heartbeat ticks fire every 5s × 4 log lines = ~2880 lines/hour
+        # of pure noise in normal operation. Dropped to DEBUG so they
+        # only appear when debugging the heartbeat path itself.
+        # Warnings/exceptions (stuck control executor, snapshot build
+        # failure) still log at INFO/WARNING so real issues surface.
+        logger.debug("[hb] tick %d: building snapshot", tick)
         try:
             snap = service.get_listener_status_local()
-            logger.info(
+            logger.debug(
                 "[hb] tick %d: snapshot built (sessions=%d)",
                 tick, snap.get("active_session_count", -1),
             )
@@ -736,7 +887,7 @@ async def _db_heartbeat_loop(service, stop: asyncio.Event, *, period: int = 5) -
             logger.exception("[hb] tick %d: snapshot build failed", tick)
             snap = None
         if snap is not None:
-            logger.info("[hb] tick %d: submitting UPDATE to control executor", tick)
+            logger.debug("[hb] tick %d: submitting UPDATE to control executor", tick)
             try:
                 await asyncio.wait_for(
                     loop.run_in_executor(
@@ -746,7 +897,7 @@ async def _db_heartbeat_loop(service, stop: asyncio.Event, *, period: int = 5) -
                     ),
                     timeout=period * 2,
                 )
-                logger.info("[hb] tick %d: UPDATE done", tick)
+                logger.debug("[hb] tick %d: UPDATE done", tick)
             except asyncio.TimeoutError:
                 logger.warning(
                     "[hb] tick %d: UPDATE timed out after %ds — control "
@@ -1346,16 +1497,44 @@ def _fmt_count(n: int) -> str:
 
 
 def _configure_logging() -> None:
-    """Stream INFO-and-above to stdout. The framework's main app uses a
-    structured logger; this worker keeps it simple — one process, one log."""
+    """Stream WORKER signal to stdout. One process, one log — the only
+    lines worth seeing in normal operation are:
+
+      - Boot banner (sign provider + Euler key fingerprint)
+      - Connect transitions  (`TikTokLive connected: @x room=…`)
+      - Terminal / error     (`@x terminal: AgeRestrictedError`)
+      - Reconcile deltas     (`Reconcile: claimed=[…] lost=[…]`)
+      - Periodic status line every 30s
+      - Shutdown
+
+    Everything else (http URLs, persistence chatter, framework init,
+    heartbeat ticks, lifecycle audit mirror) is silenced to WARNING+.
+    Set PHOVEU_BACKEND_TIKTOK_WORKER_VERBOSE=1 to re-enable for
+    debugging.
+    """
     if logging.getLogger().handlers:
-        # Already configured (e.g. when invoked via cli.py main).
         return
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s | %(message)s",
         datefmt="%H:%M:%S",
     )
+    verbose = os.getenv("PHOVEU_BACKEND_TIKTOK_WORKER_VERBOSE", "").strip().lower()
+    if verbose in ("1", "true", "yes", "on"):
+        return
+    # Silence the loudest framework + library loggers that don't
+    # produce operator-useful signal during normal operation. They
+    # still log WARNING/ERROR.
+    for noisy in (
+        "httpx",
+        "httpcore",
+        "TikTokLive",
+        "database_session",     # engine init banner repeated per process
+        "hook_manager",          # "HookManager configured with deps: [...]"
+        "tiktok_persistence",    # claim_subscriptions / record_event chatter
+        "redis_client",          # connection open/close
+    ):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 # Also expose the top-level command names that __init__.py re-exports.
