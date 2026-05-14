@@ -398,7 +398,10 @@ async def _fetch_profile_page(
         # Rate-limit: WARNING once per handle per 10 min so a global
         # WAF wave doesn't drown the log. Subsequent hits within the
         # window go to DEBUG. The 200-char body preview only fires
-        # alongside the WARNING (the cheap reason field stays).
+        # alongside the WARNING (the cheap reason field stays). On the
+        # SAME cadence we persist a `waf_detected` audit row to
+        # `tiktok_worker_log` so the dashboard can chart it instead
+        # of just having it as a console line.
         now = time.monotonic()
         last = _WAF_WARN_LAST.get(handle, 0.0)
         if (now - last) >= _WAF_WARN_COOLDOWN_S:
@@ -407,6 +410,26 @@ async def _fetch_profile_page(
                 "WAF detected on %s for @%s (status=%s len=%d); first 200 chars: %s",
                 url, handle, status, len(text), text[:200].replace("\n", " "),
             )
+            try:
+                from adapters.persistence.tiktok_persistence import (
+                    TikTokPersistenceAdapter,
+                )
+                # Standalone adapter — no shared instance available
+                # from inside a scraper helper. Construction is cheap
+                # (no DB hit until the INSERT) and `_get_session`
+                # uses the cached engine.
+                TikTokPersistenceAdapter(auto_init=False).append_worker_log(
+                    None,  # worker_id unknown in this context
+                    event="waf_detected",
+                    level="warning",
+                    handle=handle,
+                    detail={"url": url, "status": status},
+                )
+            except Exception:
+                logger.debug(
+                    "waf_detected audit-row insert failed (continuing).",
+                    exc_info=True,
+                )
         else:
             logger.debug(
                 "WAF detected on %s for @%s (status=%s, suppressed; "

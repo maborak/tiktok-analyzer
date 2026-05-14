@@ -2357,6 +2357,20 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                             diamonds = tiktok_event_hour_counts.diamonds + EXCLUDED.diamonds
         """), {"h": host_unique_id, "d": diamonds_delta})
 
+        # Per-event-type rollup. Same shape as the all-types counter
+        # above but keyed by event_type so the dashboard can chart
+        # "gifts per hour" / "comments per hour" without scanning the
+        # raw `tiktok_events` table. Only bumped when we know the
+        # type; synthetic events without one are skipped.
+        if event_type:
+            s.execute(text("""
+                INSERT INTO tiktok_event_type_hour_counts
+                    (host_unique_id, hour_bucket, type, n)
+                VALUES (:h, date_trunc('hour', NOW()), :t, 1)
+                ON CONFLICT (host_unique_id, hour_bucket, type)
+                  DO UPDATE SET n = tiktok_event_type_hour_counts.n + 1
+            """), {"h": host_unique_id, "t": event_type})
+
     # ── Phase 9B: state-cache mirror ─────────────────────────────────
     #
     # Every event that affects per-host runtime state translates into

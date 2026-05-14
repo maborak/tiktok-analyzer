@@ -875,8 +875,20 @@ async def _db_heartbeat_loop(service, stop: asyncio.Event, *, period: int = 5) -
     so the API status endpoint can fall back to the file when the DB
     is unreachable.
     """
+    from sqlalchemy import text
     loop = asyncio.get_running_loop()
     tick = 0
+    # `psutil.Process.cpu_percent()` returns the % since the previous
+    # call; first call always returns 0. Stash the proc handle so we
+    # don't pay the lookup on every tick.
+    _proc = None
+    try:
+        import psutil as _psutil
+        _proc = _psutil.Process(os.getpid())
+        _proc.cpu_percent(interval=None)  # prime baseline
+    except Exception:
+        _proc = None  # telemetry is best-effort
+
     while not stop.is_set():
         tick += 1
         # Heartbeat ticks fire every 5s × 4 log lines = ~2880 lines/hour
@@ -914,6 +926,51 @@ async def _db_heartbeat_loop(service, stop: asyncio.Event, *, period: int = 5) -
                 )
             except Exception:
                 logger.exception("[hb] tick %d: UPDATE raised", tick)
+
+            # Telemetry log row — captures the same snapshot the
+            # registry UPDATE just wrote, but as an APPEND. The
+            # registry row is overwritten on every tick (so "current
+            # state" reads are cheap) and the log preserves history
+            # so the dashboard can chart sessions / mem / CPU over
+            # time. Fire-and-forget; never block the heartbeat cadence
+            # on it.
+            try:
+                mem_rss_mb: int | None = None
+                cpu_pct: float | None = None
+                if _proc is not None:
+                    try:
+                        mem_rss_mb = int(_proc.memory_info().rss / (1024 * 1024))
+                    except Exception:
+                        pass
+                    try:
+                        cpu_pct = float(_proc.cpu_percent(interval=None))
+                    except Exception:
+                        pass
+                worker_id = getattr(service, "_worker_id", None)
+                payload = {
+                    "wid": int(worker_id) if worker_id else None,
+                    "sc": int(snap.get("active_session_count") or 0),
+                    "cc": int(snap.get("connected_session_count") or 0),
+                    "cap": int(getattr(service, "_worker_capacity", 0)),
+                    "mem": mem_rss_mb,
+                    "cpu": cpu_pct,
+                }
+
+                def _insert_hb() -> None:
+                    with service._persistence._get_session() as s:
+                        s.execute(text("""
+                          INSERT INTO tiktok_worker_heartbeat_log
+                            (worker_id, sessions_count, connected_count,
+                             capacity, memory_rss_mb, cpu_pct)
+                          VALUES (:wid, :sc, :cc, :cap, :mem, :cpu)
+                        """), payload)
+                        s.commit()
+                await asyncio.wait_for(
+                    loop.run_in_executor(None, _insert_hb),
+                    timeout=period,
+                )
+            except Exception:
+                logger.exception("heartbeat-log insert failed (continuing).")
         try:
             await asyncio.wait_for(stop.wait(), timeout=period)
         except asyncio.TimeoutError:
@@ -932,7 +989,10 @@ async def _reconcile_loop(service, stop: asyncio.Event, period: int) -> None:
     All of this is delegated to `service.reconcile_assignments()` —
     this loop is just the timer + crash log.
     """
+    import time as _time
     while not stop.is_set():
+        t0 = _time.monotonic()
+        result: dict[str, Any] | None = None
         try:
             # Best-effort stale-reaper. Cheap (one DB query); fine to
             # run on every tick from every worker.
@@ -956,6 +1016,39 @@ async def _reconcile_loop(service, stop: asyncio.Event, period: int) -> None:
                 )
         except Exception:
             logger.exception("Reconcile pass failed; will retry.")
+
+        # Telemetry row — one per pass, regardless of whether anything
+        # changed. Gives the dashboard a steady cadence to chart (tick
+        # frequency drift = control-plane stall) plus the delta when
+        # claims/lost are non-empty. The worker_log row is async via
+        # the service's audit helper so it doesn't extend the pass.
+        duration_ms = int((_time.monotonic() - t0) * 1000)
+        try:
+            detail: dict[str, Any] = {"duration_ms": duration_ms}
+            if result is not None:
+                detail["held"] = int(result.get("held") or 0)
+                claimed_list = result.get("claimed") or []
+                lost_list = result.get("lost") or []
+                if claimed_list:
+                    detail["claimed"] = list(claimed_list)
+                if lost_list:
+                    detail["lost"] = list(lost_list)
+                # Released slots (stuck-slot defense fired); only
+                # emit when non-empty so quiet rows stay tiny.
+                released = result.get("released_offline") or []
+                if released:
+                    detail["released"] = list(released)
+            else:
+                detail["error"] = True
+            # Use the service's existing audit helper so worker_id +
+            # ts are populated consistently with other worker_log rows.
+            service._log_worker(  # type: ignore[attr-defined]
+                "reconcile_pass",
+                level="info",
+                detail=detail,
+            )
+        except Exception:
+            logger.exception("reconcile_pass log write failed (continuing).")
         try:
             await asyncio.wait_for(stop.wait(), timeout=period)
         except asyncio.TimeoutError:
