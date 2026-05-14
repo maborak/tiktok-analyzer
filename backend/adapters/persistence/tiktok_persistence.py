@@ -2275,11 +2275,19 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                 self._state_apply_battle_progress(host_unique_id, payload)
             elif event_type == "battle_end":
                 self._state_apply_battle_end(host_unique_id)
-            elif event_type == "live_started":
+            # The TikTokLive client adapter emits the synthetic
+            # lifecycle events under historical names — `"connected"`
+            # for WS-up, `"disconnected"` / `"live_end"` for WS-down,
+            # `"viewer_count"` for the per-minute viewer refresh. The
+            # Phase 9 spec uses semantic names; accept both so the
+            # dispatcher matches whatever flows through `record_event`
+            # without forcing a rename in the listener (which would
+            # break downstream consumers of the legacy event stream).
+            elif event_type in ("live_started", "connected"):
                 self._state_apply_live_started(host_unique_id, payload)
-            elif event_type == "live_ended":
+            elif event_type in ("live_ended", "disconnected", "live_end"):
                 self._state_apply_live_ended(host_unique_id, payload)
-            elif event_type == "viewer_count_update":
+            elif event_type in ("viewer_count_update", "viewer_count"):
                 self._state_apply_viewer_count(host_unique_id, payload)
             else:
                 # Unknown / non-summary event. Don't publish, but bump
@@ -2391,7 +2399,12 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
     def _state_apply_viewer_count(
         self, host: str, payload: dict,
     ) -> None:
+        # The listener adapter emits viewer count under `"total"`; the
+        # Phase 9 spec named the field `"viewer_count"`. Accept either
+        # so the handler doesn't depend on a rename in the listener.
         viewer_count = payload.get("viewer_count")
+        if viewer_count is None:
+            viewer_count = payload.get("total")
         if viewer_count is None:
             return
         cached = self._state_cache.get(host)
