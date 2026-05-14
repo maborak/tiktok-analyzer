@@ -43,6 +43,7 @@ import {
 } from '@admin/services/configuration';
 import { TikTokSignConfigBody } from '@admin/pages/TikTokSignConfig';
 import { TikTokListenerStatusCard } from '@admin/components/TikTokListenerStatusCard';
+import { TikTokEulerHistory } from '@admin/components/TikTokEulerHistory';
 
 interface Section {
   /** Stable id, used as the section heading anchor. */
@@ -326,7 +327,15 @@ export function TikTokSettings() {
         </>
       )}
 
-      {subTab === 'sign-engine' && <TikTokSignConfigBody />}
+      {subTab === 'sign-engine' && (
+        <>
+          <TikTokSignConfigBody />
+          {/* Quota visibility — shows the live Euler-call histogram so
+              admins can correlate quota burn with worker activity (a
+              restart storm, a probe loop, etc.). */}
+          <TikTokEulerHistory />
+        </>
+      )}
 
       {subTab === 'worker' && <TikTokListenerStatusCard refreshKey={workerRefreshKey} />}
 

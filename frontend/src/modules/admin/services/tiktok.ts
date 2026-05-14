@@ -91,6 +91,27 @@ export interface TikTokEvent {
   match_id?: number | null;
 }
 
+export interface TikTokEulerHistorySeries {
+  endpoint: string;
+  api_key_fp: string;
+  counts: number[];
+}
+
+export interface TikTokEulerHistory {
+  since: string;
+  until: string;
+  bucket_minutes: number;
+  bins: string[];
+  endpoints: string[];
+  api_keys: string[];
+  series: TikTokEulerHistorySeries[];
+  totals: {
+    by_endpoint: Record<string, number>;
+    by_key: Record<string, number>;
+    all: number;
+  };
+}
+
 export type TikTokSignProvider = 'euler' | 'session' | 'local';
 
 export interface TikTokSignConfig {
@@ -909,6 +930,19 @@ export const tiktokApi = {
   },
 
   // Rooms + events
+
+  getEulerHistory(
+    opts?: { hours?: number; bucketMinutes?: number },
+  ): Promise<TikTokEulerHistory> {
+    return apiRequest({
+      method: 'GET',
+      url: `${BASE}/euler/history`,
+      params: {
+        hours: opts?.hours ?? 24,
+        bucket_minutes: opts?.bucketMinutes ?? 15,
+      },
+    });
+  },
 
   listHostRooms(
     handle: string,

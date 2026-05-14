@@ -410,6 +410,27 @@ def _apply_sign_client_state(
             )
 
 
+def attach_euler_logging(client: TikTokLiveClient) -> None:
+    """Install httpx event hooks so every Euler-signed request this
+    client makes lands in `tiktok_euler_call_log`. Captures the API
+    key fingerprint in effect at call time so subsequent key rotations
+    appear as a distinct series in the dashboard."""
+    try:
+        from adapters.tiktok_euler_call_sink import attach_to_client
+        cfg = _read_sign_settings()
+        raw_key = cfg.get("TIKTOK_EULER_API_KEY") or ""
+        if raw_key and len(raw_key) > 16:
+            fp = f"{raw_key[:12]}…{raw_key[-8:]} (len={len(raw_key)})"
+        elif raw_key:
+            fp = f"len={len(raw_key)}"
+        else:
+            fp = "(none)"
+        attach_to_client(client, api_key_fp=fp)
+    except Exception:
+        # Logging is non-fatal — never block a real listener connect.
+        logger.exception("Failed to attach Euler-call logging hook.")
+
+
 def _battle_user_payload(user_info: Any) -> dict[str, Any]:
     """Extract a JSON-safe payload from a BattleBaseUserInfo. The field
     layout is different from a regular User: nick_name (not nickname),
@@ -726,6 +747,7 @@ class TikTokLiveSession(TikTokLiveSessionPort):
                 _apply_sign_globals()
                 client = TikTokLiveClient(unique_id=handle)
                 _apply_sign_client_state(client, handle=handle)
+                attach_euler_logging(client)
                 self._wire_handlers(client)
                 self._client = client
                 # Try the room-id reuse fast path. If `tiktok_rooms`

@@ -730,6 +730,13 @@ async def _main(*, reconcile_seconds: int) -> None:
         name="tiktok-status",
     )
 
+    # Euler-call-log flusher. Drains the per-process buffer of
+    # captured Euler HTTP calls into `tiktok_euler_call_log` on a 5s
+    # cadence. Cheap: ~1 multi-VALUES INSERT per flush, runs in a
+    # thread executor so the loop stays free.
+    from adapters.tiktok_euler_call_sink import start_flusher_task
+    euler_log_task = start_flusher_task(stop)
+
     logger.info("Worker ready (pid=%d).", os.getpid())
     try:
         await stop.wait()
@@ -737,6 +744,7 @@ async def _main(*, reconcile_seconds: int) -> None:
         logger.info("Shutting down listener pool...")
         _tasks_to_cancel = [
             reconcile_task, db_heartbeat_task, stop_watcher_task, status_task,
+            euler_log_task,
         ]
         if tick_task is not None:
             _tasks_to_cancel.append(tick_task)

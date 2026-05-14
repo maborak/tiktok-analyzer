@@ -1763,6 +1763,116 @@ class TikTokService:
     def list_rooms_for_host(self, host_unique_id: str, *, limit: int = 50):
         return self._persistence.list_rooms_for_host(host_unique_id, limit=limit)
 
+    def get_euler_call_history(
+        self,
+        *,
+        hours: int = 24,
+        bucket_minutes: int = 15,
+    ) -> dict[str, Any]:
+        """Histogram of Euler-signed HTTP calls over the last `hours`,
+        bucketed into `bucket_minutes`-wide bins. Returns:
+
+            {
+              "since": iso, "until": iso, "bucket_minutes": N,
+              "bins":      [iso, ...]                 # ascending
+              "endpoints": ["webcast/fetch", "room/info", ...]
+              "api_keys":  ["euler_OG…UxNjkx (len=78)", ...]
+              "series":    [                          # per-endpoint per-key
+                 {"endpoint": "...", "api_key_fp": "...",
+                  "counts": [...]},                   # length == bins
+                 ...
+              ],
+              "totals":    {"by_endpoint": {...}, "by_key": {...}, "all": N}
+            }
+
+        Postgres-only — same constraint as the underlying table.
+        """
+        from datetime import datetime, timedelta, timezone
+        from sqlalchemy import text as _text
+
+        until = datetime.now(timezone.utc).replace(microsecond=0)
+        since = until - timedelta(hours=hours)
+        with self._persistence._get_session() as s:
+            # Two queries: (a) per-bin × endpoint × key counts,
+            # (b) headline totals. Both indexed by (ts DESC).
+            rows = s.execute(_text("""
+              SELECT
+                date_trunc('minute', ts)
+                  - MOD(EXTRACT(MINUTE FROM ts)::int, :bm) * INTERVAL '1 minute'
+                  AS bin,
+                endpoint,
+                api_key_fp,
+                COUNT(*) AS n
+              FROM tiktok_euler_call_log
+              WHERE ts >= :since AND ts < :until
+              GROUP BY 1, 2, 3
+              ORDER BY 1
+            """), {
+                "bm": bucket_minutes, "since": since, "until": until,
+            }).all()
+            totals = s.execute(_text("""
+              SELECT endpoint, api_key_fp, COUNT(*) AS n
+              FROM tiktok_euler_call_log
+              WHERE ts >= :since AND ts < :until
+              GROUP BY endpoint, api_key_fp
+            """), {"since": since, "until": until}).all()
+
+        # Build the bin grid up-front so empty bins render as 0,
+        # not gaps. Bucket alignment matches the GROUP BY truncation.
+        first_bin = since.replace(
+            minute=since.minute - (since.minute % bucket_minutes),
+            second=0, microsecond=0,
+        )
+        bins: list[datetime] = []
+        cur = first_bin
+        step = timedelta(minutes=bucket_minutes)
+        while cur < until:
+            bins.append(cur)
+            cur += step
+        bin_index: dict[datetime, int] = {b: i for i, b in enumerate(bins)}
+
+        # Series keyed by (endpoint, api_key_fp). Build cells with the
+        # bin grid as the canonical length, then list-ify at the end.
+        cells: dict[tuple[str, str], list[int]] = {}
+        endpoints: set[str] = set()
+        api_keys: set[str] = set()
+        for r in rows:
+            key = (r.endpoint, r.api_key_fp)
+            endpoints.add(r.endpoint)
+            api_keys.add(r.api_key_fp)
+            arr = cells.setdefault(key, [0] * len(bins))
+            idx = bin_index.get(r.bin)
+            if idx is not None:
+                arr[idx] = int(r.n or 0)
+
+        by_endpoint: dict[str, int] = {}
+        by_key: dict[str, int] = {}
+        total = 0
+        for r in totals:
+            n = int(r.n or 0)
+            by_endpoint[r.endpoint] = by_endpoint.get(r.endpoint, 0) + n
+            by_key[r.api_key_fp] = by_key.get(r.api_key_fp, 0) + n
+            total += n
+
+        series = [
+            {"endpoint": ep, "api_key_fp": fp, "counts": cells[(ep, fp)]}
+            for (ep, fp) in sorted(cells.keys())
+        ]
+        return {
+            "since": since.isoformat(),
+            "until": until.isoformat(),
+            "bucket_minutes": bucket_minutes,
+            "bins": [b.isoformat() for b in bins],
+            "endpoints": sorted(endpoints),
+            "api_keys": sorted(api_keys),
+            "series": series,
+            "totals": {
+                "by_endpoint": by_endpoint,
+                "by_key": by_key,
+                "all": total,
+            },
+        }
+
     def list_gifts(self, *, limit: int = 200):
         return self._persistence.list_gifts(limit=limit)
 

@@ -125,7 +125,12 @@ async def fetch_public_profile(handle: str) -> dict[str, Any]:
 
     # Lazy import keeps test surfaces small.
     from TikTokLive import TikTokLiveClient
+    from adapters.tiktok_live_client import attach_euler_logging
     client = TikTokLiveClient(unique_id=f"@{handle}")
+    # Probe calls consume Euler quota too — capture them in the same
+    # log so the dashboard shows the FULL Euler budget, not just the
+    # listener-pool slice.
+    attach_euler_logging(client)
 
     try:
         # ── Step 1: Euler — live status + identity (AUTHORITATIVE) ──

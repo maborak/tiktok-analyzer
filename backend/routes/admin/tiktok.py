@@ -427,6 +427,23 @@ async def aggregated_buckets(
     )
 
 
+@router.get("/euler/history")
+async def euler_call_history(
+    hours: int = Query(24, ge=1, le=168,
+                       description="Look-back window (1–168 hours)."),
+    bucket_minutes: int = Query(15, ge=1, le=120,
+                                description="Histogram bin width."),
+    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+):
+    """Histogram of Euler-signed HTTP calls — used by the Sign Engine
+    settings page to surface "what's burning my Euler quota?" with
+    hard numbers (per endpoint, per API key, per N-minute bin)."""
+    svc = _require_service()
+    return svc.get_euler_call_history(
+        hours=hours, bucket_minutes=bucket_minutes,
+    )
+
+
 @router.get("/lives/{handle}/calendar")
 async def host_calendar(
     handle: str,
