@@ -85,9 +85,21 @@ class TikTokPersistencePort(ABC):
         ...
 
     @abstractmethod
-    def room_totals(self, room_ids: list[int]) -> dict[int, dict[str, int]]:
+    def room_totals(
+        self,
+        room_ids: list[int],
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> dict[int, dict[str, int]]:
         """Returns `{room_id: {diamonds, matches, likes}}` rollups for
-        each input id. Drives per-broadcast metadata in the dropdown."""
+        each input id. Drives per-broadcast metadata in the dropdown.
+
+        Optional `since` / `until` clip gift / match / like
+        aggregations to a UTC window — used by the day-picker modal so
+        a broadcast that spans midnight only contributes the slice on
+        the selected day. Likes (cumulative counter) are reported as
+        the increment inside the window."""
 
     @abstractmethod
     def host_calendar(

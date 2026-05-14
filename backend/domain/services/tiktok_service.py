@@ -1742,12 +1742,23 @@ class TikTokService:
             "cells": cells,
         }
 
-    def room_totals(self, room_ids: list[int]) -> dict[int, dict[str, int]]:
+    def room_totals(
+        self,
+        room_ids: list[int],
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> dict[int, dict[str, int]]:
         """Pass-through to persistence — exposed on the service so the
         route doesn't reach into a private attribute. Used by the
-        broadcast dropdown to label each room with its diamonds /
-        matches / likes."""
-        return self._persistence.room_totals(room_ids)
+        broadcast dropdown + day-picker modal to label each room with
+        its diamonds / matches / likes; `since` + `until` clip those
+        totals to a calendar-day window so a broadcast that crossed
+        midnight only contributes the slice that landed on the picked
+        day."""
+        return self._persistence.room_totals(
+            room_ids, since=since, until=until,
+        )
 
     def list_rooms_for_host(self, host_unique_id: str, *, limit: int = 50):
         return self._persistence.list_rooms_for_host(host_unique_id, limit=limit)

@@ -1386,15 +1386,54 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
               // Multiple broadcasts on this day → open the picker
               // with everything selected by default. The user can
               // narrow with checkboxes or use Select all / none.
+              // Stash the bounds first so cancel cleanly drops them.
+              setDayPickerBounds(bounds);
               setDayPicker({
                 date,
                 rooms: dayRooms,
                 selected: new Set(dayRooms.map((r) => r.room_id)),
               });
-              // Stash the bounds — when the user confirms picker we
-              // promote them onto `dayWindow`. Keeping it on the
-              // dayPicker state means cancel cleanly drops them.
-              setDayPickerBounds(bounds);
+              // Refetch with day bounds so the per-row chip totals
+              // (diamonds / matches / likes) reflect only the slice
+              // on the picked day — same window the chart will use
+              // after the user confirms. A broadcast spanning
+              // midnight typically shows >90% of its activity on one
+              // side, so the unclipped chip can be off by an order
+              // of magnitude. The legacy chips are kept until the
+              // refetch resolves so the modal renders immediately.
+              (async () => {
+                try {
+                  const clipped = await tiktokApi.listHostRooms(
+                    handle, 200,
+                    { since: bounds.since, until: bounds.until },
+                  );
+                  const byId = new Map(clipped.map((r) => [r.room_id, r]));
+                  setDayPicker((p) => {
+                    if (!p) return p;
+                    return {
+                      ...p,
+                      rooms: p.rooms.map((r) => {
+                        const c = byId.get(r.room_id);
+                        if (!c) return r;
+                        // Replace only the rollup fields; keep the
+                        // start / end timestamps from the original
+                        // (full-broadcast) row so the time labels
+                        // continue to show the broadcast's actual
+                        // span, not the day-clipped one.
+                        return {
+                          ...r,
+                          diamonds: c.diamonds ?? r.diamonds,
+                          matches: c.matches ?? r.matches,
+                          likes: c.likes ?? r.likes,
+                        };
+                      }),
+                    };
+                  });
+                } catch {
+                  // Network blip → leave the unclipped chips up; the
+                  // chart will still clip when the user confirms.
+                }
+              })();
             }}
           />
         </div>
@@ -2094,6 +2133,21 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
                   : null;
               const startLabel = fmtHM(start, tz);
               const endLabel = fmtHM(end, tz);
+              // Day-suffix when start / end fall outside the picked
+              // calendar day. Without these markers a row like
+              // "23:22 → 01:54" looks like a same-day broadcast when
+              // it actually started yesterday or ended tomorrow.
+              const pickedYmd = dayPicker.date;
+              const startYmd = start ? dateKeyInZone(start.toISOString(), tz) : null;
+              const endYmd = end ? dateKeyInZone(end.toISOString(), tz) : null;
+              const startDayDelta =
+                startYmd && startYmd !== pickedYmd
+                  ? ymdDelta(startYmd, pickedYmd)
+                  : 0;
+              const endDayDelta =
+                endYmd && endYmd !== pickedYmd
+                  ? ymdDelta(endYmd, pickedYmd)
+                  : 0;
               const durMs =
                 start && end ? Math.max(0, end.getTime() - start.getTime()) : 0;
               const durMin = Math.floor(durMs / 60000);
@@ -2125,7 +2179,33 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
                   />
                   <div className="min-w-0 flex-1">
                     <div className="font-medium text-sm">
-                      {startLabel} → {endLabel}
+                      {startLabel}
+                      {startDayDelta !== 0 && (
+                        <span
+                          className="ml-1 text-[9px] font-mono text-amber-700 dark:text-amber-300 align-super"
+                          title={
+                            startDayDelta < 0
+                              ? `Started ${-startDayDelta} day(s) before this calendar day`
+                              : `Started ${startDayDelta} day(s) after this calendar day`
+                          }
+                        >
+                          {startDayDelta > 0 ? `+${startDayDelta}d` : `${startDayDelta}d`}
+                        </span>
+                      )}
+                      <span className="mx-1">→</span>
+                      {endLabel}
+                      {endDayDelta !== 0 && (
+                        <span
+                          className="ml-1 text-[9px] font-mono text-amber-700 dark:text-amber-300 align-super"
+                          title={
+                            endDayDelta > 0
+                              ? `Ended ${endDayDelta} day(s) after this calendar day`
+                              : `Ended ${-endDayDelta} day(s) before this calendar day`
+                          }
+                        >
+                          {endDayDelta > 0 ? `+${endDayDelta}d` : `${endDayDelta}d`}
+                        </span>
+                      )}
                       <span className="ml-2 text-[10px] font-mono text-gray-500">
                         {durMin > 0
                           ? durMin >= 60
@@ -2205,6 +2285,20 @@ function sumBy(o: Record<string, number>): number {
   let s = 0;
   for (const k in o) s += o[k];
   return s;
+}
+
+/** Signed delta in days between two YYYY-MM-DD strings. Used by the
+ *  day-picker modal to render a `+1d` / `-1d` suffix next to start /
+ *  end times that fall on a different calendar day than the one the
+ *  user clicked — without that hint a cross-midnight row labelled
+ *  "23:22 → 01:54" looks like a same-day broadcast even though the
+ *  end timestamp is the NEXT day. Both inputs must be parseable by
+ *  Date.parse; non-finite results collapse to 0. */
+function ymdDelta(fromYmd: string, toYmd: string): number {
+  const a = Date.parse(`${fromYmd}T00:00:00Z`);
+  const b = Date.parse(`${toYmd}T00:00:00Z`);
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return 0;
+  return Math.round((a - b) / 86_400_000);
 }
 
 // Treat a room as ended when its last_seen_at is older than 5 minutes —

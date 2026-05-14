@@ -910,11 +910,23 @@ export const tiktokApi = {
 
   // Rooms + events
 
-  listHostRooms(handle: string, limit = 50): Promise<TikTokRoom[]> {
+  listHostRooms(
+    handle: string,
+    limit = 50,
+    opts?: { since?: string; until?: string },
+  ): Promise<TikTokRoom[]> {
+    // `since` / `until` are optional UTC ISO bounds. When set, the
+    // backend clips diamonds / matches / likes totals to that window
+    // — the day-picker modal passes the calendar-day bounds so a
+    // broadcast that crosses midnight only reports the slice on the
+    // selected day instead of its full-broadcast total.
+    const params: Record<string, string | number> = { limit };
+    if (opts?.since) params.since = opts.since;
+    if (opts?.until) params.until = opts.until;
     return apiRequest({
       method: 'GET',
       url: `${BASE}/lives/${encodeURIComponent(handle)}/rooms`,
-      params: { limit },
+      params,
     });
   },
 

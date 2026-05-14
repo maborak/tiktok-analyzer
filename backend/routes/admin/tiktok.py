@@ -455,6 +455,19 @@ async def host_calendar(
 async def list_host_rooms(
     handle: str,
     limit: int = Query(50, ge=1, le=200),
+    since: Optional[datetime] = Query(
+        None,
+        description=(
+            "Optional UTC lower bound for diamonds / matches / likes "
+            "totals. The day-picker modal passes this so a broadcast "
+            "that spanned midnight only contributes the slice on the "
+            "selected calendar day."
+        ),
+    ),
+    until: Optional[datetime] = Query(
+        None,
+        description="Optional UTC upper bound for totals (see `since`).",
+    ),
     _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
 ):
     svc = _require_service()
@@ -462,8 +475,13 @@ async def list_host_rooms(
     rooms = svc.list_rooms_for_host(handle, limit=limit)
     # Per-room rollups (diamonds / matches / likes) so the dropdown
     # selector can show them inline. One extra round-trip; the SQL
-    # itself is a single CTE join scoped to this host's rooms.
-    totals = svc.room_totals([r.room_id for r in rooms]) if rooms else {}
+    # itself is a single CTE join scoped to this host's rooms. When
+    # `since` / `until` are provided, totals are clipped to that
+    # window so the modal chips match the day-aggregate chart.
+    totals = (
+        svc.room_totals([r.room_id for r in rooms], since=since, until=until)
+        if rooms else {}
+    )
     return [
         RoomResponse(
             room_id=str(r.room_id),

@@ -543,7 +543,13 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
             )
             return [_room_to_dataclass(r) for r in q.all()]
 
-    def room_totals(self, room_ids: list[int]) -> dict[int, dict[str, int]]:
+    def room_totals(
+        self,
+        room_ids: list[int],
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> dict[int, dict[str, int]]:
         """Per-room rollup of `diamonds`, `matches`, and the room's
         peak `likes` counter (from TikTok's cumulative LikeEvent.total).
         Returns `{room_id: {diamonds, matches, likes}}` for every input
@@ -552,6 +558,16 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
         Drives the metadata shown next to each broadcast in the
         live-detail page's dropdown selector — same idea as the
         per-day rollup in `host_calendar`, but per-room.
+
+        Optional `since` / `until` clip the gift / match / like
+        aggregations to a UTC window so the day-picker modal can show
+        only the slice on the selected calendar day instead of the
+        full broadcast total. Likes are special: the lib publishes a
+        room-cumulative `total`, so when clipped we report the
+        DIFFERENCE between MAX(total) inside the window and the
+        nearest sample BEFORE the window — that yields the like
+        increment that happened during the slice, matching what the
+        chart will show.
         """
         out: dict[int, dict[str, int]] = {
             int(rid): {"diamonds": 0, "matches": 0, "likes": 0}
@@ -570,33 +586,57 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                              ) AS diamonds
                       FROM tiktok_events
                       WHERE type = 'gift' AND room_id = ANY(:ids)
+                        AND (CAST(:since AS timestamptz) IS NULL OR ts >= CAST(:since AS timestamptz))
+                        AND (CAST(:until AS timestamptz) IS NULL OR ts <= CAST(:until AS timestamptz))
                       GROUP BY room_id
                     ),
                     matches AS (
                       SELECT room_id, COUNT(*) AS matches
-                      FROM tiktok_matches WHERE room_id = ANY(:ids)
+                      FROM tiktok_matches
+                      WHERE room_id = ANY(:ids)
+                        AND (CAST(:since AS timestamptz) IS NULL OR started_at >= CAST(:since AS timestamptz))
+                        AND (CAST(:until AS timestamptz) IS NULL OR started_at <= CAST(:until AS timestamptz))
                       GROUP BY room_id
                     ),
-                    likes AS (
-                      -- TikTok's LikeEvent.total is a room-cumulative
-                      -- counter (matches the on-screen heart count).
-                      -- MAX picks the latest sample, which is the
-                      -- final tally when the room ended.
+                    likes_window AS (
+                      -- Cumulative counter: clip by reporting
+                      -- (MAX inside window) − (last sample at-or-before
+                      -- window start). When no window is set this
+                      -- collapses to plain MAX (legacy behaviour).
                       SELECT room_id,
-                             MAX(COALESCE(NULLIF(payload->>'total','')::bigint, 0)) AS likes
-                      FROM tiktok_events
+                             MAX(COALESCE(NULLIF(payload->>'total','')::bigint, 0)) AS max_in,
+                             (SELECT COALESCE(NULLIF(t.payload->>'total','')::bigint, 0)
+                                FROM tiktok_events t
+                                WHERE t.room_id = e.room_id AND t.type = 'like'
+                                  AND (CAST(:since AS timestamptz) IS NULL
+                                       OR t.ts < CAST(:since AS timestamptz))
+                                ORDER BY t.ts DESC LIMIT 1)     AS baseline
+                      FROM tiktok_events e
                       WHERE type = 'like' AND room_id = ANY(:ids)
+                        AND (CAST(:since AS timestamptz) IS NULL OR ts >= CAST(:since AS timestamptz))
+                        AND (CAST(:until AS timestamptz) IS NULL OR ts <= CAST(:until AS timestamptz))
                       GROUP BY room_id
                     )
                     SELECT r.room_id,
                            COALESCE(g.diamonds, 0)  AS diamonds,
                            COALESCE(m.matches, 0)   AS matches,
-                           COALESCE(l.likes, 0)     AS likes
+                           CASE
+                             WHEN CAST(:since AS timestamptz) IS NULL
+                               THEN COALESCE(lw.max_in, 0)
+                             ELSE GREATEST(
+                               0,
+                               COALESCE(lw.max_in, 0) - COALESCE(lw.baseline, 0)
+                             )
+                           END                         AS likes
                     FROM unnest(CAST(:ids AS bigint[])) AS r(room_id)
-                    LEFT JOIN gifts   g ON g.room_id   = r.room_id
-                    LEFT JOIN matches m ON m.room_id   = r.room_id
-                    LEFT JOIN likes   l ON l.room_id   = r.room_id
-                """), {"ids": [int(x) for x in room_ids]}).mappings().all()
+                    LEFT JOIN gifts        g  ON g.room_id  = r.room_id
+                    LEFT JOIN matches      m  ON m.room_id  = r.room_id
+                    LEFT JOIN likes_window lw ON lw.room_id = r.room_id
+                """), {
+                    "ids": [int(x) for x in room_ids],
+                    "since": since,
+                    "until": until,
+                }).mappings().all()
                 for r in rows:
                     out[int(r["room_id"])] = {
                         "diamonds": int(r["diamonds"] or 0),
