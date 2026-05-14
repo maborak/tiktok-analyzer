@@ -814,9 +814,71 @@ export function TikTokGifterModal({
   );
 
   // Embedded mode: caller renders the wrapping Modal + close chrome.
-  // We return just the body so the unified shell can place it inside
-  // its own tab pane.
-  if (embedded) return bodyContent;
+  // We return the body plus an action footer — when this modal sits
+  // inside `TikTokGifterDetailModal`'s tabbed shell, the shell's own
+  // outer footer is Close-only, so the Favourites + Add-to-monitor
+  // actions need to land here or operators can't reach them.
+  // (Suppressed in `readOnly` / public mode so anonymous viewers
+  // don't see admin-only affordances.)
+  if (embedded) {
+    return (
+      <>
+        {/* Same `TikTokAddLiveModal` mount as the non-embedded
+            branch — the wrapper shell sits above us, and the add
+            modal needs to stack above THAT, so rendering it as a
+            sibling here works because React portals to body. */}
+        {!readOnly && uniqueId && (
+          <TikTokAddLiveModal
+            isOpen={addMonitorOpen}
+            handle={uniqueId}
+            onCancel={() => setAddMonitorOpen(false)}
+            onConfirm={confirmAddMonitor}
+          />
+        )}
+        {bodyContent}
+        {!readOnly && (
+          <div className="flex items-center justify-end gap-2 pt-3 mt-3 border-t border-gray-200/60 dark:border-white/10">
+            <Button
+              variant={isFavorite ? 'primary' : 'ghost'}
+              onClick={onToggleFavorite}
+              disabled={favoriteBusy || !userId}
+              title={
+                isFavorite
+                  ? 'Remove from favourites — stops live alerts when they gift'
+                  : 'Add to favourites — fires a live alert whenever they gift in any tracked broadcast'
+              }
+            >
+              <Star className={`w-4 h-4 mr-1.5 ${isFavorite ? 'fill-current' : ''}`} />
+              {isFavorite ? 'Favourited' : 'Add to Favourites'}
+            </Button>
+            {uniqueId && (
+              isMonitored ? (
+                <Link
+                  to="/admin/tiktok/$handle"
+                  params={{ handle: uniqueId }}
+                  onClick={onClose}
+                  className="inline-flex items-center gap-1 px-3 py-2 rounded text-xs font-mono uppercase tracking-wider bg-emerald-100 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-500/30 hover:bg-emerald-200 dark:hover:bg-emerald-500/25 transition-colors"
+                  title="Open this creator's live page"
+                >
+                  <Radio className="w-3.5 h-3.5" />
+                  ✓ Monitoring
+                </Link>
+              ) : (
+                <Button
+                  variant="ghost"
+                  onClick={() => setAddMonitorOpen(true)}
+                  title="Start monitoring this creator's lives"
+                >
+                  <Radio className="w-4 h-4 mr-1.5" />
+                  Add to monitor
+                </Button>
+              )
+            )}
+          </div>
+        )}
+      </>
+    );
+  }
 
   return (
     <>

@@ -686,7 +686,36 @@ export function TikTokCommonGifterDetailModal({
     </>
   );
 
-  if (embedded) return body;
+  // Embedded mode: the wrapper (`TikTokGifterDetailModal`) renders its
+  // own modal + Close button; we lose the standalone footer. Append
+  // the Favourites action inline so admins keep the affordance when
+  // viewing this content via the Profile tab of the unified shell.
+  if (embedded) {
+    return (
+      <>
+        {body}
+        {isAdmin && (
+          <div className="flex items-center justify-end gap-2 pt-3 mt-3 border-t border-gray-200/60 dark:border-white/10">
+            <Button
+              variant={isFavorite ? 'primary' : 'ghost'}
+              onClick={onToggleFavorite}
+              disabled={favoriteBusy || !userId}
+              title={
+                isFavorite
+                  ? 'Remove from favourites — stops live alerts when they gift'
+                  : 'Add to favourites — fires a live alert whenever they gift in any tracked broadcast'
+              }
+            >
+              <Star
+                className={`w-4 h-4 mr-1.5 ${isFavorite ? 'fill-current' : ''}`}
+              />
+              {isFavorite ? 'Favourited' : 'Add to Favourites'}
+            </Button>
+          </div>
+        )}
+      </>
+    );
+  }
 
   return (
     <Modal
