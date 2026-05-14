@@ -85,104 +85,187 @@ def list_lives_cmd() -> None:
     asyncio.run(_list_lives())
 
 
-@tiktok_group.command(name="gaps")
+@tiktok_group.command(name="downtime")
 @click.option(
-    "--hours", type=int, default=96, show_default=True,
-    help="Look-back window in hours.",
+    "--days", type=int, default=1, show_default=True,
+    help="How many past days to summarize (1 = today only).",
 )
 @click.option(
-    "--min-gap-s", type=int, default=120, show_default=True,
-    help="Minimum gap length (seconds) to report.",
+    "--tz", "tz_name", type=str, default="America/New_York", show_default=True,
+    help="Timezone for the daily boundary.",
 )
 @click.option(
-    "--min-hosts", type=int, default=3, show_default=True,
-    help="Only report gap-start minutes affecting at least this many hosts (treat as a global outage).",
+    "--min-window-s", type=int, default=120, show_default=True,
+    help="Ignore outages shorter than this (drops normal between-event jitter).",
 )
 @click.option(
-    "--host", "host_filter", type=str, default=None,
-    help="Only report gaps for one specific host (overrides --min-hosts).",
+    "--show-windows/--no-show-windows", default=True, show_default=True,
+    help="Also list every outage window beyond the daily totals.",
 )
-def gaps_cmd(hours: int, min_gap_s: int, min_hosts: int, host_filter: str | None) -> None:
-    """Detect event-flow gaps in TikTok ingestion.
+def downtime_cmd(days: int, tz_name: str, min_window_s: int, show_windows: bool) -> None:
+    """How much data did we MISS today? (and previous days)
 
-    Finds windows where an active room produced no events for at least
-    --min-gap-s seconds. With --min-hosts >= 2 the report rolls up by
-    gap-start minute so simultaneous outages across many hosts (worker
-    restart, network blip) surface as a single row.
+    A minute counts as "down" only when at least one tracked room was
+    OPEN (i.e. some host was live) AND we ingested zero events that
+    minute. The "rooms were open" gate avoids counting low-traffic
+    hours where no host was streaming.
 
-    Useful when investigating diamond discrepancies — visible
-    score-update jumps after a gap are TikTok's WS replay catching the
-    state up, but the individual gift events that produced the score
-    are lost forever.
+    Daily rollup uses the per-day boundary in --tz so "today" matches
+    what shows up in the UI for a US-east admin. Outages straddling
+    midnight are credited to the day each minute falls in.
+
+    Examples:
+        python cli.py system tiktok downtime              # today, ET
+        python cli.py system tiktok downtime --days 4
+        python cli.py system tiktok downtime --tz UTC --days 7
     """
     from database.core.connection import create_database_engine
     from sqlalchemy import text as _text
     engine = create_database_engine()
     with engine.connect() as c:
-        if host_filter:
-            rows = c.execute(_text("""
-              WITH flow AS (
-                SELECT e.room_id, r.host_unique_id AS host, e.ts,
-                       LAG(e.ts) OVER (
-                         PARTITION BY e.room_id ORDER BY e.ts
-                       ) AS prev_ts
-                FROM tiktok_events e
-                JOIN tiktok_rooms r ON r.room_id = e.room_id
-                WHERE e.ts > NOW() - (:hrs || ' hours')::interval
-                  AND r.host_unique_id = :h
-                  AND e.type IN ('gift','comment','like','join',
-                                 'match_update','viewer_count')
-              )
-              SELECT host, room_id, prev_ts, ts,
-                     EXTRACT(EPOCH FROM (ts - prev_ts))::int AS gap_s
-              FROM flow
-              WHERE prev_ts IS NOT NULL
-                AND EXTRACT(EPOCH FROM (ts - prev_ts)) > :gs
-              ORDER BY gap_s DESC
-              LIMIT 50
-            """), {"hrs": hours, "gs": min_gap_s, "h": host_filter}).fetchall()
-            click.echo(f"Gaps for @{host_filter} (last {hours}h, ≥{min_gap_s}s):")
-            click.echo(f"{'prev_ts':<32} | {'ts':<32} | {'gap_min':>7} | room")
-            for r in rows:
-                click.echo(
-                    f"{str(r.prev_ts):<32} | {str(r.ts):<32} | "
-                    f"{r.gap_s/60:>7.1f} | {r.room_id}"
-                )
-            return
+        # Per-minute series, classified into:
+        #   - "active"  : at least one room was open this minute
+        #                 (first_seen_at <= m < COALESCE(ended_at, last_seen_at + 5m))
+        #   - "events_n": events ingested this minute
+        # "Down" minute = active > 0 AND events_n == 0.
         rows = c.execute(_text("""
-          WITH flow AS (
-            SELECT e.room_id, r.host_unique_id AS host, e.ts,
-                   LAG(e.ts) OVER (
-                     PARTITION BY e.room_id ORDER BY e.ts
-                   ) AS prev_ts
-            FROM tiktok_events e
-            JOIN tiktok_rooms r ON r.room_id = e.room_id
-            WHERE e.ts > NOW() - (:hrs || ' hours')::interval
-              AND e.type IN ('gift','comment','like','join',
-                             'match_update','viewer_count')
+          WITH bounds AS (
+            SELECT date_trunc('day', NOW() AT TIME ZONE :tz)
+                   - (:days - 1) * INTERVAL '1 day' AS start_local,
+                   date_trunc('minute', NOW() AT TIME ZONE :tz) AS end_local
+          ),
+          grid AS (
+            SELECT generate_series(
+                     (SELECT start_local AT TIME ZONE :tz FROM bounds),
+                     (SELECT end_local   AT TIME ZONE :tz FROM bounds),
+                     INTERVAL '1 minute'
+                   ) AS minute_utc
+          ),
+          events_per_min AS (
+            SELECT date_trunc('minute', ts) AS minute_utc,
+                   COUNT(*) AS n
+            FROM tiktok_events
+            WHERE ts >= (SELECT start_local AT TIME ZONE :tz FROM bounds)
+              AND ts <  (SELECT end_local   AT TIME ZONE :tz FROM bounds)
+                       + INTERVAL '1 minute'
+            GROUP BY 1
+          ),
+          -- For each room, expand its open interval into the minute
+          -- grid. `ended_at` is NULL for rooms that never got a clean
+          -- end event; fall back to `last_seen_at + 5 min` (the same
+          -- 5-min liveness rule used elsewhere).
+          rooms_active AS (
+            SELECT g.minute_utc, COUNT(*) AS n_rooms
+            FROM grid g
+            JOIN tiktok_rooms r
+              ON r.first_seen_at <= g.minute_utc
+             AND COALESCE(r.ended_at, r.last_seen_at + INTERVAL '5 minutes')
+                 > g.minute_utc
+            WHERE r.first_seen_at <
+                  (SELECT end_local AT TIME ZONE :tz FROM bounds) + INTERVAL '1 day'
+              AND COALESCE(r.ended_at, r.last_seen_at) >=
+                  (SELECT start_local AT TIME ZONE :tz FROM bounds) - INTERVAL '1 day'
+            GROUP BY g.minute_utc
           )
-          SELECT date_trunc('minute', prev_ts) AS gap_start_min,
-                 COUNT(DISTINCT host) AS n_hosts_affected,
-                 AVG(EXTRACT(EPOCH FROM (ts - prev_ts)))::int AS avg_gap_s,
-                 MAX(EXTRACT(EPOCH FROM (ts - prev_ts)))::int AS max_gap_s
-          FROM flow
-          WHERE prev_ts IS NOT NULL
-            AND EXTRACT(EPOCH FROM (ts - prev_ts)) > :gs
-          GROUP BY 1
-          HAVING COUNT(DISTINCT host) >= :mh
-          ORDER BY n_hosts_affected DESC, avg_gap_s DESC
-          LIMIT 30
-        """), {"hrs": hours, "gs": min_gap_s, "mh": min_hosts}).fetchall()
+          SELECT g.minute_utc,
+                 COALESCE(e.n, 0)       AS n_events,
+                 COALESCE(ra.n_rooms, 0) AS n_active_rooms,
+                 (g.minute_utc AT TIME ZONE :tz)::date AS local_day
+          FROM grid g
+          LEFT JOIN events_per_min e USING (minute_utc)
+          LEFT JOIN rooms_active ra USING (minute_utc)
+          ORDER BY g.minute_utc
+        """), {"tz": tz_name, "days": days}).fetchall()
+
+    if not rows:
+        click.echo("No data in window.")
+        return
+
+    # A minute is "down" when at least one room was open AND zero
+    # events landed. "Live minutes" = minutes when at least one room
+    # was open — used as the denominator so the percentage means "of
+    # the time we should have been ingesting, what fraction did we
+    # actually capture".
+    def _is_down(r) -> bool:
+        return r.n_active_rooms > 0 and r.n_events == 0
+
+    from datetime import timedelta as _td
+    windows: list[tuple] = []  # (start_utc, end_utc, minutes, peak_rooms)
+    cur_start = None
+    cur_count = 0
+    cur_peak_rooms = 0
+    prev_min = None
+    for r in rows:
+        if _is_down(r):
+            if cur_start is None:
+                cur_start = r.minute_utc
+                cur_count = 1
+                cur_peak_rooms = r.n_active_rooms
+            else:
+                cur_count += 1
+                cur_peak_rooms = max(cur_peak_rooms, r.n_active_rooms)
+            prev_min = r.minute_utc
+        else:
+            if cur_start is not None and cur_count * 60 >= min_window_s:
+                windows.append((cur_start, prev_min + _td(minutes=1),
+                               cur_count, cur_peak_rooms))
+            cur_start = None
+            cur_count = 0
+            cur_peak_rooms = 0
+    if cur_start is not None and cur_count * 60 >= min_window_s:
+        windows.append((cur_start, prev_min + _td(minutes=1),
+                       cur_count, cur_peak_rooms))
+
+    from collections import defaultdict
+    down_by_day: dict[str, int] = defaultdict(int)
+    live_by_day: dict[str, int] = defaultdict(int)
+    total_by_day: dict[str, int] = defaultdict(int)
+    for r in rows:
+        total_by_day[str(r.local_day)] += 1
+        if r.n_active_rooms > 0:
+            live_by_day[str(r.local_day)] += 1
+        if _is_down(r):
+            down_by_day[str(r.local_day)] += 1
+
+    def _fmt(m: int) -> str:
+        if m >= 60:
+            return f"{m // 60}h {m % 60:02d}m"
+        return f"{m} min"
+
+    click.echo(f"\nIngestion downtime — {tz_name}, last {days} day(s)\n")
+    click.echo(f"  {'Day':<12} | {'Down':>9} | {'Live time':>11} | {'Capture':>8}")
+    click.echo("  " + "-" * 50)
+    for day in sorted(total_by_day.keys()):
+        down = down_by_day.get(day, 0)
+        live = live_by_day.get(day, 0)
+        capture = 100.0 * (live - down) / live if live else 100.0
         click.echo(
-            f"Global outage windows (last {hours}h, ≥{min_gap_s}s gap, "
-            f"≥{min_hosts} hosts):"
+            f"  {day:<12} | {_fmt(down):>9} | {_fmt(live):>11} | "
+            f"{capture:>6.2f}%"
         )
-        click.echo(f"{'gap_start':<26} | hosts | avg_min | max_min")
-        for r in rows:
-            click.echo(
-                f"{str(r.gap_start_min):<26} | {r.n_hosts_affected:>5} | "
-                f"{r.avg_gap_s/60:>7.1f} | {r.max_gap_s/60:>7.1f}"
-            )
+    total_down = sum(down_by_day.values())
+    total_live = sum(live_by_day.values())
+    overall = 100.0 * (total_live - total_down) / total_live if total_live else 100.0
+    click.echo("  " + "-" * 50)
+    click.echo(
+        f"  {'TOTAL':<12} | {_fmt(total_down):>9} | "
+        f"{_fmt(total_live):>11} | {overall:>6.2f}%"
+    )
+    click.echo(
+        "\n  Capture % = (live minutes − down minutes) / live minutes."
+        "\n  'Down' counts only minutes when ≥1 room was open AND we got 0 events."
+    )
+
+    if not show_windows or not windows:
+        return
+    click.echo(f"\nOutage windows (≥{min_window_s}s, rooms open at the time):")
+    click.echo(f"  {'Start (UTC)':<22} | {'End (UTC)':<22} | {'Duration':>10} | rooms")
+    click.echo("  " + "-" * 70)
+    for start, end, mins, peak in windows:
+        click.echo(
+            f"  {str(start):<22} | {str(end):<22} | "
+            f"{_fmt(mins):>10} | {peak}"
+        )
 
 
 @tiktok_group.command(name="debug")
