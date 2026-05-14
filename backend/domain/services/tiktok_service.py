@@ -192,6 +192,35 @@ class TikTokService:
     OFFLINE_RELEASE_HYSTERESIS_S = 300.0   # 5 min
     LIVE_STATUS_FRESHNESS_S      = 180.0   # 3 min
 
+    # Stuck-slot defenses (2026-05-14) — see `backend/docs/WORKER.md` §3.
+    # The probe-based recycle above gates on `is_live ∈ {True, False, None}`
+    # where `None` means "probe was inconclusive" (WAF, 403, missing SIGI).
+    # Conservative-on-None protects against transient probe failures but
+    # leaks slots when a host's live ENDED and the profile probe is
+    # permanently stuck returning None (WAF on the profile URL,
+    # banned/deleted account, age-restriction).
+    #
+    # Two additional release conditions, both gated on long thresholds
+    # so they fire only on genuinely stuck slots:
+    #
+    #   Stage 1 — local-signal release:
+    #     The listener's WebSocket disconnect callback knows for CERTAIN
+    #     when the live ended (TikTok closed our WS, or the lib bailed
+    #     after retry exhaustion). If local state has been DISCONNECTED
+    #     / LIVE_ENDED / ERROR continuously for `LOCAL_OFFLINE_RELEASE_S`,
+    #     force-release regardless of probe.
+    #
+    #   Stage 2 — probe-None patience cap:
+    #     If the central probe has returned `None` continuously for
+    #     `PROBE_UNKNOWN_RELEASE_S`, treat as effectively False. The
+    #     "1 sec of 403s → cascade" the original probe code feared
+    #     doesn't fit a 30-minute window.
+    #
+    # Both thresholds are intentionally generous; neither triggers on
+    # transient flaps.
+    LOCAL_OFFLINE_RELEASE_S   = 600.0    # 10 min — local WS signal
+    PROBE_UNKNOWN_RELEASE_S   = 1800.0   # 30 min — probe-None patience
+
     # Postgres advisory-lock key. Cross-process mutex: only one listener
     # pool may hold this at a time. Constant chosen to never collide with
     # any framework-managed advisory locks (the framework's range is small
@@ -312,6 +341,15 @@ class TikTokService:
         # is older than OFFLINE_RELEASE_HYSTERESIS_S do we tear down
         # the supervisor and free the slot.
         self._offline_observed_at: dict[str, datetime] = {}
+        # Stuck-slot defense state (2026-05-14, see WORKER.md §3.4):
+        #   `_local_offline_since`: time.time() of the most recent
+        #     transition INTO DISCONNECTED/LIVE_ENDED/ERROR. Cleared
+        #     when state returns to CONNECTED. Drives Stage-1 release.
+        #   `_probe_unknown_since`: time.time() of the most recent
+        #     contiguous-None probe run. Cleared when probe returns a
+        #     definite True/False. Drives Stage-2 release.
+        self._local_offline_since: dict[str, float] = {}
+        self._probe_unknown_since: dict[str, float] = {}
         # Process-wide pause flag. When set, supervisor refuses to start
         # new sessions and `start_all_enabled()` is a no-op. Triggered by
         # the SIGUSR1 control signal from the API.
@@ -679,6 +717,7 @@ class TikTokService:
         #     (whose ORDER BY now prefers is_live=true) backfill the
         #     slot with a creator who's actually broadcasting.
         now_utc = datetime.now(timezone.utc)
+        now_ts = time.time()
         released_offline: list[str] = []
         for handle in list(still_mine):
             sub = all_subs.get(handle)
@@ -686,14 +725,57 @@ class TikTokService:
                 continue
             is_live = sub.is_live  # tri-state: True / False / None
             checked_at = sub.live_checked_at
+
+            # Stage-1 stuck-slot defense — local-signal release. If the
+            # listener's own state has been offline-equivalent
+            # continuously for `LOCAL_OFFLINE_RELEASE_S`, the WS is
+            # provably dead from our side. Release REGARDLESS of probe
+            # state (handles the case where the probe is permanently
+            # stuck on None for this host — WAF, banned account,
+            # age-restricted). See `WORKER.md` §3.4.
+            local_offline_since = self._local_offline_since.get(handle)
+            if (
+                local_offline_since is not None
+                and (now_ts - local_offline_since) >= self.LOCAL_OFFLINE_RELEASE_S
+                and self._states.get(handle) != SubscriptionState.CONNECTED.value
+            ):
+                logger.info(
+                    "Capacity recycle (stage-1, local-signal): @%s "
+                    "DISCONNECTED for %.0fs — releasing slot.",
+                    handle, now_ts - local_offline_since,
+                )
+                await self._release_slot(handle, still_mine, released_offline)
+                continue
+
+            # Stage-2 stuck-slot defense — probe-None patience cap. If
+            # the central probe has returned None continuously for
+            # `PROBE_UNKNOWN_RELEASE_S`, treat as effectively offline.
+            # Only fires when we're ALSO not locally CONNECTED — if
+            # events are flowing, the probe's confusion doesn't matter.
+            probe_unknown_since = self._probe_unknown_since.get(handle)
+            if (
+                probe_unknown_since is not None
+                and (now_ts - probe_unknown_since) >= self.PROBE_UNKNOWN_RELEASE_S
+                and self._states.get(handle) != SubscriptionState.CONNECTED.value
+            ):
+                logger.info(
+                    "Capacity recycle (stage-2, probe-None): @%s probe "
+                    "unknown for %.0fs — treating as offline, releasing slot.",
+                    handle, now_ts - probe_unknown_since,
+                )
+                await self._release_slot(handle, still_mine, released_offline)
+                continue
+
             if is_live is True:
                 # Definitely live — clear any prior offline marker so
                 # a future flap doesn't trip the hysteresis prematurely.
                 self._offline_observed_at.pop(handle, None)
                 continue
             if is_live is None or checked_at is None:
-                # Unknown / never probed — don't release; let the next
-                # tick decide once the probe runs.
+                # Unknown / never probed — don't release via the
+                # probe-based path; let the next tick decide once the
+                # probe runs. (Stage-2 above handles the permanently-
+                # stuck case.)
                 continue
             # Trust is_live=false only if the probe ran recently. A
             # stale "false" might be hours old (worker-pause incident,
@@ -730,17 +812,7 @@ class TikTokService:
                 "local state %s) — releasing slot.",
                 handle, offline_for_s, check_age_s, local_state,
             )
-            try:
-                await self._stop_session(handle)
-            except Exception:
-                logger.exception("stop_session during recycle failed for @%s", handle)
-            try:
-                self._persistence.release_my_assignment(self._worker_id, handle)
-            except Exception:
-                logger.exception("release_my_assignment failed for @%s", handle)
-            self._offline_observed_at.pop(handle, None)
-            still_mine.discard(handle)
-            released_offline.append(handle)
+            await self._release_slot(handle, still_mine, released_offline)
 
         # 2b. Resume sessions we still own but aren't running locally.
         #     This covers the worker-restart case: leases were extended
@@ -831,6 +903,40 @@ class TikTokService:
             "bounced": bounced,
             "held": len(self._sessions),
         }
+
+    async def _release_slot(
+        self,
+        handle: str,
+        still_mine: set[str],
+        released_offline: list[str],
+    ) -> None:
+        """Tear down a session + drop its DB assignment + clear all
+        tracking state for this handle. Used by the three recycle
+        paths in `reconcile_assignments`:
+
+          (1) Stage-1 local-signal release (WS confirmed offline)
+          (2) Stage-2 probe-None patience release (probe stuck)
+          (3) Probe-confirmed-false release (the original path)
+
+        Idempotent — safe to call multiple times for the same handle.
+        Failures in either teardown step are logged but don't raise;
+        the reconcile loop must finish even when one host is stuck.
+        """
+        try:
+            await self._stop_session(handle)
+        except Exception:
+            logger.exception("stop_session during recycle failed for @%s", handle)
+        try:
+            self._persistence.release_my_assignment(self._worker_id, handle)
+        except Exception:
+            logger.exception("release_my_assignment failed for @%s", handle)
+        # Clear all tracking dicts so a future re-claim of this handle
+        # starts with a clean slate (no stale stuck-slot timers ticking).
+        self._offline_observed_at.pop(handle, None)
+        self._local_offline_since.pop(handle, None)
+        self._probe_unknown_since.pop(handle, None)
+        still_mine.discard(handle)
+        released_offline.append(handle)
 
     def write_heartbeat_to_db(self, snap: dict[str, Any] | None = None) -> None:
         """Push a listener snapshot into tiktok_workers. Called from the
@@ -1795,8 +1901,18 @@ class TikTokService:
                     raw_is_live = profile.get("is_live") if profile else None
                     if raw_is_live is None:
                         is_live = None
+                        # Stage-2 stuck-slot defense (2026-05-14):
+                        # track WHEN this host's probe started returning
+                        # None continuously. Cleared the moment we get a
+                        # definite True/False. The reconcile loop reads
+                        # this + PROBE_UNKNOWN_RELEASE_S to release slots
+                        # whose probe is permanently stuck.
+                        self._probe_unknown_since.setdefault(
+                            sub.unique_id, time.time(),
+                        )
                     else:
                         is_live = bool(raw_is_live)
+                        self._probe_unknown_since.pop(sub.unique_id, None)
                     room_id_raw = profile.get("room_id") if profile else None
                     try:
                         room_id = int(room_id_raw) if room_id_raw else None
@@ -3306,8 +3422,34 @@ class TikTokService:
         return cb
 
     def _handle_state_change_for(self, unique_id: str):
+        """State-change callback for the TikTokLive session.
+
+        Beyond updating `_states`, this callback also tracks the local-
+        offline timestamp used by Stage-1 of the stuck-slot defense
+        (see `LOCAL_OFFLINE_RELEASE_S`). When state transitions INTO an
+        offline-equivalent state (DISCONNECTED / LIVE_ENDED / ERROR /
+        DISABLED), stamp `_local_offline_since[handle]` with the
+        current epoch. When it transitions BACK to CONNECTED, clear
+        the stamp — we don't release a slot that's reconnected. The
+        reconcile loop reads this stamp + threshold to release slots
+        whose WS is provably dead, regardless of probe state."""
         async def cb(state: str) -> None:
+            prev = self._states.get(unique_id)
             self._states[unique_id] = state
+            offline_states = {
+                SubscriptionState.DISCONNECTED.value,
+                SubscriptionState.LIVE_ENDED.value,
+                SubscriptionState.ERROR.value,
+                SubscriptionState.DISABLED.value,
+            }
+            if state in offline_states:
+                # Only stamp on TRANSITION into offline — repeated
+                # callbacks with the same offline state shouldn't reset
+                # the clock (would let a flap delay the release forever).
+                if prev not in offline_states:
+                    self._local_offline_since[unique_id] = time.time()
+            elif state == SubscriptionState.CONNECTED.value:
+                self._local_offline_since.pop(unique_id, None)
         return cb
 
     def _handle_terminal_error_for(self, unique_id: str):
