@@ -192,6 +192,21 @@ export interface TikTokHandleLookup {
   already_subscribed: boolean;
 }
 
+/** Subset of `TikTokHandleLookup` that can be forwarded into
+ *  `createLive` so the backend can persist the cached identity instead
+ *  of triggering a second profile scrape. Intentionally trims the live-
+ *  state + lookup-meta fields (`is_live`, `room_id`, `source`, `error`,
+ *  `warning`, `already_subscribed`) — those describe the lookup itself,
+ *  not the durable profile. */
+export interface TikTokHandleLookupProfile {
+  nickname?: string | null;
+  user_id?: string | null;
+  avatar_url?: string | null;
+  bio?: string | null;
+  follower_count?: number | null;
+  following_count?: number | null;
+}
+
 export interface TikTokGift {
   gift_id: string;
   name: string | null;
@@ -922,11 +937,30 @@ export const tiktokApi = {
     });
   },
 
-  createLive(username: string, enabled = true): Promise<TikTokSubscription> {
+  /** Create a subscription for the given handle.
+   *
+   *  Optional `profile` carries the snapshot the operator just saw in
+   *  `TikTokAddLiveModal`'s preview (captured via `lookupHandle`). When
+   *  present, the backend can persist the cached identity/avatar/follower
+   *  counts directly instead of triggering a second SIGI scrape + Euler
+   *  fallback on the create path — which previously burned a WAF probe
+   *  and another sign quota for data we already had.
+   *
+   *  Backend accepts the extra fields silently (Pydantic default
+   *  `extra='ignore'` on `SubscriptionRequest`). Older deployments that
+   *  haven't wired the field through to `create_subscription` will keep
+   *  behaving as before; the bandwidth cost is bounded. */
+  createLive(
+    username: string,
+    enabled = true,
+    profile?: TikTokHandleLookupProfile | null,
+  ): Promise<TikTokSubscription> {
+    const data: Record<string, unknown> = { username, enabled };
+    if (profile) data.profile = profile;
     return apiRequest({
       method: 'POST',
       url: `${BASE}/lives`,
-      data: { username, enabled },
+      data,
     });
   },
 

@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import {
   AlertTriangle,
   CheckCircle2,
+  Circle,
   Eye,
   Loader2,
   Radio,
@@ -17,6 +18,7 @@ import { Button } from '@/components/ui/Button';
 import { Modal } from '@/components/ui/Modal';
 import {
   type TikTokHandleLookup,
+  type TikTokHandleLookupProfile,
   tiktokApi,
 } from '@admin/services/tiktok';
 
@@ -24,7 +26,13 @@ interface TikTokAddLiveModalProps {
   isOpen: boolean;
   handle: string;
   onCancel: () => void;
-  onConfirm: () => void; // proceeds with creating the subscription
+  /** Called when the operator confirms the preview. Receives the
+   *  profile snapshot captured during lookup (when present) so the
+   *  parent can thread it into `tiktokApi.createLive(handle, true,
+   *  profile)` and skip a redundant SIGI / Euler probe. Older parents
+   *  that ignore the argument keep their previous behaviour — the
+   *  callback signature stays compatible via TS bivariance. */
+  onConfirm: (profile?: TikTokHandleLookupProfile | null) => void | Promise<void>;
 }
 
 export function TikTokAddLiveModal({
@@ -84,7 +92,21 @@ export function TikTokAddLiveModal({
   const handleConfirm = async () => {
     setSubmitting(true);
     try {
-      await Promise.resolve(onConfirm());
+      // Forward the captured profile so the parent can pass it to
+      // `createLive` and skip a second backend scrape. `null` when
+      // the lookup itself failed (network / 404) — parents should
+      // fall back to the legacy two-arg create in that case.
+      const profile: TikTokHandleLookupProfile | null = data
+        ? {
+            nickname: data.nickname,
+            user_id: data.user_id,
+            avatar_url: data.avatar_url,
+            bio: data.bio,
+            follower_count: data.follower_count,
+            following_count: data.following_count,
+          }
+        : null;
+      await Promise.resolve(onConfirm(profile));
     } finally {
       setSubmitting(false);
     }
@@ -120,7 +142,7 @@ export function TikTokAddLiveModal({
         </div>
       }
     >
-      {loading && <LookupSkeleton />}
+      {loading && <LookupProgress handle={handle} />}
       {!loading && data && <LookupBody data={data} />}
     </Modal>
   );
@@ -128,15 +150,76 @@ export function TikTokAddLiveModal({
 
 // ─── views ─────────────────────────────────────────────────────────
 
-function LookupSkeleton() {
+/** Live progress steps shown while `tiktokApi.lookupHandle(...)` runs.
+ *
+ *  The backend lookup chain is `validate → SIGI scrape → (fallback)
+ *  Euler call → DB check → preview`. We don't get progress events back
+ *  over the wire, so the UI advances on elapsed-time heuristics tuned to
+ *  the typical timings observed in the worker logs. The final step
+ *  stays pending until the request resolves and the modal flips to the
+ *  preview body — at which point the spinner unmounts entirely.
+ *
+ *  Worst-case overrun (slow Euler, retries) just leaves step 3
+ *  spinning, which is the correct visual: we're still working. */
+const LOOKUP_STEPS = [
+  'Validating handle',
+  'Fetching TikTok profile',
+  'Checking live status',
+  'Preparing preview',
+] as const;
+
+function LookupProgress({ handle }: { handle: string }) {
+  const [step, setStep] = useState(0);
+
+  useEffect(() => {
+    // Reset on each handle so reopening the modal for a different
+    // user replays the animation instead of jumping straight to done.
+    setStep(0);
+    const t1 = setTimeout(() => setStep(1), 200);
+    const t2 = setTimeout(() => setStep(2), 800);
+    const t3 = setTimeout(() => setStep(3), 2000);
+    return () => {
+      clearTimeout(t1);
+      clearTimeout(t2);
+      clearTimeout(t3);
+    };
+  }, [handle]);
+
   return (
-    <div className="flex items-center gap-4 animate-pulse">
-      <div className="w-20 h-20 rounded-full bg-gray-200 shrink-0" />
-      <div className="flex-1 space-y-2">
-        <div className="h-5 w-1/2 bg-gray-200 rounded" />
-        <div className="h-4 w-1/3 bg-gray-200 rounded" />
-        <div className="h-4 w-2/3 bg-gray-200 rounded" />
+    <div className="space-y-3">
+      <div className="text-xs auth-mono-label text-gray-500">
+        Looking up @{handle}
       </div>
+      <ul className="space-y-2">
+        {LOOKUP_STEPS.map((label, idx) => {
+          const done = idx < step;
+          const active = idx === step;
+          return (
+            <li
+              key={label}
+              className={
+                'flex items-center gap-2 text-sm transition-colors ' +
+                (done
+                  ? 'text-gray-500'
+                  : active
+                    ? 'text-gray-900 font-medium'
+                    : 'text-gray-400')
+              }
+            >
+              <span className="w-4 h-4 shrink-0 flex items-center justify-center">
+                {done ? (
+                  <CheckCircle2 className="w-4 h-4 text-primary-500" />
+                ) : active ? (
+                  <Loader2 className="w-4 h-4 text-primary-500 animate-spin" />
+                ) : (
+                  <Circle className="w-3.5 h-3.5 text-gray-300" />
+                )}
+              </span>
+              <span>{label}</span>
+            </li>
+          );
+        })}
+      </ul>
     </div>
   );
 }
