@@ -169,23 +169,40 @@ def _resolve_public_room_set(room_ids: Iterable[int]) -> list[int]:
     return ordered
 
 
-def _set_cache_headers(response: Response) -> None:
+def _set_cache_headers(
+    response: Response,
+    *,
+    max_age: int = 15,
+    cacheable: bool = True,
+) -> None:
     """Apply the standard public-endpoint cache headers in-place.
 
-    Every public-TikTok endpoint shares the same caching shape:
-      - `Cache-Control: public, max-age=15` — browsers + CDNs absorb
-        the fan-out from anonymous polling tabs without each one
-        rehitting the API every poll cycle.
-      - `Vary: Accept-Encoding` — the only request header that
-        meaningfully changes our representation is gzip vs identity.
-        No auth / cookie / per-user variance.
+    Default — `Cache-Control: public, max-age=15, s-maxage=15` —
+    so browsers and CDNs absorb the fan-out from anonymous polling
+    tabs without each one rehitting the API every poll cycle. The
+    server-side service cache already absorbs the SQL fan-out for the
+    process; this header pushes one more layer up so a shared public
+    URL with N concurrent viewers collapses to 1 RTT per 15 s
+    (was: 1 RTT per viewer per 30 s).
+
+    Privacy: a 15-second leakage window after an operator flips a
+    handle to `is_public=False` is acceptable for public-by-design
+    payloads (no operator-only data is ever in this response — see
+    `_PUBLIC_SUMMARY_FIELDS`). For surfaces that MUST never be
+    cached after a config change (detail page that exposes the host's
+    runtime config), callers pass `cacheable=False` to force
+    `no-store`.
+
+    `Vary: Accept-Encoding` — the only request header that meaningfully
+    changes our representation is gzip vs identity. No auth / cookie /
+    per-user variance.
     """
-    # Privacy-sensitive: `no-store` so browsers / CDNs never serve a
-    # cached payload after an operator flips `is_public=False`. The
-    # 30 s in-process server cache still absorbs anonymous fan-out,
-    # but each client always re-asks — and the moment the access
-    # guard refuses the handle, the cached browser copy is gone.
-    response.headers["Cache-Control"] = "no-store"
+    if cacheable and max_age > 0:
+        response.headers["Cache-Control"] = (
+            f"public, max-age={max_age}, s-maxage={max_age}"
+        )
+    else:
+        response.headers["Cache-Control"] = "no-store"
     response.headers["Vary"] = "Accept-Encoding"
 
 
@@ -291,7 +308,7 @@ def _sanitize_match(match_dict: Any) -> dict[str, Any]:
 
 
 @router.get("/tiktok/lives")
-def public_lives(
+async def public_lives(
     response: Response,
     tz: str = Query(
         "UTC",
@@ -318,13 +335,19 @@ def public_lives(
     last_caption, listener state, worker coordination columns, internal
     identifiers) are never copied into the response.
 
-    Cached server-side for 30s (in TikTokService). The response also
-    carries `Cache-Control: public, max-age=15` so CDNs and browser
-    caches absorb the fan-out from anonymous viewers.
+    Async handler — the underlying summary call is a sync SQLAlchemy
+    fan-out, so we wrap it in `asyncio.to_thread` to keep the event
+    loop free for other connections. This matters when a shared public
+    URL gets a burst of concurrent viewers at the 30 s cache boundary.
+
+    Cached server-side for 30 s (in TikTokService). Response carries
+    `Cache-Control: public, max-age=15, s-maxage=15` so CDNs and
+    browser caches collapse the per-viewer fan-out to one RTT per
+    15 s — see `_set_cache_headers` for the trade-off.
     """
     svc = _require_service()
     _set_cache_headers(response)
-    return svc.get_public_lives_summary(tz=tz)
+    return await asyncio.to_thread(svc.get_public_lives_summary, tz=tz)
 
 
 @router.get("/tiktok/lives/{handle}")

@@ -260,6 +260,22 @@ function TikTokLivesBody() {
     onUpdate: onSocketUpdate,
   });
 
+  // Seed the WS hook's per-host version cursor whenever the bundle
+  // brings fresh data in. Without this, a WS reconnect before the
+  // first delta arrives finds an empty version map and skips the
+  // on-reconnect snapshot step, leaving cards stale until the next
+  // 5-minute reconcile poll. See `useTikTokLivesSocket.ts:seedVersions`.
+  useEffect(() => {
+    const versions: Record<string, number> = {};
+    for (const [host, slice] of Object.entries(summary)) {
+      const v = (slice as { version?: number }).version;
+      if (typeof v === 'number' && v > 0) versions[host] = v;
+    }
+    if (Object.keys(versions).length > 0) {
+      wsStatus.seedVersions(versions);
+    }
+  }, [summary, wsStatus]);
+
   // Single bundled fetch — provides initial subs + summary + totals.
   // After Phase 9.E this also acts as the periodic safety-net
   // reconciliation: when the WS is live (driving deltas) we re-fetch

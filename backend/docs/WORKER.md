@@ -215,40 +215,35 @@ new subscriptions can't be claimed.
 This is the user-reported "30/30 with disconnected sessions for 3+
 hours" bug. Real production issue.
 
-### 3.3 Why didn't `_handle_state_change_for` free the slot?
-
-```python
-def _handle_state_change_for(self, unique_id: str):
-    async def cb(state: str) -> None:
-        self._states[unique_id] = state
-    return cb
-```
-
-It only updates the state dict. The session stays in `_sessions`.
-The reconcile loop is the only path that ever frees a slot, and
-that path gates on the probe (not on local state) — see §3.2.
-
-### 3.4 Proposed fix (not yet shipped)
+### 3.4 Proposed fix (shipped)
 
 Two-stage defense:
 
 **Stage 1 — local signal as authoritative free trigger**:
 In `_handle_state_change_for`, when state transitions to
-`DISCONNECTED` / `LIVE_ENDED` / `ERROR`, mark
+`DISCONNECTED` / `LIVE_ENDED` / `DISABLED`, mark
 `self._local_offline_at[handle] = time.time()`. Reset on state
 back to `CONNECTED`. In reconcile, add a new condition: if
-`local_offline_at` is older than `LOCAL_OFFLINE_RELEASE_S` (proposed
-600 s = 10 min), force-release REGARDLESS of probe state.
+`local_offline_at` is older than `LOCAL_OFFLINE_RELEASE_S` (600 s = 10 min),
+force-release REGARDLESS of probe state.
+**Note**: `ERROR` state is intentionally EXCLUDED from this list. Terminal
+errors like `AgeRestrictedError` have long exponential backoffs (up to 4h).
+If we included `ERROR`, the stuck-slot defense would kill the session
+mid-backoff and release the slot, causing an endless reconnect loop that
+burns the Euler quota.
 
 **Stage 2 — cap probe-`None` patience**:
 If `is_live=None` has persisted continuously for >
-`PROBE_UNKNOWN_RELEASE_S` (proposed 1800 s = 30 min), treat as False
+`PROBE_UNKNOWN_RELEASE_S` (1800 s = 30 min), treat as False
 for recycle purposes. The "1 sec of 403s → cascade" the existing
 code guards against doesn't fit a 30-min window — by then the probe
 has either recovered or the host is genuinely unreachable.
 
-Both gates are conservative; neither triggers on transient blips.
-Stage 1 is the primary fix; Stage 2 is defense-in-depth.
+**Eager Offline Sync**:
+To prevent WAF-blocked probes from keeping `is_live=True` forever
+and causing endless WS reconnect attempts, `UserOfflineError` now
+triggers an eager `update_subscription_profile` to set `is_live=False`
+immediately.
 
 ---
 

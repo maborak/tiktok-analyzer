@@ -673,11 +673,13 @@ class TikTokLiveSession(TikTokLiveSessionPort):
         on_event: Callable[..., Awaitable[None]],
         on_state_change: Callable[[str], Awaitable[None]] | None = None,
         on_terminal_error: Callable[[str, str], Awaitable[None]] | None = None,
+        on_offline: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self._unique_id = unique_id
         self._on_event = on_event
         self._on_state_change = on_state_change
         self._on_terminal_error = on_terminal_error
+        self._on_offline = on_offline
         self._client: TikTokLiveClient | None = None
         self._room_id: int | None = None
         self._heartbeat: asyncio.Task[Any] | None = None
@@ -870,6 +872,11 @@ class TikTokLiveSession(TikTokLiveSessionPort):
                     logger.info("@%s is offline; will retry on a slow cadence.", self._unique_id)
                 last_offline = True
                 last_sign_limited = False
+                if self._on_offline:
+                    try:
+                        await self._on_offline()
+                    except Exception:
+                        pass
             except SignatureRateLimitError:
                 # EulerStream's sign API rate-limited us. Free tier is tiny;
                 # retrying fast only deepens the hole. Back off HARD and
@@ -1529,10 +1536,12 @@ class TikTokLiveSessionFactory(TikTokLiveSessionFactoryPort):
         on_event: Callable[..., Awaitable[None]],
         on_state_change: Callable[[str], Awaitable[None]] | None = None,
         on_terminal_error: Callable[[str, str], Awaitable[None]] | None = None,
+        on_offline: Callable[[], Awaitable[None]] | None = None,
     ) -> TikTokLiveSessionPort:
         return TikTokLiveSession(
             unique_id=unique_id,
             on_event=on_event,
             on_state_change=on_state_change,
             on_terminal_error=on_terminal_error,
+            on_offline=on_offline,
         )

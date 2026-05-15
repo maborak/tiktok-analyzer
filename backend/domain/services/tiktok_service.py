@@ -1900,6 +1900,22 @@ class TikTokService:
               WHERE event = 'waf_detected'
                 AND ts >= :since AND ts < :until
             """), {"since": since, "until": until}).scalar() or 0
+            # 3.5. Profile Scrape outcomes (Success, WAF, Error) per bin.
+            # We track the new profile_probe_* events.
+            probe_rows = s.execute(_text("""
+              SELECT
+                date_trunc('minute', ts)
+                  - MOD(EXTRACT(MINUTE FROM ts)::int, :bm) * INTERVAL '1 minute'
+                  AS bin,
+                event,
+                COUNT(*)::int as n
+              FROM tiktok_worker_log
+              WHERE event IN ('profile_probe_success', 'profile_probe_waf', 'profile_probe_error')
+                AND ts >= :since AND ts < :until
+              GROUP BY 1, 2
+              ORDER BY 1
+            """), {"bm": bucket_min, "since": since, "until": until}).all()
+
             # 4. Reconcile — pass count + p50/p95 duration per bin +
             #    overall claimed/lost. PERCENTILE_CONT is exact (small
             #    row counts) and indexed by ts.
@@ -1965,6 +1981,22 @@ class TikTokService:
             p50_arr[idx] = int(r.p50) if r.p50 is not None else None
             p95_arr[idx] = int(r.p95) if r.p95 is not None else None
 
+        # ── Pack profile scrapes ─────────────────────────────────────
+        probe_success = [0] * N
+        probe_waf = [0] * N
+        probe_error = [0] * N
+        for r in probe_rows:
+            idx = bin_index.get(r.bin)
+            if idx is None:
+                continue
+            if r.event == "profile_probe_success":
+                probe_success[idx] = int(r.n)
+            elif r.event == "profile_probe_waf":
+                probe_waf[idx] = int(r.n)
+            elif r.event == "profile_probe_error":
+                probe_error[idx] = int(r.n)
+
+
         bin_iso = [b.isoformat() for b in bins]
         return {
             "since": since.isoformat(),
@@ -1990,6 +2022,12 @@ class TikTokService:
             "waf": {
                 "totals": {r.handle: int(r.n) for r in waf_rows},
                 "all": int(waf_total),
+            },
+            "profile_scrapes": {
+                "bins": bin_iso,
+                "success": probe_success,
+                "waf": probe_waf,
+                "error": probe_error,
             },
             "reconcile": {
                 "bins": bin_iso,
@@ -2343,7 +2381,7 @@ class TikTokService:
             h for h, st in self._states.items()
             if st == SubscriptionState.CONNECTED.value
         }
-        now = _utcnow()
+        now = datetime.now(timezone.utc)
         offline_cutoff = timedelta(
             seconds=self.PROFILE_STALE_AFTER_SECONDS_OFFLINE
         )
@@ -2432,6 +2470,26 @@ class TikTokService:
                             "Live-status scrape raised for @%s", sub.unique_id
                         )
                         profile = None
+
+                    outcome_event = "profile_probe_success"
+                    err_str = profile.get("error") if profile else None
+                    if profile is None:
+                        outcome_event = "profile_probe_error"
+                    elif err_str:
+                        if "WAF" in err_str or "slardar-config" in err_str:
+                            outcome_event = "profile_probe_waf"
+                        else:
+                            outcome_event = "profile_probe_error"
+                    
+                    try:
+                        self._log_worker(
+                            outcome_event,
+                            level="info" if outcome_event == "profile_probe_success" else "warning",
+                            handle=sub.unique_id,
+                        )
+                    except Exception:
+                        pass
+
                     # Tri-state read: True / False / None. Don't coerce
                     # None → False — the scraper now returns None when
                     # it couldn't determine live status (TikTok 403'd,
@@ -3210,6 +3268,83 @@ class TikTokService:
     ] = {}
     _lives_summary_meta_lock = threading.Lock()
 
+    # ── Cache observability ──────────────────────────────────────────
+    #
+    # Counters bumped on every cache lookup across the read-path
+    # caches. Exposed at `GET /admin/tiktok/cache/stats` so an operator
+    # can see actual hit-ratio in production — previously we had no
+    # signal at all on whether the TTL caches were doing their job.
+    #
+    # `dict[str, dict[str, int]]` shape:
+    #     {
+    #       "lives_summary":   {"hits": N, "misses": M, "size": current_dict_len},
+    #       "lives_totals":    {...},
+    #       "public_summary":  {...},
+    #       "week_calendar":   {...},
+    #       "daily_buckets":   {...},
+    #     }
+    #
+    # Bumped via `_record_cache(...)`. Reset on process restart — these
+    # are session-scoped, not durable. For long-running production
+    # observability the operator can poll the endpoint and diff.
+    _cache_stats: dict[str, dict[str, int]] = {}
+    _cache_stats_lock = threading.Lock()
+
+    def _record_cache(self, name: str, *, hit: bool) -> None:
+        """Bump the `hits` or `misses` counter for the named cache.
+
+        Cheap (single dict lookup + int increment under a tiny lock) so
+        it's safe to call from every cache check. The lock is held for
+        microseconds; contention is negligible compared to the work
+        each caller is already doing.
+        """
+        with self._cache_stats_lock:
+            slot = self._cache_stats.get(name)
+            if slot is None:
+                slot = {"hits": 0, "misses": 0}
+                self._cache_stats[name] = slot
+            slot["hits" if hit else "misses"] += 1
+
+    def get_cache_stats(self) -> dict[str, Any]:
+        """Snapshot of every cache layer with its current hit/miss
+        counters + an approximate `size` (entries currently held).
+
+        Used by `GET /admin/tiktok/cache/stats` to give operators a
+        live signal on whether the TTL caches are doing their job. A
+        hit_ratio under 80% on `lives_summary` likely means the TTL is
+        too short for the poll cadence; under 30% means something is
+        bypassing the cache entirely (e.g. a TZ flapping between
+        viewers, or distinct handle subsets per caller). All counters
+        reset on process restart.
+        """
+        with self._cache_stats_lock:
+            counters = {
+                name: {"hits": v.get("hits", 0), "misses": v.get("misses", 0)}
+                for name, v in self._cache_stats.items()
+            }
+        sizes: dict[str, int] = {
+            "lives_summary": len(self._lives_summary_cache),
+            "lives_totals": 1 if self._lives_totals_cache is not None else 0,
+            "public_summary": (
+                len(self._public_lives_summary_cache)
+                if isinstance(self._public_lives_summary_cache, dict)
+                else 0
+            ),
+        }
+        rows: list[dict[str, Any]] = []
+        for name in ("lives_summary", "lives_totals", "public_summary"):
+            c = counters.get(name, {"hits": 0, "misses": 0})
+            total = c["hits"] + c["misses"]
+            ratio = round(c["hits"] / total, 3) if total > 0 else None
+            rows.append({
+                "name": name,
+                "hits": c["hits"],
+                "misses": c["misses"],
+                "hit_ratio": ratio,
+                "size": sizes.get(name, 0),
+            })
+        return {"caches": rows}
+
     # Phase 9C: fields the state cache provably maintains in lock-step
     # with `get_lives_summary` (per `test_state_cache_parity.py`). These
     # are the only fields we overlay from cache onto the SQL result —
@@ -3269,8 +3404,10 @@ class TikTokService:
         sql_result: dict[str, Any]
         hit = self._lives_summary_cache.get(key)
         if hit and (now - hit[0]) < self._LIVES_SUMMARY_TTL_S:
+            self._record_cache("lives_summary", hit=True)
             sql_result = hit[1]
         else:
+            self._record_cache("lives_summary", hit=False)
             # Cold miss — singleflight. Get or create the per-key lock.
             with self._lives_summary_meta_lock:
                 lock = self._lives_summary_locks.get(key)
@@ -3435,6 +3572,15 @@ class TikTokService:
     # the dict (kept as `None` instead of `{}` to detect "never
     # populated" in tests that monkeypatch the type-annotation default).
     _public_lives_summary_cache: dict[str, tuple[float, dict[str, Any]]] | None = None
+    # Per-tz singleflight locks — protect `list_public_subscriptions()` +
+    # `get_lives_summary` against a thundering herd at the 30s TTL
+    # expiry. Without these, N concurrent anonymous viewers on the same
+    # public URL each enter the miss branch and fire a duplicate
+    # `list_public_subscriptions` read; `get_lives_summary` has its own
+    # singleflight further down the stack but the outer subs read does
+    # not.  See `_lives_summary_locks` for the same pattern.
+    _public_lives_summary_locks: dict[str, threading.Lock] = {}
+    _public_lives_summary_meta_lock = threading.Lock()
 
     # Public-handle set: the lowercased `unique_id`s of every
     # subscription with `is_public=True`. Used by the public WS
@@ -3546,58 +3692,79 @@ class TikTokService:
         any new key upstream stays opaque by default until explicitly
         added to `_PUBLIC_SUBSCRIPTION_FIELDS` or `_PUBLIC_SUMMARY_FIELDS`.
         """
-        now = time.monotonic()
-        # Cache slot is per-tz so a request from a Lima-zone viewer
-        # doesn't get a UTC-bucketed payload (or vice versa). The
-        # cached shape is a `dict[str (tz), tuple[float, dict]]`.
+        # Double-checked locking around the per-tz cache slot. Lock
+        # acquisition is gated by a meta-lock so concurrent first
+        # callers don't each create a new sub-lock. Same shape as
+        # `get_lives_summary` upstream.
         cached_for_tz = self._public_lives_summary_cache.get(tz) \
             if isinstance(self._public_lives_summary_cache, dict) else None
+        now = time.monotonic()
         if cached_for_tz is not None and (now - cached_for_tz[0]) < self._PUBLIC_LIVES_SUMMARY_TTL_S:
+            self._record_cache("public_summary", hit=True)
             return cached_for_tz[1]
+        self._record_cache("public_summary", hit=False)
 
-        # 1. Pull just the public-flagged subscriptions. Profile fields
-        #    (nickname/avatar/follower_count/is_live/...) live on this
-        #    row — get_lives_summary doesn't carry them.
-        publics = self._persistence.list_public_subscriptions()
-        handles = [s.unique_id for s in publics if s.unique_id]
-        if not handles:
-            result = {"items": []}
+        with self._public_lives_summary_meta_lock:
+            lock = self._public_lives_summary_locks.get(tz)
+            if lock is None:
+                lock = threading.Lock()
+                self._public_lives_summary_locks[tz] = lock
+
+        with lock:
+            now = time.monotonic()
+            cached_for_tz = self._public_lives_summary_cache.get(tz) \
+                if isinstance(self._public_lives_summary_cache, dict) else None
+            if cached_for_tz is not None and (now - cached_for_tz[0]) < self._PUBLIC_LIVES_SUMMARY_TTL_S:
+                # Double-checked hit: someone else populated it while
+                # we waited on the lock. Don't double-count the miss
+                # we already recorded above — that's still the
+                # observability-correct accounting (a real RTT was made,
+                # we just collapsed it with another caller).
+                return cached_for_tz[1]
+
+            # 1. Pull just the public-flagged subscriptions. Profile
+            #    fields (nickname/avatar/follower_count/is_live/...)
+            #    live on this row — get_lives_summary doesn't carry them.
+            publics = self._persistence.list_public_subscriptions()
+            handles = [s.unique_id for s in publics if s.unique_id]
+            if not handles:
+                result = {"items": []}
+                if not isinstance(self._public_lives_summary_cache, dict):
+                    self._public_lives_summary_cache = {}
+                self._public_lives_summary_cache[tz] = (now, result)
+                return result
+
+            # 2. Re-use the admin summary path — same SQL fan-out, shares
+            #    the 60s TTL cache when admin + public callers overlap on
+            #    the same handle set. Then sanitize each entry so nothing
+            #    operator-only escapes.
+            summary = self.get_lives_summary(handles, tz=tz)
+
+            items: list[dict[str, Any]] = []
+            for sub in publics:
+                h = sub.unique_id
+                if not h:
+                    continue
+                row = summary.get(h.lstrip("@").lower(), {}) or {}
+                summary_slice = self._pick(row, self._PUBLIC_SUMMARY_FIELDS)
+                # Same trim as the admin bundle: `last_broadcasts` is a
+                # 3-element history but the React card only reads
+                # index 0. Slicing here mirrors the admin behaviour
+                # and shrinks the public response symmetrically.
+                if isinstance(summary_slice.get("last_broadcasts"), list):
+                    summary_slice["last_broadcasts"] = summary_slice["last_broadcasts"][:1]
+                items.append(
+                    {
+                        "subscription": self._pick(sub, self._PUBLIC_SUBSCRIPTION_FIELDS),
+                        "summary":      summary_slice,
+                    }
+                )
+
+            result = {"items": items}
             if not isinstance(self._public_lives_summary_cache, dict):
                 self._public_lives_summary_cache = {}
             self._public_lives_summary_cache[tz] = (now, result)
             return result
-
-        # 2. Re-use the admin summary path — same SQL fan-out, shares
-        #    the 10s TTL cache when admin + public callers overlap on
-        #    the same handle set. Then sanitize each entry so nothing
-        #    operator-only escapes.
-        summary = self.get_lives_summary(handles, tz=tz)
-
-        items: list[dict[str, Any]] = []
-        for sub in publics:
-            h = sub.unique_id
-            if not h:
-                continue
-            row = summary.get(h.lstrip("@").lower(), {}) or {}
-            summary_slice = self._pick(row, self._PUBLIC_SUMMARY_FIELDS)
-            # Same trim as the admin bundle: `last_broadcasts` is a
-            # 3-element history but the React card only reads index 0.
-            # Slicing here mirrors the admin behaviour and shrinks the
-            # public response symmetrically.
-            if isinstance(summary_slice.get("last_broadcasts"), list):
-                summary_slice["last_broadcasts"] = summary_slice["last_broadcasts"][:1]
-            items.append(
-                {
-                    "subscription": self._pick(sub, self._PUBLIC_SUBSCRIPTION_FIELDS),
-                    "summary":      summary_slice,
-                }
-            )
-
-        result = {"items": items}
-        if not isinstance(self._public_lives_summary_cache, dict):
-            self._public_lives_summary_cache = {}
-        self._public_lives_summary_cache[tz] = (now, result)
-        return result
 
     # `get_lives_totals` is polled every 30 s by the /admin/tiktok
     # header strip. It's three unfiltered aggregates over
@@ -3619,12 +3786,16 @@ class TikTokService:
         now = time.monotonic()
         cached = self._lives_totals_cache
         if cached is not None and (now - cached[0]) < self._LIVES_TOTALS_TTL_S:
+            self._record_cache("lives_totals", hit=True)
             return cached[1]
+        self._record_cache("lives_totals", hit=False)
 
         with self._lives_totals_lock:
             now2 = time.monotonic()
             cached2 = self._lives_totals_cache
             if cached2 is not None and (now2 - cached2[0]) < self._LIVES_TOTALS_TTL_S:
+                # Inside-the-lock late hit: collapse with another caller.
+                # Already counted the miss above for observability.
                 return cached2[1]
             result = self._persistence.get_lives_totals()
             self._lives_totals_cache = (now2, result)
@@ -3955,6 +4126,7 @@ class TikTokService:
                 on_event=self._handle_event_for(unique_id),
                 on_state_change=self._handle_state_change_for(unique_id),
                 on_terminal_error=self._handle_terminal_error_for(unique_id),
+                on_offline=self._handle_offline_for(unique_id),
             )
             self._sessions[unique_id] = session
         # Reset any stale terminal-error reason; a fresh session start
@@ -4008,7 +4180,6 @@ class TikTokService:
             offline_states = {
                 SubscriptionState.DISCONNECTED.value,
                 SubscriptionState.LIVE_ENDED.value,
-                SubscriptionState.ERROR.value,
                 SubscriptionState.DISABLED.value,
             }
             if state in offline_states:
@@ -4038,6 +4209,25 @@ class TikTokService:
                 handle=unique_id,
                 detail={"kind": kind, "message": message},
             )
+        return cb
+
+    def _handle_offline_for(self, unique_id: str):
+        """Immediately sync DB to offline reality when the WS handshake proves
+        the stream is dead. Bypasses the profile scraper (which might be WAF-blocked)
+        so the host drops out of the worker queue instead of looping."""
+        async def cb() -> None:
+            try:
+                import functools
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    self._event_executor,
+                    functools.partial(
+                        self._persistence.update_subscription_profile,
+                        unique_id, profile={"is_live": False}
+                    )
+                )
+            except Exception as e:
+                logger.warning("Failed to eagerly mark offline for @%s: %s", unique_id, e)
         return cb
 
     async def _on_event(

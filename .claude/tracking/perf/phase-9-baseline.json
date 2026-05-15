@@ -1,0 +1,21 @@
+{
+  "label": "phase-9-baseline",
+  "timestamp": "2026-05-15T20:42:55.771285+00:00",
+  "base_url": "http://localhost:9020",
+  "warmup": 3,
+  "cold": {
+    "GET /admin/tiktok/lives/bundle": {
+      "ms": 29382.44,
+      "status": 200,
+      "bytes": 248004
+    }
+  },
+  "warm": {
+    "total_p50_ms": 36.7,
+    "total_p95_ms": 44.27,
+    "total_min_ms": 32.75,
+    "total_max_ms": 44.32,
+    "total_mean_ms": 37.69,
+    "runs": 20
+  }
+}

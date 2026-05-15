@@ -1,0 +1,21 @@
+{
+  "label": "phase-9.2-room_stats",
+  "timestamp": "2026-05-15T21:18:27.516400+00:00",
+  "base_url": "http://localhost:9020",
+  "warmup": 3,
+  "cold": {
+    "GET /admin/tiktok/lives/bundle": {
+      "ms": 542.7,
+      "status": 200,
+      "bytes": 247108
+    }
+  },
+  "warm": {
+    "total_p50_ms": 36.8,
+    "total_p95_ms": 42.68,
+    "total_min_ms": 33.97,
+    "total_max_ms": 42.71,
+    "total_mean_ms": 37.41,
+    "runs": 20
+  }
+}

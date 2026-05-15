@@ -156,7 +156,8 @@ export function TikTokWorkerTelemetry() {
           <SessionsCard data={data} xLabels={xLabels} labelInterval={labelInterval} />
           <CpuMemCard   data={data} xLabels={xLabels} labelInterval={labelInterval} />
           <EventTypesCard data={data} xLabels={xLabels} labelInterval={labelInterval} />
-          <WafCard      data={data} />
+          <WafCard      data={data} xLabels={xLabels} labelInterval={labelInterval} />
+          <ProfileScrapesCard data={data} xLabels={xLabels} labelInterval={labelInterval} />
           <ReconcileCard data={data} xLabels={xLabels} labelInterval={labelInterval} />
         </>
       )}
@@ -354,54 +355,122 @@ function EventTypesCard({ data, xLabels, labelInterval }: CardProps) {
   );
 }
 
-function WafCard({ data }: { data: Telemetry }) {
-  const entries = useMemo(() => {
-    return Object.entries(data.waf.totals)
-      .sort(([, a], [, b]) => b - a)
-      .slice(0, 12);
-  }, [data.waf.totals]);
+function WafCard({ data, xLabels, labelInterval }: CardProps) {
   const opt = useMemo(() => {
-    if (entries.length === 0) return null;
-    const handles = entries.map(([h]) => h);
-    const counts = entries.map(([, n]) => n);
+    const r = data.profile_scrapes;
+    const hasData = r.waf.some((v) => v > 0);
+    if (!hasData) return null;
     return {
       animation: false,
       tooltip: { trigger: 'axis' as const },
-      grid: { left: 110, right: 24, top: 8, bottom: 24 },
-      xAxis: { type: 'value' as const, axisLabel: { fontSize: 10 } },
-      yAxis: {
+      legend: { bottom: 0, textStyle: { fontSize: 11 } },
+      grid: { left: 40, right: 24, top: 16, bottom: 36 },
+      xAxis: {
         type: 'category' as const,
-        data: handles,
-        inverse: true,
-        axisLabel: { fontSize: 10 },
+        data: xLabels,
+        axisLabel: { fontSize: 10, interval: labelInterval, margin: 6 },
       },
+      yAxis: { type: 'value' as const, axisLabel: { fontSize: 10 } },
       series: [
         {
-          type: 'bar' as const,
-          data: counts,
+          name: 'WAF hits',
+          type: 'line' as const,
+          data: r.waf,
           itemStyle: { color: '#f59e0b' },
-          barCategoryGap: '20%',
+          areaStyle: { color: 'rgba(245, 158, 11, 0.1)' },
+          smooth: true,
+          showSymbol: false,
         },
       ],
     };
-  }, [entries]);
+  }, [data.profile_scrapes, xLabels, labelInterval]);
+
+  const totalWafs = useMemo(() => data.profile_scrapes.waf.reduce((a, b) => a + b, 0), [data.profile_scrapes]);
+
   return (
     <ChartCard
-      title="WAF pressure by handle"
-      subtitle={
-        'Counts a WAF challenge each time the profile scraper trips '
-        + 'the public-site anti-bot gate (rate-limited to 1 row / handle / 10 min).'
-      }
+      title="WAF pressure over time"
+      subtitle="Plots the absolute number of WAF challenges encountered by the profile scraper per time bin."
       headlineChips={[
-        ['detections', data.waf.all.toLocaleString()],
-        ['affected handles', String(Object.keys(data.waf.totals).length)],
+        ['total WAFs', totalWafs.toLocaleString()],
       ]}
       empty={!opt}
       emptyMsg="No WAF detections in this window."
     >
       {opt && (
         <ReactECharts echarts={echarts} option={opt}
-                      style={{ height: Math.max(160, entries.length * 22 + 50), width: '100%' }}
+                      style={{ height: 240, width: '100%' }}
+                      notMerge lazyUpdate />
+      )}
+    </ChartCard>
+  );
+}
+
+function ProfileScrapesCard({ data, xLabels, labelInterval }: CardProps) {
+  const opt = useMemo(() => {
+    const r = data.profile_scrapes;
+    const hasData = r.success.some(v => v > 0) || r.waf.some(v => v > 0) || r.error.some(v => v > 0);
+    if (!hasData) return null;
+
+    return {
+      animation: false,
+      tooltip: { trigger: 'axis' as const },
+      legend: { show: true, bottom: 0, textStyle: { fontSize: 11 } },
+      grid: { left: 40, right: 24, top: 16, bottom: 36 },
+      xAxis: {
+        type: 'category' as const,
+        data: xLabels,
+        axisLabel: { fontSize: 10, interval: labelInterval, margin: 6 },
+      },
+      yAxis: { type: 'value' as const, axisLabel: { fontSize: 10 } },
+      series: [
+        {
+          name: 'Success',
+          type: 'line' as const,
+          data: r.success,
+          itemStyle: { color: '#10b981' },
+          smooth: true,
+          showSymbol: false,
+        },
+        {
+          name: 'WAF',
+          type: 'line' as const,
+          data: r.waf,
+          itemStyle: { color: '#f59e0b' },
+          smooth: true,
+          showSymbol: false,
+        },
+        {
+          name: 'Error',
+          type: 'line' as const,
+          data: r.error,
+          itemStyle: { color: '#ef4444' },
+          smooth: true,
+          showSymbol: false,
+        },
+      ],
+    };
+  }, [data.profile_scrapes, xLabels, labelInterval]);
+
+  const totalSuccess = useMemo(() => data.profile_scrapes.success.reduce((a,b)=>a+b,0), [data.profile_scrapes]);
+  const totalWaf = useMemo(() => data.profile_scrapes.waf.reduce((a,b)=>a+b,0), [data.profile_scrapes]);
+  const totalError = useMemo(() => data.profile_scrapes.error.reduce((a,b)=>a+b,0), [data.profile_scrapes]);
+
+  return (
+    <ChartCard
+      title="Profile scrape outcomes"
+      subtitle="Plots the success and failure of individual public profile fetches over time."
+      headlineChips={[
+        ['success', totalSuccess.toLocaleString()],
+        ['waf', totalWaf.toLocaleString()],
+        ['error', totalError.toLocaleString()],
+      ]}
+      empty={!opt}
+      emptyMsg="No scrape data in this window."
+    >
+      {opt && (
+        <ReactECharts echarts={echarts} option={opt}
+                      style={{ height: 240, width: '100%' }}
                       notMerge lazyUpdate />
       )}
     </ChartCard>

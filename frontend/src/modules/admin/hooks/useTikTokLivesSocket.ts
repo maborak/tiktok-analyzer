@@ -99,6 +99,18 @@ export interface UseTikTokLivesSocketResult {
    * replies with one snapshot frame per handle.
    */
   requestSnapshot: (handles: string[]) => void;
+  /**
+   * Seed the internal per-host version map from a bundle response so
+   * an on-reconnect snapshot request covers every host the page already
+   * knows about. Without this, the hook starts with an empty version
+   * map; if the WS drops before the first delta arrives, the reconnect
+   * skips the snapshot step and per-host cards stay stale until the
+   * next 5-minute reconcile poll.
+   *
+   * Idempotent — only writes versions that are >= the currently-tracked
+   * value, so a stale call doesn't roll the cursor backwards.
+   */
+  seedVersions: (versions: Record<string, number>) => void;
 }
 
 
@@ -305,7 +317,24 @@ export function useTikTokLivesSocket(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [audience, maxReconnectAttempts]);
 
-  return { status, versionByHost, requestSnapshot };
+  const seedVersions = useCallback((versions: Record<string, number>) => {
+    let mutated = false;
+    const next = { ...versionByHostRef.current };
+    for (const [host, v] of Object.entries(versions)) {
+      if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0) continue;
+      const cur = next[host];
+      if (cur == null || v > cur) {
+        next[host] = v;
+        mutated = true;
+      }
+    }
+    if (mutated) {
+      versionByHostRef.current = next;
+      setVersionByHost(next);
+    }
+  }, []);
+
+  return { status, versionByHost, requestSnapshot, seedVersions };
 }
 
 

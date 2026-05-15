@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useMemo, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from 'react';
 import { Radio } from 'lucide-react';
 
 import { PageShell, PageHeader } from '@/components/ui/PageShell';
@@ -7,6 +7,7 @@ import {
   type TikTokSubscription,
   type TikTokLiveSummary,
 } from '@admin';
+import { useTikTokLivesSocket } from '@admin/hooks/useTikTokLivesSocket';
 // Same code-split as the admin /admin/tiktok page — the gifter modal
 // pulls echarts on import and is closed 99% of the time. Loading the
 // chunk on first open keeps the public-lives bundle (which a viewer
@@ -74,6 +75,53 @@ function PublicLivesBody() {
   const [entries, setEntries] = useState<PublicEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  // WS-pushed per-host deltas via `/public/tiktok/ws`. Server-side
+  // deltas are pre-sanitized to the public-summary allowlist, so we
+  // can apply them straight into the matching `PublicEntry.summary`
+  // without re-trimming. When the WS is up (status === 'live'), the
+  // page is sub-second fresh; the 30 s reconcile poll below stays as
+  // a safety net for missed deltas and to catch host list changes
+  // (a new public handle, a removed one).
+  const onSocketUpdate = useCallback(
+    (host: string, slice: TikTokLiveSummary, version: number) => {
+      setEntries((prev) => {
+        let mutated = false;
+        const next = prev.map((entry) => {
+          if (entry.subscription.unique_id !== host) return entry;
+          const merged = { ...entry.summary, ...slice, version };
+          if (JSON.stringify(entry.summary) === JSON.stringify(merged)) {
+            return entry;
+          }
+          mutated = true;
+          return { ...entry, summary: merged };
+        });
+        return mutated ? next : prev;
+      });
+    },
+    [],
+  );
+
+  const wsStatus = useTikTokLivesSocket({
+    audience: 'public',
+    onUpdate: onSocketUpdate,
+  });
+
+  // Seed per-host versions from the polled bundle so reconnects can
+  // request snapshots for every host we already know about. Same
+  // rationale as `TikTokLives.tsx` — see `seedVersions`.
+  useEffect(() => {
+    const versions: Record<string, number> = {};
+    for (const entry of entries) {
+      const v = (entry.summary as { version?: number }).version;
+      if (typeof v === 'number' && v > 0) {
+        versions[entry.subscription.unique_id] = v;
+      }
+    }
+    if (Object.keys(versions).length > 0) {
+      wsStatus.seedVersions(versions);
+    }
+  }, [entries, wsStatus]);
   // Gifter detail modal — mirrors the admin page. The modal queries
   // its own data via `/admin/...` endpoints today, but those calls
   // return the same shape for unauthenticated viewers when the modal

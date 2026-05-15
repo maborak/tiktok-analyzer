@@ -1,0 +1,21 @@
+{
+  "label": "phase-9.1-wk_diam-preagg",
+  "timestamp": "2026-05-15T20:57:25.635013+00:00",
+  "base_url": "http://localhost:9020",
+  "warmup": 3,
+  "cold": {
+    "GET /admin/tiktok/lives/bundle": {
+      "ms": 1310.62,
+      "status": 200,
+      "bytes": 251685
+    }
+  },
+  "warm": {
+    "total_p50_ms": 40.1,
+    "total_p95_ms": 46.13,
+    "total_min_ms": 35.32,
+    "total_max_ms": 46.17,
+    "total_mean_ms": 39.74,
+    "runs": 20
+  }
+}

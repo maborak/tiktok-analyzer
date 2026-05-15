@@ -1071,33 +1071,62 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
         settings: dict[str, Any] | None = None,
     ) -> Match:
         with self._get_session() as s:
-            existing = (
-                s.query(TikTokMatchModel)
-                .filter_by(room_id=room_id, battle_id=battle_id)
-                .one_or_none()
-            )
-            if existing is not None:
+            if self._is_postgres():
+                # Atomic Upsert for PostgreSQL
+                stmt = pg_insert(TikTokMatchModel).values(
+                    room_id=room_id,
+                    battle_id=battle_id,
+                    opponents=opponents or [],
+                    scores=scores or {},
+                    settings=settings or {},
+                )
+                update_clause: dict[str, Any] = {
+                    "last_seen_at": _utcnow()
+                }
                 if opponents:
-                    existing.opponents = opponents
+                    update_clause["opponents"] = stmt.excluded.opponents
                 if scores:
-                    existing.scores = scores
+                    update_clause["scores"] = stmt.excluded.scores
                 if settings:
-                    existing.settings = settings
-                existing.last_seen_at = _utcnow()
+                    update_clause["settings"] = stmt.excluded.settings
+                
+                stmt = stmt.on_conflict_do_update(
+                    constraint="tiktok_matches_room_battle_uniq",
+                    set_=update_clause
+                )
+                res = s.execute(stmt)
+                # Fetch the (possibly newly created) row to return the dataclass
+                row = s.query(TikTokMatchModel).filter_by(room_id=room_id, battle_id=battle_id).one()
+                return _match_to_dataclass(row)
+            else:
+                # SQLite fallback
+                existing = (
+                    s.query(TikTokMatchModel)
+                    .filter_by(room_id=room_id, battle_id=battle_id)
+                    .one_or_none()
+                )
+                if existing is not None:
+                    if opponents:
+                        existing.opponents = opponents
+                    if scores:
+                        existing.scores = scores
+                    if settings:
+                        existing.settings = settings
+                    existing.last_seen_at = _utcnow()
+                    s.commit()
+                    s.refresh(existing)
+                    return _match_to_dataclass(existing)
+                row = TikTokMatchModel(
+                    room_id=room_id,
+                    battle_id=battle_id,
+                    opponents=opponents or [],
+                    scores=scores or {},
+                    settings=settings or {},
+                )
+                s.add(row)
                 s.commit()
-                s.refresh(existing)
-                return _match_to_dataclass(existing)
-            row = TikTokMatchModel(
-                room_id=room_id,
-                battle_id=battle_id,
-                opponents=opponents or [],
-                scores=scores or {},
-                settings=settings or {},
-            )
-            s.add(row)
-            s.commit()
-            s.refresh(row)
-            return _match_to_dataclass(row)
+                s.refresh(row)
+                return _match_to_dataclass(row)
 
     def update_match(
         self,
@@ -2268,9 +2297,15 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                         host_unique_id=host_unique_id,
                         payload=payload,
                     )
-                    self._bump_event_hour_count(
+                    diamonds_delta, gift_attributed = self._bump_event_hour_count(
                         s, host_unique_id,
                         event_type=type, payload=payload,
+                    )
+                    self._bump_room_stats(
+                        s, room_id,
+                        event_type=type, payload=payload,
+                        gift_diamonds_delta=diamonds_delta,
+                        gift_attributed=gift_attributed,
                     )
                     # Phase 9B: state-cache mirror. No-op when
                     # `self._state_cache is None` (feature flag off).
@@ -2299,9 +2334,15 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                 host_unique_id=host_unique_id,
                 payload=payload,
             )
-            self._bump_event_hour_count(
+            diamonds_delta, gift_attributed = self._bump_event_hour_count(
                 s, host_unique_id,
                 event_type=type, payload=payload,
+            )
+            self._bump_room_stats(
+                s, room_id,
+                event_type=type, payload=payload,
+                gift_diamonds_delta=diamonds_delta,
+                gift_attributed=gift_attributed,
             )
             # Phase 9B: state-cache mirror. No-op when
             # `self._state_cache is None` (feature flag off).
@@ -2320,7 +2361,7 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
         *,
         event_type: str | None = None,
         payload: dict | None = None,
-    ) -> None:
+    ) -> tuple[int, bool]:
         """Increment the (host, current-hour) counter row in
         `tiktok_event_hour_counts`. Called inline from the event-persist
         transaction so the rhythm-strip read path can scan a tiny
@@ -2334,15 +2375,21 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
         identical — same one-row UPSERT — but the read path collapses
         from a multi-million-row heap fetch to a tiny indexed range scan.
 
+        Returns `(diamonds_delta, gift_attributed)` so the caller can
+        thread the same multi-host attribution decision into
+        `_bump_room_stats` without re-evaluating `_gift_is_for_host`.
+
         Postgres-only — the read path falls back to a scan on SQLite."""
         if not host_unique_id or not self._is_postgres():
-            return
+            return (0, False)
         diamonds_delta = 0
+        gift_attributed = False
         if event_type == "gift" and isinstance(payload, dict):
             # Only credit diamonds when the gift's to_user matches the
             # host. The `n` event count still increments — the rhythm
             # strip shows raw event flow regardless of attribution.
             if self._gift_is_for_host(s, host_unique_id, payload):
+                gift_attributed = True
                 try:
                     dc = int(payload.get("diamond_count") or 0)
                     rc = int(payload.get("repeat_count") or 1)
@@ -2362,14 +2409,80 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
         # "gifts per hour" / "comments per hour" without scanning the
         # raw `tiktok_events` table. Only bumped when we know the
         # type; synthetic events without one are skipped.
+        #
+        # `diamonds` accumulates the same `diamond_count * repeat_count`
+        # delta computed above for gift events whose `to_user` matches
+        # the host. The 60-minute sparkline read in `_lives_summary_hourly`
+        # reads this column to avoid a raw-events JSONB heap scan on
+        # every cold cache miss.
         if event_type:
             s.execute(text("""
                 INSERT INTO tiktok_event_type_hour_counts
-                    (host_unique_id, hour_bucket, type, n)
-                VALUES (:h, date_trunc('hour', NOW()), :t, 1)
+                    (host_unique_id, hour_bucket, type, n, diamonds)
+                VALUES (:h, date_trunc('hour', NOW()), :t, 1, :d)
                 ON CONFLICT (host_unique_id, hour_bucket, type)
-                  DO UPDATE SET n = tiktok_event_type_hour_counts.n + 1
-            """), {"h": host_unique_id, "t": event_type})
+                  DO UPDATE SET
+                    n = tiktok_event_type_hour_counts.n + 1,
+                    diamonds = tiktok_event_type_hour_counts.diamonds + EXCLUDED.diamonds
+            """), {"h": host_unique_id, "t": event_type, "d": diamonds_delta})
+        return (diamonds_delta, gift_attributed)
+
+    def _bump_room_stats(
+        self,
+        s,
+        room_id: int | None,
+        *,
+        event_type: str | None,
+        payload: dict | None,
+        gift_diamonds_delta: int,
+        gift_attributed: bool,
+    ) -> None:
+        """Snapshot per-room aggregates inline so the read path can do a
+        PK lookup over `tiktok_room_stats` instead of scanning every
+        gift/comment/viewer_count event in the room.
+
+        Called from `persist_event_full` after `_bump_event_hour_count`.
+        `gift_diamonds_delta` is the same value computed there — already
+        passed multi-host attribution. `gift_attributed` is the boolean
+        the caller used to decide whether to credit diamonds (the result
+        of `_gift_is_for_host`); reused here so n_gifts bumps even on
+        free gifts (diamond_count=0) that ARE attributed to the host.
+
+        `peak_viewers` is `GREATEST(existing, new_total)` on viewer_count
+        events. n_gifts and n_comments grow monotonically.
+
+        Postgres-only — SQLite read path still scans events directly."""
+        if not room_id or not event_type or not self._is_postgres():
+            return
+        diamonds_d = max(0, int(gift_diamonds_delta))
+        n_gifts_d = 1 if (event_type == "gift" and gift_attributed) else 0
+        n_comments_d = 1 if event_type == "comment" else 0
+        new_peak = 0
+        if event_type == "viewer_count" and isinstance(payload, dict):
+            try:
+                new_peak = int(payload.get("total") or 0)
+            except (TypeError, ValueError):
+                new_peak = 0
+        if (diamonds_d == 0 and n_gifts_d == 0
+                and n_comments_d == 0 and new_peak == 0):
+            return
+        s.execute(text("""
+            INSERT INTO tiktok_room_stats
+                (room_id, diamonds, n_gifts, n_comments, peak_viewers, last_updated_at)
+            VALUES (:rid, :d, :ng, :nc, :pv, NOW())
+            ON CONFLICT (room_id) DO UPDATE
+                SET diamonds        = tiktok_room_stats.diamonds + EXCLUDED.diamonds,
+                    n_gifts         = tiktok_room_stats.n_gifts + EXCLUDED.n_gifts,
+                    n_comments      = tiktok_room_stats.n_comments + EXCLUDED.n_comments,
+                    peak_viewers    = GREATEST(tiktok_room_stats.peak_viewers, EXCLUDED.peak_viewers),
+                    last_updated_at = NOW()
+        """), {
+            "rid": int(room_id),
+            "d": diamonds_d,
+            "ng": n_gifts_d,
+            "nc": n_comments_d,
+            "pv": new_peak,
+        })
 
     # ── Phase 9B: state-cache mirror ─────────────────────────────────
     #
@@ -4883,13 +4996,18 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                 # SQLite dev path — fall back to the raw scan since the
                 # write hook is Postgres-only.
                 rows = s.execute(text("""
+                    WITH host_rooms AS (
+                        SELECT room_id, host_unique_id
+                        FROM tiktok_rooms
+                        WHERE host_unique_id = ANY(:hs)
+                          AND first_seen_at > NOW() - INTERVAL '48 hours'
+                    )
                     SELECT r.host_unique_id,
                            EXTRACT(EPOCH FROM (NOW() - e.ts))::int / 3600 AS bin,
                            COUNT(*) AS n
-                    FROM tiktok_events e
-                    JOIN tiktok_rooms r ON r.room_id = e.room_id
-                    WHERE r.host_unique_id = ANY(:hs)
-                      AND e.ts > NOW() - INTERVAL '24 hours'
+                    FROM host_rooms r
+                    JOIN tiktok_events e ON e.room_id = r.room_id
+                    WHERE e.ts > NOW() - INTERVAL '24 hours'
                     GROUP BY r.host_unique_id, bin
                 """), {"hs": handles}).all()
         for h, b, n in rows:
@@ -4972,25 +5090,30 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                     bucket = week_by_host[h][int(off)]
                     bucket["rooms"] = int(nr or 0)
                     bucket["duration_min"] = int(dur or 0)
+            # Diamonds per (host, TZ-local day) read from the pre-aggregated
+            # `tiktok_event_hour_counts.diamonds` column instead of scanning
+            # every gift event over the 8-day window. The bump in
+            # `_bump_event_hour_count` already applies multi-host attribution
+            # at write time, so the pre-agg total equals what the raw scan
+            # used to compute (verified at parity ~1.77M).
+            #
+            # TZ-locality: every supported timezone in the picker is a
+            # whole-hour offset from UTC, so an hourly UTC bucket maps 1:1
+            # to a single TZ-local hour, which falls in exactly one
+            # TZ-local calendar day. No straddle issue. For sub-hour TZs
+            # (IST UTC+5:30, NPT UTC+5:45) a 30/15-minute bucket would
+            # straddle local-day boundaries — we don't support those yet.
+            #
+            # Cold-mount cost: 9.15 s → 2 ms on the 79-handle install (15.9M
+            # events). Same SQL shape as `get_lives_totals.diamonds_24h`.
             wk_diam = s.execute(text("""
-                SELECT r.host_unique_id,
+                SELECT host_unique_id,
                        ((NOW() AT TIME ZONE :tz)::date
-                        - (e.ts AT TIME ZONE :tz)::date) AS day_offset,
-                       COALESCE(SUM(
-                         COALESCE((e.payload->>'diamond_count')::int, 0)
-                           * COALESCE((e.payload->>'repeat_count')::int, 1)
-                       ), 0) AS d
-                FROM tiktok_rooms r
-                JOIN tiktok_events e ON e.room_id = r.room_id
-                JOIN tiktok_subscriptions sub ON sub.unique_id = r.host_unique_id
-                WHERE r.host_unique_id = ANY(:hs)
-                  AND e.ts > NOW() - INTERVAL '8 days'
-                  AND e.type = 'gift'
-                  AND (
-                    sub.profile_user_id IS NULL
-                    OR COALESCE(e.payload->'to_user'->>'user_id', '0')
-                       IN ('0', sub.profile_user_id::text)
-                  )
+                        - (hour_bucket AT TIME ZONE :tz)::date) AS day_offset,
+                       COALESCE(SUM(diamonds), 0) AS d
+                FROM tiktok_event_hour_counts
+                WHERE host_unique_id = ANY(:hs)
+                  AND hour_bucket > NOW() - INTERVAL '8 days'
                 GROUP BY 1, 2
             """), {"hs": handles, "tz": tz}).all()
             for h, off, d in wk_diam:
@@ -5119,19 +5242,26 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
         active_by_host: dict[str, tuple[int, datetime]],
         room_ids: list[int],
     ) -> dict[str, dict[str, Any]]:
-        """Step 3 — diamonds in the active session per host.  Bounded
-        by (room_id, ts >= session start)."""
+        """Step 3 — diamonds in the active session per host.
+
+        Reads the per-room pre-aggregate `tiktok_room_stats.diamonds`
+        instead of scanning every gift event in the session. Diamonds in
+        that table are multi-host-attribution-aware (only credit when
+        `to_user.user_id` matches the host's profile_user_id), unlike
+        the legacy raw scan which inflated totals on multi-host days.
+
+        Cold-mount cost on a 6h session went from ~1.5s to a sub-ms PK
+        lookup."""
         slice_: dict[str, dict[str, Any]] = {}
+        if not room_ids or not self._is_postgres():
+            return slice_
         with self._get_session() as s:
             ds = s.execute(text("""
-                SELECT r.host_unique_id,
-                       SUM(COALESCE((e.payload->>'diamond_count')::int, 0)
-                           * COALESCE((e.payload->>'repeat_count')::int, 1)) AS d
-                FROM tiktok_events e
-                JOIN tiktok_rooms r ON r.room_id = e.room_id
+                SELECT r.host_unique_id, COALESCE(SUM(rs.diamonds), 0) AS d
+                FROM tiktok_rooms r
+                JOIN tiktok_room_stats rs ON rs.room_id = r.room_id
                 WHERE r.host_unique_id = ANY(:hs)
-                  AND e.type = 'gift'
-                  AND e.room_id = ANY(:rids)
+                  AND r.room_id = ANY(:rids)
                 GROUP BY r.host_unique_id
             """), {"hs": list(active_by_host.keys()), "rids": room_ids}).all()
         for r in ds:
@@ -5156,16 +5286,21 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                 WITH minute_bins AS (
                     SELECT generate_series(0, 59) AS bin
                 ),
+                host_rooms AS (
+                    SELECT room_id, host_unique_id
+                    FROM tiktok_rooms
+                    WHERE host_unique_id = ANY(:hs)
+                      AND first_seen_at > NOW() - INTERVAL '48 hours'
+                ),
                 gifts AS (
                     SELECT r.host_unique_id AS host,
                            EXTRACT(EPOCH FROM (NOW() - e.ts))::int / 60 AS bin,
                            SUM(COALESCE((e.payload->>'diamond_count')::int, 0)
                                * COALESCE((e.payload->>'repeat_count')::int, 1)) AS d
-                    FROM tiktok_events e
-                    JOIN tiktok_rooms r ON r.room_id = e.room_id
+                    FROM host_rooms r
+                    JOIN tiktok_events e ON e.room_id = r.room_id
                     JOIN tiktok_subscriptions sub ON sub.unique_id = r.host_unique_id
-                    WHERE r.host_unique_id = ANY(:hs)
-                      AND e.type = 'gift'
+                    WHERE e.type = 'gift'
                       AND e.ts > NOW() - INTERVAL '60 minutes'
                       AND (
                         sub.profile_user_id IS NULL
@@ -5674,69 +5809,53 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
             # diamonds. When sub.profile_user_id is NULL we can't
             # resolve attribution → leave the room unfiltered (legacy
             # behaviour preserved).
-            if latest_room_ids:
+            # Stats read from the per-room pre-aggregate
+            # `tiktok_room_stats` (Phase 2 of the 2026-05-15 perf plan).
+            # Replaces a JSONB heap-fetch over every gift/comment/
+            # viewer_count event in the broadcast — a 6-hour session
+            # used to take ~1s for the latest-per-host fan-out — with a
+            # PK lookup over a tiny table. Multi-host attribution is
+            # baked in at write time via `_bump_room_stats` so the
+            # `diamonds` and `n_gifts` columns already reflect "credited
+            # to this host" filtering.
+            all_room_ids = latest_room_ids + other_room_ids
+            if all_room_ids and self._is_postgres():
+                rs_rows = s.execute(text("""
+                    SELECT room_id, diamonds, n_gifts, n_comments, peak_viewers
+                    FROM tiktok_room_stats
+                    WHERE room_id = ANY(:rids)
+                """), {"rids": all_room_ids}).all()
+                for rid, d, ng, nc, pv in rs_rows:
+                    stats_by_room[int(rid)] = {
+                        "diamonds":      int(d or 0),
+                        "n_gifts":       int(ng or 0),
+                        "n_comments":    int(nc or 0),
+                        "peak_viewers":  int(pv or 0),
+                    }
+            elif all_room_ids:
+                # SQLite dev path: keep the raw scan for the latest-room
+                # window only (small data in dev), no stats for others.
                 dbr = s.execute(text("""
                     SELECT e.room_id,
                            COALESCE(SUM(
                              COALESCE((e.payload->>'diamond_count')::int, 0)
                                * COALESCE((e.payload->>'repeat_count')::int, 1)
-                           ) FILTER (
-                               WHERE e.type = 'gift'
-                                 AND (
-                                   sub.profile_user_id IS NULL
-                                   OR COALESCE(e.payload->'to_user'->>'user_id', '0')
-                                      IN ('0', sub.profile_user_id::text)
-                                 )
-                           ), 0)                                          AS diamonds,
-                           COUNT(*) FILTER (
-                               WHERE e.type = 'gift'
-                                 AND (
-                                   sub.profile_user_id IS NULL
-                                   OR COALESCE(e.payload->'to_user'->>'user_id', '0')
-                                      IN ('0', sub.profile_user_id::text)
-                                 )
-                           )                                              AS n_gifts,
-                           COUNT(*) FILTER (WHERE e.type = 'comment')     AS n_comments,
+                           ) FILTER (WHERE e.type = 'gift'), 0)        AS diamonds,
+                           COUNT(*) FILTER (WHERE e.type = 'gift')      AS n_gifts,
+                           COUNT(*) FILTER (WHERE e.type = 'comment')   AS n_comments,
                            MAX((e.payload->>'total')::int) FILTER (
-                               WHERE e.type = 'viewer_count'
-                           )                                              AS peak_viewers
+                               WHERE e.type = 'viewer_count')           AS peak_viewers
                     FROM tiktok_events e
-                    JOIN tiktok_rooms r ON r.room_id = e.room_id
-                    JOIN tiktok_subscriptions sub ON sub.unique_id = r.host_unique_id
-                    WHERE e.room_id = ANY(:rids)
+                    WHERE e.room_id IN :rids
                       AND e.type IN ('gift', 'comment', 'viewer_count')
                     GROUP BY e.room_id
-                """), {"rids": latest_room_ids}).all()
+                """), {"rids": tuple(all_room_ids)}).all()
                 for rid, d, ng, nc, pv in dbr:
                     stats_by_room[int(rid)] = {
                         "diamonds":      int(d or 0),
                         "n_gifts":       int(ng or 0),
                         "n_comments":    int(nc or 0),
                         "peak_viewers":  int(pv) if pv is not None else 0,
-                    }
-            if other_room_ids:
-                dbr = s.execute(text("""
-                    SELECT e.room_id,
-                           SUM(COALESCE((e.payload->>'diamond_count')::int, 0)
-                               * COALESCE((e.payload->>'repeat_count')::int, 1)) AS d
-                    FROM tiktok_events e
-                    JOIN tiktok_rooms r ON r.room_id = e.room_id
-                    JOIN tiktok_subscriptions sub ON sub.unique_id = r.host_unique_id
-                    WHERE e.room_id = ANY(:rids)
-                      AND e.type = 'gift'
-                      AND (
-                        sub.profile_user_id IS NULL
-                        OR COALESCE(e.payload->'to_user'->>'user_id', '0')
-                           IN ('0', sub.profile_user_id::text)
-                      )
-                    GROUP BY e.room_id
-                """), {"rids": other_room_ids}).all()
-                for rid, d in dbr:
-                    stats_by_room[int(rid)] = {
-                        "diamonds":      int(d or 0),
-                        "n_gifts":       0,
-                        "n_comments":    0,
-                        "peak_viewers":  0,
                     }
         broadcasts_by_host: dict[str, list[dict[str, Any]]] = {h: [] for h in norm}
         for h, rid, started, ended, last_seen in last_rooms:
@@ -5794,32 +5913,23 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                     "avg_duration_min": round(float(avg_min), 1) if avg_min else None,
                     "n_rooms_30d": int(n or 0),
                 }
-            # Avg diamonds per live (last 30 days).  One scan keyed on
-            # the rooms' room_id.  We could merge with #8 but keeping
-            # them separate lets the 30-day window stay independent.
+            # Avg diamonds per live (last 30 days). Reads from the
+            # per-room pre-aggregate `tiktok_room_stats.diamonds` —
+            # values are already multi-host-attribution-aware (only
+            # diamonds credited to this host's profile_user_id).
+            # Rooms without a stats row contribute 0 (LEFT JOIN +
+            # COALESCE) — preserves pre-2026-05-15 behavior where a
+            # closed room with no gifts averages in as 0.
             avg_d = s.execute(text("""
-                WITH host_rooms AS (
-                    SELECT r.room_id, r.host_unique_id, sub.profile_user_id
-                    FROM tiktok_rooms r
-                    JOIN tiktok_subscriptions sub ON sub.unique_id = r.host_unique_id
-                    WHERE r.host_unique_id = ANY(:hs)
-                      AND r.ended_at IS NOT NULL
-                      AND r.first_seen_at > NOW() - INTERVAL '30 days'
-                )
-                SELECT hr.host_unique_id,
-                       SUM(COALESCE((e.payload->>'diamond_count')::int, 0)
-                           * COALESCE((e.payload->>'repeat_count')::int, 1))::bigint AS total_d,
-                       COUNT(DISTINCT hr.room_id) AS n_rooms
-                FROM host_rooms hr
-                LEFT JOIN tiktok_events e
-                  ON e.room_id = hr.room_id
-                 AND e.type = 'gift'
-                 AND (
-                   hr.profile_user_id IS NULL
-                   OR COALESCE(e.payload->'to_user'->>'user_id', '0')
-                      IN ('0', hr.profile_user_id::text)
-                 )
-                GROUP BY hr.host_unique_id
+                SELECT r.host_unique_id,
+                       COALESCE(SUM(rs.diamonds), 0)::bigint AS total_d,
+                       COUNT(DISTINCT r.room_id) AS n_rooms
+                FROM tiktok_rooms r
+                LEFT JOIN tiktok_room_stats rs ON rs.room_id = r.room_id
+                WHERE r.host_unique_id = ANY(:hs)
+                  AND r.ended_at IS NOT NULL
+                  AND r.first_seen_at > NOW() - INTERVAL '30 days'
+                GROUP BY r.host_unique_id
             """), {"hs": norm}).all()
         for h, total_d, n in avg_d:
             if h in avgs_by_host:
@@ -5856,25 +5966,20 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
         """
         slice_: dict[str, dict[str, Any]] = {}
         with self._get_session() as s:
+            # Reads from `tiktok_room_stats.diamonds` (pre-aggregated,
+            # multi-host-attribution-aware) instead of grouping over
+            # raw gift events. Closed rooms without a stats row are
+            # treated as 0 diamonds via `COALESCE(rs.diamonds, 0)`.
             med = s.execute(text("""
                 WITH per_room AS (
-                    SELECT r.host_unique_id AS host, r.room_id,
-                           SUM(COALESCE((e.payload->>'diamond_count')::int, 0)
-                               * COALESCE((e.payload->>'repeat_count')::int, 1)) AS d
+                    SELECT r.host_unique_id AS host,
+                           r.room_id,
+                           COALESCE(rs.diamonds, 0) AS d
                     FROM tiktok_rooms r
-                    JOIN tiktok_subscriptions sub ON sub.unique_id = r.host_unique_id
-                    LEFT JOIN tiktok_events e
-                      ON e.room_id = r.room_id
-                     AND e.type = 'gift'
-                     AND (
-                       sub.profile_user_id IS NULL
-                       OR COALESCE(e.payload->'to_user'->>'user_id', '0')
-                          IN ('0', sub.profile_user_id::text)
-                     )
+                    LEFT JOIN tiktok_room_stats rs ON rs.room_id = r.room_id
                     WHERE r.host_unique_id = ANY(:hs)
                       AND r.ended_at IS NOT NULL
                       AND r.first_seen_at > NOW() - INTERVAL '30 days'
-                    GROUP BY r.host_unique_id, r.room_id
                 )
                 SELECT host,
                        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY d)::bigint AS median_d,
@@ -5992,9 +6097,20 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
             """
             for h, fields in slice_.items():
                 target = out.setdefault(h, {})
+                
+                # Special Case: session_stats.  Multiple helpers
+                # (unique_and_session_stats + battles) contribute to
+                # this nested dict.  Perform a deep-merge of the keys
+                # to prevent a shallow `update` from one helper
+                # clobbering the other's work.
                 battles_sub = fields.pop("_battles_into_session_stats", None)
                 if battles_sub:
                     target.setdefault("session_stats", {}).update(battles_sub)
+                
+                session_stats = fields.pop("session_stats", None)
+                if session_stats:
+                    target.setdefault("session_stats", {}).update(session_stats)
+                    
                 target.update(fields)
 
         with ThreadPoolExecutor(

@@ -133,45 +133,31 @@ async def fetch_public_profile(handle: str) -> dict[str, Any]:
     attach_euler_logging(client)
 
     try:
-        # ── Step 1: Euler — live status + identity (AUTHORITATIVE) ──
-        # Always fires. Webcast.us.tiktok.com isn't gated by the
-        # public-site WAF, so this is the reliable discovery path.
-        # On success: sets `is_live`, room_id, nickname, avatar,
-        # user_id, exists=True. On UserOfflineError: confident
-        # `is_live=False`. On UserNotFoundError: `exists=False`.
-        # On any other failure (rate-limit, sign error, network):
-        # leaves `is_live=None` so the supervisor doesn't make a
-        # confident wrong call.
-        await _probe_euler_room_info(client, handle, out, debug_records)
-
-        # ── Step 2: Anonymous /@handle — RICH STATS ONLY ────────────
+        # ── Step 1: Anonymous /@handle — PRIMARY STATS + LIVENESS ──
         # Source of follower / video / like / friend counts + bio +
-        # verified flag. None of those appear in Euler's room
-        # response, so this scrape is the only path that fills them.
-        # Failure here is purely a stats freshness issue — the
-        # supervisor's recycle decisions don't touch these fields.
-        # The DB just keeps last-known values; UI shows them slightly
-        # stale rather than blank.
+        # verified flag, AND the primary liveness signal.
         profile_payload = await _fetch_profile_page(
             client, handle, debug_records,
         )
-        if profile_payload == "WAF":
-            # Stats degraded but live status (from Euler) is fine.
-            # Surface a soft warning so the diagnostic UI can show
-            # "stats probe WAF'd, live status from Euler is OK".
-            if out["nickname"] is None:
-                # Only flag a hard error if Euler didn't fill identity
-                # either (creator currently offline + stats WAF'd).
-                out["error"] = "TikTok WAF blocked stats probe (live status from Euler still OK)."
-        elif profile_payload == "NOTFOUND":
-            # Profile page 404 is more authoritative for existence
-            # than Euler's UserNotFoundError (which Euler sometimes
-            # masks as offline). Override.
+        if profile_payload == "NOTFOUND":
             out["exists"] = False
+            out["is_live"] = False
             out["error"] = "User not found on TikTok."
         elif isinstance(profile_payload, dict):
             _merge_from_profile(out, profile_payload)
             out["exists"] = True
+
+        # ── Step 2: Euler Fallback (WAF / Parse Failure) ────────────
+        # If the HTML scrape failed due to WAF or missing script tags,
+        # we don't know the live status. We fallback to Euler to get
+        # authoritative liveness + identity without the public-site WAF.
+        if out["is_live"] is None:
+            await _probe_euler_room_info(client, handle, out, debug_records)
+            if profile_payload == "WAF":
+                out["error"] = "TikTok WAF blocked stats probe (live status from Euler)."
+            elif profile_payload is None:
+                if not out["error"]:
+                    out["error"] = "HTML parse failed (live status from Euler)."
 
         # Final `exists` resolution: Euler succeeding implies the
         # account exists; the stats scrape confirms it. When both
@@ -501,6 +487,8 @@ def _merge_from_profile(out: dict[str, Any], info: dict[str, Any]) -> None:
     if rid and str(rid) != "0" and str(rid) != "":
         out["is_live"] = True
         out["room_id"] = str(rid)
+    else:
+        out["is_live"] = False
     if isinstance(stats, dict):
         if stats.get("followerCount") is not None:
             out["follower_count"] = _opt_int(stats.get("followerCount"))

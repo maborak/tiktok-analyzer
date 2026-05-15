@@ -50,4 +50,5 @@ class TikTokLiveSessionFactoryPort(ABC):
         on_event: Callable[..., Awaitable[None]],
         on_state_change: Callable[[str], Awaitable[None]] | None = None,
         on_terminal_error: Callable[[str, str], Awaitable[None]] | None = None,
+        on_offline: Callable[[], Awaitable[None]] | None = None,
     ) -> TikTokLiveSessionPort: ...

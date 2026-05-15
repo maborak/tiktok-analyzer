@@ -465,6 +465,23 @@ async def worker_telemetry(
     return svc.get_worker_telemetry(hours=hours)
 
 
+@router.get("/cache/stats")
+async def cache_stats(
+    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+):
+    """Hit/miss counters for the in-memory TTL caches that back the
+    Lives page (lives_summary, lives_totals, public_summary).
+
+    Counters reset on process restart — these are session-scoped, not
+    durable. A hit_ratio < 0.8 on `lives_summary` usually means the
+    cache TTL is shorter than the frontend poll cadence; < 0.3 means
+    something is bypassing the cache (e.g. distinct handle subsets
+    per call, or a TZ flipping between callers).
+    """
+    svc = _require_service()
+    return svc.get_cache_stats()
+
+
 @router.get("/lives/{handle}/calendar")
 async def host_calendar(
     handle: str,

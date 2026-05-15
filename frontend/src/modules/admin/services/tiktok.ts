@@ -148,6 +148,12 @@ export interface TikTokWorkerTelemetry {
     totals: Record<string, number>;
     all: number;
   };
+  profile_scrapes: {
+    bins: string[];
+    success: number[];
+    waf: number[];
+    error: number[];
+  };
   reconcile: {
     bins: string[];
     pass_count:   number[];

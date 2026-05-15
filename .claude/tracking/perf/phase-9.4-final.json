@@ -1,0 +1,21 @@
+{
+  "label": "phase-9.4-final",
+  "timestamp": "2026-05-15T21:35:51.473037+00:00",
+  "base_url": "http://localhost:9020",
+  "warmup": 3,
+  "cold": {
+    "GET /admin/tiktok/lives/bundle": {
+      "ms": 667.1,
+      "status": 200,
+      "bytes": 242272
+    }
+  },
+  "warm": {
+    "total_p50_ms": 32.12,
+    "total_p95_ms": 41.45,
+    "total_min_ms": 28.58,
+    "total_max_ms": 41.67,
+    "total_mean_ms": 32.66,
+    "runs": 20
+  }
+}
