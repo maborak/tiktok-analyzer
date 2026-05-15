@@ -114,7 +114,13 @@ def _backfill_diamonds(engine) -> None:
                 )::bigint AS diamonds
             FROM tiktok_events e
             JOIN tiktok_rooms r ON r.room_id = e.room_id
-            JOIN tiktok_subscriptions sub ON sub.unique_id = r.host_unique_id
+            LEFT JOIN tiktok_subscriptions sub
+                ON sub.unique_id = r.host_unique_id
+            -- LEFT JOIN so rooms with deleted/renamed host subscriptions
+            -- still get backfilled. Attribution predicate below treats
+            -- sub.profile_user_id IS NULL as legacy-fall-through (count
+            -- all gifts) which matches the inline _gift_is_for_host
+            -- behaviour at write time.
             WHERE e.type = 'gift'
               AND r.host_unique_id IS NOT NULL
               AND (

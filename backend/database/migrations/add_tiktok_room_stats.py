@@ -134,7 +134,13 @@ def _backfill(engine) -> None:
                 NOW() AS last_updated_at
             FROM tiktok_events e
             JOIN tiktok_rooms r ON r.room_id = e.room_id
-            JOIN tiktok_subscriptions sub ON sub.unique_id = r.host_unique_id
+            LEFT JOIN tiktok_subscriptions sub
+                ON sub.unique_id = r.host_unique_id
+            -- LEFT JOIN so rooms whose host's subscription row was
+            -- deleted/renamed still get a stats row. The attribution
+            -- predicate inside the FILTER below already handles the
+            -- unjoined case (sub.profile_user_id IS NULL → count all
+            -- gifts, matching legacy fall-through behaviour).
             WHERE e.type IN ('gift', 'comment', 'viewer_count')
             GROUP BY e.room_id
             ON CONFLICT (room_id) DO UPDATE

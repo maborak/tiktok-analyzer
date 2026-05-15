@@ -5256,10 +5256,16 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
         if not room_ids or not self._is_postgres():
             return slice_
         with self._get_session() as s:
+            # LEFT JOIN so a room that just went live (in tiktok_rooms
+            # but not yet bumped into tiktok_room_stats by the first
+            # event) returns 0 instead of being filtered out entirely.
+            # The merger downstream needs a row per host to populate
+            # diamonds_session=0; without it the field is missing.
             ds = s.execute(text("""
-                SELECT r.host_unique_id, COALESCE(SUM(rs.diamonds), 0) AS d
+                SELECT r.host_unique_id,
+                       COALESCE(SUM(rs.diamonds), 0) AS d
                 FROM tiktok_rooms r
-                JOIN tiktok_room_stats rs ON rs.room_id = r.room_id
+                LEFT JOIN tiktok_room_stats rs ON rs.room_id = r.room_id
                 WHERE r.host_unique_id = ANY(:hs)
                   AND r.room_id = ANY(:rids)
                 GROUP BY r.host_unique_id

@@ -173,25 +173,28 @@ def _set_cache_headers(
     response: Response,
     *,
     max_age: int = 15,
-    cacheable: bool = True,
+    cacheable: bool = False,
 ) -> None:
     """Apply the standard public-endpoint cache headers in-place.
 
-    Default — `Cache-Control: public, max-age=15, s-maxage=15` —
-    so browsers and CDNs absorb the fan-out from anonymous polling
-    tabs without each one rehitting the API every poll cycle. The
-    server-side service cache already absorbs the SQL fan-out for the
-    process; this header pushes one more layer up so a shared public
-    URL with N concurrent viewers collapses to 1 RTT per 15 s
-    (was: 1 RTT per viewer per 30 s).
+    Default — `Cache-Control: no-store` — so flipping a handle's
+    `is_public=False` immediately removes its data from anonymous view.
+    The server-side per-tz cache still absorbs SQL fan-out within the
+    process, but each anonymous client always re-asks the API.
 
-    Privacy: a 15-second leakage window after an operator flips a
-    handle to `is_public=False` is acceptable for public-by-design
-    payloads (no operator-only data is ever in this response — see
-    `_PUBLIC_SUMMARY_FIELDS`). For surfaces that MUST never be
-    cached after a config change (detail page that exposes the host's
-    runtime config), callers pass `cacheable=False` to force
-    `no-store`.
+    Opt-in: pass `cacheable=True` (with optional `max_age`) on the
+    bulk list endpoint we explicitly verified ships no operator-only
+    state. That emits `Cache-Control: public, max-age=N, s-maxage=N`
+    and lets CDNs + browser caches collapse the per-viewer fan-out
+    (1 RTT per viewer per 30 s → 1 RTT per shared cache per 15 s on
+    a hot public URL).
+
+    Why the default flipped to `no-store` in the 2026-05-15 audit
+    pass: 20+ existing public endpoints call this helper. Defaulting
+    to `cacheable=True` would have CDN-cached every detail/runtime/
+    status response, some of which expose operator-flippable state at
+    sub-15s latency. Safer to require opt-in per-route after a quick
+    sanity check on the response payload.
 
     `Vary: Accept-Encoding` — the only request header that meaningfully
     changes our representation is gzip vs identity. No auth / cookie /
@@ -346,7 +349,13 @@ async def public_lives(
     15 s — see `_set_cache_headers` for the trade-off.
     """
     svc = _require_service()
-    _set_cache_headers(response)
+    # The bulk list endpoint is the only public surface we explicitly
+    # opted into CDN/browser caching. Detail / runtime-config / status
+    # endpoints stay on the default `no-store` so a `is_public=False`
+    # flip is immediate. The list endpoint's payload contains only
+    # `_PUBLIC_SUMMARY_FIELDS` (audited 2026-05-15) — already public
+    # info per TikTok's own platform.
+    _set_cache_headers(response, cacheable=True, max_age=15)
     return await asyncio.to_thread(svc.get_public_lives_summary, tz=tz)
 
 

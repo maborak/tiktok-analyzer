@@ -110,6 +110,11 @@ function PublicLivesBody() {
   // Seed per-host versions from the polled bundle so reconnects can
   // request snapshots for every host we already know about. Same
   // rationale as `TikTokLives.tsx` — see `seedVersions`.
+  //
+  // Dep is `wsStatus.seedVersions` (stable useCallback ref) — depending
+  // on `wsStatus` would re-run the effect on every render because the
+  // hook returns a fresh object each time.
+  const seedVersions = wsStatus.seedVersions;
   useEffect(() => {
     const versions: Record<string, number> = {};
     for (const entry of entries) {
@@ -119,9 +124,9 @@ function PublicLivesBody() {
       }
     }
     if (Object.keys(versions).length > 0) {
-      wsStatus.seedVersions(versions);
+      seedVersions(versions);
     }
-  }, [entries, wsStatus]);
+  }, [entries, seedVersions]);
   // Gifter detail modal — mirrors the admin page. The modal queries
   // its own data via `/admin/...` endpoints today, but those calls
   // return the same shape for unauthenticated viewers when the modal

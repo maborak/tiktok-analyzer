@@ -265,6 +265,12 @@ function TikTokLivesBody() {
   // first delta arrives finds an empty version map and skips the
   // on-reconnect snapshot step, leaving cards stale until the next
   // 5-minute reconcile poll. See `useTikTokLivesSocket.ts:seedVersions`.
+  //
+  // Dep is `wsStatus.seedVersions` (stable useCallback ref), NOT
+  // `wsStatus` itself — the hook returns a fresh object each render
+  // and depending on the whole would re-fire this effect on every
+  // re-render of the page.
+  const seedVersions = wsStatus.seedVersions;
   useEffect(() => {
     const versions: Record<string, number> = {};
     for (const [host, slice] of Object.entries(summary)) {
@@ -272,9 +278,9 @@ function TikTokLivesBody() {
       if (typeof v === 'number' && v > 0) versions[host] = v;
     }
     if (Object.keys(versions).length > 0) {
-      wsStatus.seedVersions(versions);
+      seedVersions(versions);
     }
-  }, [summary, wsStatus]);
+  }, [summary, seedVersions]);
 
   // Single bundled fetch — provides initial subs + summary + totals.
   // After Phase 9.E this also acts as the periodic safety-net

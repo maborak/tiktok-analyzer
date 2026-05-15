@@ -323,9 +323,14 @@ export function useTikTokLivesSocket(
     for (const [host, v] of Object.entries(versions)) {
       if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0) continue;
       const cur = next[host];
-      if (cur == null || v > cur) {
-        next[host] = v;
-        mutated = true;
+      // `>=` (idempotent re-seed at the same version after reconnect)
+      // matches the doc and is harmless. `v < cur` is the bug we want
+      // to prevent (rolling the cursor backwards drops live deltas).
+      if (cur == null || v >= cur) {
+        if (cur !== v) {
+          next[host] = v;
+          mutated = true;
+        }
       }
     }
     if (mutated) {

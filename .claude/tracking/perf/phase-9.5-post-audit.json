@@ -1,0 +1,21 @@
+{
+  "label": "phase-9.5-post-audit",
+  "timestamp": "2026-05-15T22:05:48.195452+00:00",
+  "base_url": "http://localhost:9020",
+  "warmup": 3,
+  "cold": {
+    "GET /admin/tiktok/lives/bundle": {
+      "ms": 341.08,
+      "status": 200,
+      "bytes": 238664
+    }
+  },
+  "warm": {
+    "total_p50_ms": 31.49,
+    "total_p95_ms": 42.35,
+    "total_min_ms": 28.22,
+    "total_max_ms": 42.55,
+    "total_mean_ms": 32.14,
+    "runs": 20
+  }
+}
