@@ -149,24 +149,26 @@ export function TikTokTimezonePill({ compact = false }: Props) {
     <>
       <div
         className={
-          'flex items-center gap-2 text-[11px] font-mono ' +
-          (compact ? '' : 'flex-col items-start')
+          'flex items-center gap-2 text-[11px] font-mono min-w-0 max-w-full ' +
+          (compact ? 'flex-wrap' : 'flex-col items-start')
         }
         title={
           'Every TikTok date/time on this page renders in this zone. '
           + 'Choice persists across pages + tabs (localStorage).'
         }
       >
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2 min-w-0 max-w-full">
           <Clock className="w-3.5 h-3.5 text-gray-500 shrink-0" />
-          {!compact && <span className="auth-mono-label">Timezone</span>}
+          {!compact && <span className="auth-mono-label shrink-0">Timezone</span>}
           <select
             value={tz}
             onChange={handleSelectChange}
             className={
               'px-2 py-1 rounded-md border border-gray-200 text-[11px] '
-              + 'font-mono dark:bg-gray-100/5 truncate '
-              + (compact ? 'max-w-[180px]' : 'max-w-[220px]')
+              + 'font-mono dark:bg-gray-100/5 truncate min-w-0 '
+              + (compact
+                ? 'max-w-[140px] sm:max-w-[180px]'
+                : 'max-w-[160px] sm:max-w-[220px]')
             }
           >
             {Object.entries(grouped).map(([region, opts]) => (
@@ -182,7 +184,7 @@ export function TikTokTimezonePill({ compact = false }: Props) {
           </select>
           {activeOption && (
             <span
-              className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-sky-50 text-sky-700 dark:bg-sky-500/10 dark:text-sky-300"
+              className="shrink-0 px-1.5 py-0.5 rounded text-[10px] font-mono bg-sky-50 text-sky-700 dark:bg-sky-500/10 dark:text-sky-300"
               title={
                 `${activeOption.value} is currently ${activeOption.currentOffset} from UTC. `
                 + 'Shifts automatically on DST transitions.'
@@ -195,7 +197,7 @@ export function TikTokTimezonePill({ compact = false }: Props) {
             <button
               type="button"
               onClick={resetTz}
-              className="text-[10px] text-primary-600 hover:text-primary-800 underline decoration-dotted"
+              className="shrink-0 text-[10px] text-primary-600 hover:text-primary-800 underline decoration-dotted"
               title={`Reset to ${browserTz}`}
             >
               reset
@@ -203,8 +205,8 @@ export function TikTokTimezonePill({ compact = false }: Props) {
           )}
         </div>
         {!compact && (
-          <div className="text-[10px] text-gray-500">
-            Now: <span className="font-mono text-gray-700 dark:text-gray-300">{nowPreview}</span>
+          <div className="text-[10px] text-gray-500 min-w-0 max-w-full break-words">
+            Now: <span className="font-mono text-gray-700 dark:text-gray-300 break-all">{nowPreview}</span>
           </div>
         )}
       </div>
@@ -214,7 +216,7 @@ export function TikTokTimezonePill({ compact = false }: Props) {
           isOpen={otherOpen}
           onClose={() => setOtherOpen(false)}
           title="Enter timezone"
-          className="max-w-md"
+          className="max-w-[90vw] sm:max-w-md"
           footer={
             <div className="flex items-center justify-end gap-2">
               <Button variant="ghost" onClick={() => setOtherOpen(false)}>Cancel</Button>

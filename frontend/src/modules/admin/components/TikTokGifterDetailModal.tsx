@@ -1,10 +1,13 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Activity, Star, X } from 'lucide-react';
+import { Activity, Radio, Star, X } from 'lucide-react';
+import { Link } from '@tanstack/react-router';
 
 import { Button } from '@/components/ui/Button';
 import { Modal } from '@/components/ui/Modal';
 import { TikTokGifterModal } from '@admin/components/TikTokGifterModal';
 import { TikTokCommonGifterDetailModal } from '@admin/components/TikTokCommonGifterDetailModal';
+import { useTikTokApi } from '@admin/contexts/TikTokApiContext';
+import { useTikTokRuntimeConfig } from '@admin/contexts/TikTokRuntimeConfigContext';
 
 /** Unified gifter-detail shell. Wraps the two existing per-scope
  *  modals — the in-scope one (`TikTokGifterModal`, gifts/comments/
@@ -132,6 +135,35 @@ export function TikTokGifterDetailModal({
 
   const showTabStrip = currentAvailable && profileAvailable;
 
+  // "Go to Live" affordance — if the gifter's @handle is also one of
+  // our monitored hosts (i.e. appears in the subscriptions list), the
+  // operator can jump straight to that host's live-detail page. The
+  // check uses listLives() which is heavily cached by apiRequest's
+  // in-flight dedupe / TTL cache, and is skipped on the public
+  // audience (listLives is admin-only).
+  const tiktokApi = useTikTokApi();
+  const { audience } = useTikTokRuntimeConfig();
+  const isAdmin = audience === 'admin';
+  const [isMonitored, setIsMonitored] = useState<boolean>(false);
+  useEffect(() => {
+    if (!isAdmin || !isOpen || !uniqueId) {
+      setIsMonitored(false);
+      return;
+    }
+    let cancelled = false;
+    tiktokApi
+      .listLives()
+      .then((rows) => {
+        if (cancelled) return;
+        const handle = uniqueId.toLowerCase();
+        setIsMonitored(rows.some((r) => r.unique_id?.toLowerCase() === handle));
+      })
+      .catch(() => {
+        // Silent — falls back to "not monitored", hiding the button.
+      });
+    return () => { cancelled = true; };
+  }, [isOpen, uniqueId, isAdmin, tiktokApi]);
+
   // The shared identity row at the top. Both inner modals suppress
   // their own identity headers in embedded mode, so this is the sole
   // place identity appears. We only show fields we have — no
@@ -175,18 +207,35 @@ export function TikTokGifterDetailModal({
           )}
         </div>
       </div>
-      {headerStats.length > 0 && (
-        <div className="flex items-baseline gap-4 flex-shrink-0">
-          {headerStats.map((s) => (
-            <div key={s.label} className="text-right">
-              <div className="text-[10px] font-mono uppercase tracking-wider text-gray-500">
-                {s.label}
+      <div className="flex items-center gap-3 flex-shrink-0">
+        {headerStats.length > 0 && (
+          <div className="flex items-baseline gap-4">
+            {headerStats.map((s) => (
+              <div key={s.label} className="text-right">
+                <div className="text-[10px] font-mono uppercase tracking-wider text-gray-500">
+                  {s.label}
+                </div>
+                <div className="text-sm font-bold tabular-nums">{s.value}</div>
               </div>
-              <div className="text-sm font-bold tabular-nums">{s.value}</div>
-            </div>
-          ))}
-        </div>
-      )}
+            ))}
+          </div>
+        )}
+        {/* Go-to-Live shortcut — appears only when the viewer's @handle
+            also belongs to a monitored host. Closes the modal on click
+            so navigation isn't visually trapped behind the shell. */}
+        {isMonitored && uniqueId && (
+          <Link
+            to="/admin/tiktok/$handle"
+            params={{ handle: uniqueId }}
+            onClick={onClose}
+            className="inline-flex items-center gap-1.5 bg-primary-500 hover:bg-primary-600 text-white px-3 py-1.5 text-xs rounded-md font-medium transition-colors"
+            title={`Open @${uniqueId}'s live page`}
+          >
+            <Radio className="w-3.5 h-3.5" />
+            Go to Live
+          </Link>
+        )}
+      </div>
     </div>
   );
 

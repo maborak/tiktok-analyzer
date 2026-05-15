@@ -514,6 +514,22 @@ export function TikTokCommonGifterDetailModal({
                       @{uniqueId}
                     </span>
                   )}
+                  {/* Go-to-Live shortcut — shown when this viewer's
+                      @handle also belongs to a monitored host. Lets
+                      the operator jump straight to the host's live-
+                      detail page from the identity row. */}
+                  {isMonitored && uniqueId && (
+                    <Link
+                      to="/admin/tiktok/$handle"
+                      params={{ handle: uniqueId }}
+                      onClick={onClose}
+                      className="ml-auto inline-flex items-center gap-1.5 bg-primary-500 hover:bg-primary-600 text-white px-3 py-1.5 text-xs rounded-md font-medium transition-colors"
+                      title={`Open @${uniqueId}'s live page`}
+                    >
+                      <Radio className="w-3.5 h-3.5" />
+                      Go to Live
+                    </Link>
+                  )}
                 </div>
                 {/* Persona + dormancy row — the audit's hierarchy ask. */}
                 {data && (
