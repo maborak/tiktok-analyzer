@@ -1262,16 +1262,16 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
         title={`@${handle}`}
         icon={<Radio className="w-5 h-5" />}
         description={
-          stats?.room?.title || (roomId == null ? 'No active or recent rooms found.' : 'Real-time stats for the most recent room.')
+          // Show the broadcast title when we have a room; the profile
+          // box below already carries the "real-time stats" framing so
+          // a generic subtitle is redundant. Only the "no rooms" empty
+          // state remains.
+          roomId == null
+            ? 'No active or recent rooms found.'
+            : (stats?.room?.title || null)
         }
         actions={
           <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
-            {/* Timezone + WS status — top-of-page controls so they're
-                visible regardless of how far the operator has scrolled
-                into the profile. Same pair lives on the Lives list
-                and Public Lives headers, sharing the same provider. */}
-            <TikTokTimezonePill compact />
-            <TikTokRealtimeIndicator audience={readOnly ? 'public' : 'admin'} />
             {/* Back link — admin routes back to /admin/tiktok (the
                 admin lives index); public routes back to /lives (the
                 public lives index that was moved out of `/` when the
@@ -1336,6 +1336,16 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
           </div>
         }
       />
+
+      {/* TZ pill + WS indicator row — pulled out of the PageHeader actions
+          slot so the action area stays focused on per-page controls
+          (back, broadcast picker, range chip, refresh). Full-width with
+          wrap so the two pills sit on their own line on mobile rather
+          than competing with Refresh/Lives for header real-estate. */}
+      <div className="flex flex-wrap items-center gap-2 mb-3 -mt-1">
+        <TikTokTimezonePill compact />
+        <TikTokRealtimeIndicator audience={readOnly ? 'public' : 'admin'} />
+      </div>
 
       {/* Rich profile header + live-activity heatmap.
           Side-by-side on lg+, stacked on mobile. The heatmap uses
@@ -1517,6 +1527,20 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
           onSelectMatch={setSelectedMatch}
           scopeLabel={chartViewLabel}
           readOnly={readOnly}
+          // Forward the page-level gifter modal trigger so each
+          // BattlerCard's Profile button surfaces the canonical
+          // gift/comment history view.
+          onSelectGifter={(u) =>
+            setSelectedGifter({
+              userId: u.userId,
+              uniqueId: u.uniqueId,
+              nickname: u.nickname,
+              diamonds: undefined,
+              gifts: undefined,
+              comments: undefined,
+              tab: 'gifts',
+            })
+          }
         />
       )}
 
@@ -1943,12 +1967,58 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
             {recent.length === 0 && (
               <li className="text-gray-500">Waiting for events…</li>
             )}
-            {recent.map((e, i) => (
-              <li key={i} className="truncate">
-                <span style={{ color: eventColor(e.type) }}>{e.type}</span>{' '}
-                <span className="text-gray-700">{summarizeEvent(e)}</span>
-              </li>
-            ))}
+            {recent.map((e, i) => {
+              // When the event carries an identifiable actor, surface
+              // a small profile button so the operator can drill into
+              // that viewer's gift/comment history without searching
+              // the gifters tab. We only have payload.user.nickname
+              // for display — user_id comes through on the WS envelope.
+              const u =
+                (e.payload?.user as
+                  | { unique_id?: string; nickname?: string }
+                  | undefined) || undefined;
+              const uniqueId = u?.unique_id ?? null;
+              const nickname = u?.nickname ?? null;
+              const userId = e.user_id;
+              const hasActor = !!(userId && (uniqueId || nickname));
+              return (
+                <li key={i} className="flex items-start gap-1.5 min-w-0">
+                  <span
+                    className="shrink-0"
+                    style={{ color: eventColor(e.type) }}
+                  >
+                    {e.type}
+                  </span>
+                  <span className="text-gray-700 min-w-0 flex-1 truncate">
+                    {summarizeEvent(e)}
+                  </span>
+                  {hasActor && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setSelectedGifter({
+                          userId,
+                          uniqueId,
+                          nickname,
+                          // Lifetime counters aren't in the WS payload —
+                          // the modal renders "(·)" badges until its
+                          // own per-tab queries populate the totals.
+                          diamonds: undefined,
+                          gifts: undefined,
+                          comments: undefined,
+                          tab: e.type === 'comment' ? 'comments' : 'gifts',
+                        })
+                      }
+                      className="shrink-0 inline-flex items-center text-gray-500 hover:text-primary-600 transition-colors"
+                      title={`Open profile — ${nickname || `@${uniqueId}` || userId}`}
+                      aria-label="Open gifter profile"
+                    >
+                      <User className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </li>
+              );
+            })}
           </ul>
         </section>
       )}
@@ -3257,6 +3327,14 @@ interface MatchesPanelProps {
   scopeLabel?: string;
   /** When true, suppress the rival monitor pills inside `LiveMatchView`. */
   readOnly?: boolean;
+  /** Threaded down to the in-progress match view so each BattlerCard
+   *  can open the canonical gifter modal for that anchor. Lives in the
+   *  parent page (where the modal mounts), so we forward the setter. */
+  onSelectGifter?: (sel: {
+    userId: string | null;
+    uniqueId: string | null;
+    nickname: string | null;
+  }) => void;
 }
 
 // HostProfile is the full subscription record now — `MatchupCell`
@@ -3272,6 +3350,7 @@ function MatchesPanel({
   onSelectMatch,
   scopeLabel,
   readOnly = false,
+  onSelectGifter,
 }: MatchesPanelProps) {
   // Default tab: live if there's an active match, otherwise past.
   const [tab, setTab] = useState<'live' | 'past'>(
@@ -3338,6 +3417,7 @@ function MatchesPanel({
             match={activeMatch}
             hostHandle={hostHandle}
             readOnly={readOnly}
+            onSelectGifter={onSelectGifter}
           />
         ) : (
           <PastMatchesTable
@@ -3384,9 +3464,21 @@ interface LiveMatchViewProps {
    *  modal. The pills call `createLive`, which is an admin-write
    *  endpoint not exposed to public viewers. */
   readOnly?: boolean;
+  /** Threaded from MatchesPanel → parent page so each BattlerCard's
+   *  Profile button can open the page-level gifter modal. */
+  onSelectGifter?: (sel: {
+    userId: string | null;
+    uniqueId: string | null;
+    nickname: string | null;
+  }) => void;
 }
 
-function LiveMatchView({ match, hostHandle, readOnly = false }: LiveMatchViewProps) {
+function LiveMatchView({
+  match,
+  hostHandle,
+  readOnly = false,
+  onSelectGifter,
+}: LiveMatchViewProps) {
   const tiktokApi = useTikTokApi();
   // Re-render every second so the duration / countdown updates.
   const [, setTick] = useState(0);
@@ -3565,62 +3657,154 @@ function LiveMatchView({ match, hostHandle, readOnly = false }: LiveMatchViewPro
         </div>
       </div>
 
-      {/* Versus card. Right column stacks all rivals vertically so
-          3-way and 4-way battles show every opponent (we previously
-          only rendered `rivals[0]`). The host card on the left
-          stretches to the height of the rival stack via items-stretch
-          so the layout stays balanced regardless of opponent count.
-          Multi-team battles (3v1, 2v2) hide same-team anchors from
-          the rival side and surface them as small "teammate" chips
-          under the host card instead. */}
+      {/* Versus card. Both teams render as horizontal flex rows of
+          BattlerCards so multi-anchor battles (3v1, 2v2, 4-way) show
+          everyone on equal footing. Teammates sit beside the host in
+          the "our team" column; rivals stack horizontally in the
+          "rival team" column. A vertical divider with the VS letters
+          separates the two sides. The grid collapses to a single
+          column on mobile — the divider becomes a horizontal rule
+          implicit in the row gap. Each card carries its own Profile
+          and Monitor affordances; we no longer render a separate
+          monitor-pill row below the versus card. */}
       <div className="grid grid-cols-1 md:grid-cols-[1fr_auto_1fr] gap-4 items-stretch">
-        <div className="flex flex-col gap-2">
-          <BattlerCard
-            person={host}
-            score={hostScore}
-            color="#10b981" /* emerald = home/host */
-            fallbackHandle={hostHandle}
-            align="left"
-            winning={leaderSide === 'host'}
-          />
-          {teammates.length > 0 && (
-            <div
-              className="rounded-md border border-emerald-200 bg-emerald-50 dark:bg-emerald-500/10 dark:border-emerald-500/30 px-2.5 py-1.5 text-[11px] font-mono"
-              title="Anchors on the host's team this battle"
-            >
-              <span className="text-emerald-700 dark:text-emerald-300 uppercase tracking-wider text-[9px] mr-1.5">
-                Teammates
-              </span>
-              {teammates.map((t, i) => (
-                <span key={t.user_id || normalizeHandle(t) || i} className="text-gray-700 dark:text-gray-300">
-                  @{normalizeHandle(t) ?? '?'}{i < teammates.length - 1 ? ', ' : ''}
-                </span>
-              ))}
-            </div>
-          )}
+        {/* Host (our team) column — host first, then teammates. flex-wrap
+            so cards reflow under the host on narrow desktops rather than
+            forcing horizontal scroll. */}
+        <div className="flex flex-wrap gap-2 items-stretch">
+          <div className="flex-1 min-w-[200px]">
+            <BattlerCard
+              person={host}
+              score={hostScore}
+              color="#10b981" /* emerald = home/host */
+              fallbackHandle={hostHandle}
+              align="left"
+              winning={leaderSide === 'host'}
+              // Host's profile button — surfaces the page-host's
+              // gifter modal. We only wire it when we actually have a
+              // user_id (some matches arrive without one); otherwise
+              // hide the bottom row entirely.
+              onProfileClick={
+                onSelectGifter && host?.user_id
+                  ? () =>
+                      onSelectGifter({
+                        userId: String(host.user_id),
+                        uniqueId: host.unique_id ?? hostHandle,
+                        nickname: host.nickname ?? null,
+                      })
+                  : undefined
+              }
+              // The page IS the host's monitored live — no monitor CTA.
+              monitorState={null}
+            />
+          </div>
+          {teammates.map((t, i) => {
+            const tHandle = t.unique_id || null;
+            const tHandleLc = tHandle?.toLowerCase() ?? null;
+            const monitored = tHandleLc
+              ? subscribedSet.has(tHandleLc)
+              : false;
+            // Per-teammate score uses the same per-anchor → team-id
+            // fallback chain as rivalScoreOf. Most events ship
+            // armies.host_score per anchor; the team_id fallback
+            // splits the team total evenly, which is a defensible
+            // best-effort when only the team total is known.
+            const tScore = (() => {
+              if (t.score != null) return Number(t.score);
+              if (hostTeamId) {
+                const teamTotal = Number(scoresByTeam[hostTeamId] ?? 0);
+                // Even split across teammates+host; conservative since
+                // we don't know the real per-anchor allocation.
+                return Math.round(teamTotal / Math.max(1, teammates.length + 1));
+              }
+              return 0;
+            })();
+            return (
+              <div
+                key={t.user_id || tHandle || i}
+                className="flex-1 min-w-[200px]"
+              >
+                <BattlerCard
+                  person={t}
+                  score={tScore}
+                  color="#10b981"
+                  fallbackHandle={null}
+                  align="left"
+                  winning={false}
+                  onProfileClick={
+                    onSelectGifter && t.user_id
+                      ? () =>
+                          onSelectGifter({
+                            userId: String(t.user_id),
+                            uniqueId: tHandle,
+                            nickname: t.nickname ?? null,
+                          })
+                      : undefined
+                  }
+                  // Hide the monitor row in read-only mode (the
+                  // confirmation modal calls an admin-write endpoint
+                  // not exposed publicly).
+                  monitorState={
+                    readOnly || !tHandle
+                      ? null
+                      : monitored
+                        ? 'monitored'
+                        : 'add'
+                  }
+                  monitorHandle={tHandle}
+                  onMonitorClick={
+                    tHandle ? () => setAddRivalOpen(t) : undefined
+                  }
+                />
+              </div>
+            );
+          })}
         </div>
         <div className="flex items-center justify-center">
+          {/* Vertical divider on md+; the "VS" sits at the midpoint of
+              the divider so both team columns visually break against
+              it. Collapses to a thin horizontal line on mobile. */}
+          <div className="hidden md:block w-px self-stretch bg-gray-200 dark:bg-white/10 relative">
+            <div
+              className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 bg-white dark:bg-gray-100/10 px-2 text-2xl font-extrabold text-rose-500 select-none"
+              style={{ fontFamily: 'var(--font-mono-display)' }}
+              aria-hidden
+            >
+              VS
+            </div>
+          </div>
           <div
-            className="text-3xl font-extrabold text-rose-500 select-none"
+            className="md:hidden text-3xl font-extrabold text-rose-500 select-none"
             style={{ fontFamily: 'var(--font-mono-display)' }}
             aria-hidden
           >
             VS
           </div>
         </div>
+        {/* Rival column — same flex-wrap shape so 3-way / 4-way battles
+            render multiple rivals side-by-side. */}
         {rivals.length === 0 ? (
-          <BattlerCard
-            person={null}
-            score={rivalScore}
-            color="#ef4444"
-            fallbackHandle={null}
-            align="right"
-            winning={false}
-          />
+          <div className="flex flex-wrap gap-2 items-stretch">
+            <div className="flex-1 min-w-[200px]">
+              <BattlerCard
+                person={null}
+                score={rivalScore}
+                color="#ef4444"
+                fallbackHandle={null}
+                align="right"
+                winning={false}
+              />
+            </div>
+          </div>
         ) : (
-          <div className="flex flex-col gap-2">
+          <div className="flex flex-wrap gap-2 items-stretch">
             {rivals.map((r, i) => {
               const sc = rivalScoreOf(r);
+              const rHandle = r.unique_id || null;
+              const rHandleLc = rHandle?.toLowerCase() ?? null;
+              const monitored = rHandleLc
+                ? subscribedSet.has(rHandleLc)
+                : false;
               // Only the rival(s) tied for the top score get the
               // "winning" glow — and only when they're actually
               // beating the host. Otherwise nobody on the rival side
@@ -3628,15 +3812,40 @@ function LiveMatchView({ match, hostHandle, readOnly = false }: LiveMatchViewPro
               const isLeader =
                 leaderSide === 'rival' && sc === topRivalScore && sc > 0;
               return (
-                <BattlerCard
-                  key={r.user_id || normalizeHandle(r) || i}
-                  person={r}
-                  score={sc}
-                  color="#ef4444" /* red = rival */
-                  fallbackHandle={null}
-                  align="right"
-                  winning={isLeader}
-                />
+                <div
+                  key={r.user_id || rHandle || i}
+                  className="flex-1 min-w-[200px]"
+                >
+                  <BattlerCard
+                    person={r}
+                    score={sc}
+                    color="#ef4444" /* red = rival */
+                    fallbackHandle={null}
+                    align="right"
+                    winning={isLeader}
+                    onProfileClick={
+                      onSelectGifter && r.user_id
+                        ? () =>
+                            onSelectGifter({
+                              userId: String(r.user_id),
+                              uniqueId: rHandle,
+                              nickname: r.nickname ?? null,
+                            })
+                        : undefined
+                    }
+                    monitorState={
+                      readOnly || !rHandle
+                        ? null
+                        : monitored
+                          ? 'monitored'
+                          : 'add'
+                    }
+                    monitorHandle={rHandle}
+                    onMonitorClick={
+                      rHandle ? () => setAddRivalOpen(r) : undefined
+                    }
+                  />
+                </div>
               );
             })}
           </div>
@@ -3683,48 +3892,10 @@ function LiveMatchView({ match, hostHandle, readOnly = false }: LiveMatchViewPro
           are visible without a manual refresh. */}
       <LiveMatchTopDonors match={match} hostHandle={hostHandle} />
 
-      {/* Rival-host monitor pill(s) — bottom-left of the card. One
-          pill per rival opponent (1 in solo 1v1 PK, up to 3 in a
-          4-way battle). Each pill flips between "+ Add to monitor"
-          (opens the canonical confirm modal) and "✓ Monitoring"
-          (links to that creator's detail page). Renders only when
-          we have an actual handle — anonymous opponents are skipped.
-          Hidden entirely in read-only mode — the pills + their
-          confirmation modal both call admin-write endpoints. */}
-      {!readOnly && rivals.some((r) => r.unique_id) && (
-        <div className="mt-4 pt-3 border-t border-gray-200 dark:border-white/10 flex items-center gap-2 flex-wrap">
-          <span className="text-[10px] uppercase tracking-wider font-mono text-gray-500 mr-1">
-            Rival{rivals.filter((r) => r.unique_id).length > 1 ? 's' : ''}:
-          </span>
-          {rivals.filter((r) => r.unique_id).map((r) => {
-            const handle = r.unique_id!;
-            const monitored = subscribedSet.has(handle.toLowerCase());
-            return monitored ? (
-              <Link
-                key={handle}
-                to="/admin/tiktok/$handle"
-                params={{ handle }}
-                className="inline-flex items-center gap-1 px-2 py-1 rounded text-[11px] font-mono uppercase tracking-wider bg-emerald-100 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-500/30 hover:bg-emerald-200 dark:hover:bg-emerald-500/25 transition-colors"
-                title={`Open @${handle}'s live page — already monitored`}
-              >
-                <Radio className="w-3.5 h-3.5" />
-                ✓ Monitoring @{handle}
-              </Link>
-            ) : (
-              <button
-                key={handle}
-                type="button"
-                onClick={() => setAddRivalOpen(r)}
-                className="inline-flex items-center gap-1 px-2 py-1 rounded text-[11px] font-mono uppercase tracking-wider bg-primary-100 dark:bg-primary-500/15 text-primary-700 dark:text-primary-300 border border-primary-200 dark:border-primary-500/30 hover:bg-primary-200 dark:hover:bg-primary-500/25 transition-colors"
-                title={`Start monitoring @${handle}'s lives`}
-              >
-                <Radio className="w-3.5 h-3.5" />
-                + Add @{handle}
-              </button>
-            );
-          })}
-        </div>
-      )}
+      {/* Note: the standalone "Rivals: + Add / ✓ Monitoring" pill row
+          previously rendered here has been folded into each BattlerCard
+          as a per-card footer affordance, so the entire match section
+          carries only one source of truth for the monitor state. */}
 
       {/* Confirm modal — reuses the canonical Add Live preview so
           the operator sees the same avatar/followers/bio they'd see
@@ -3986,6 +4157,19 @@ interface BattlerCardProps {
   fallbackHandle: string | null;
   align: 'left' | 'right';
   winning: boolean;
+  /** Optional bottom-row affordances. Each is independent — pass `null`
+   *  / leave undefined to hide. Used so the same card renders for the
+   *  page's host (no buttons — already on their page), teammates
+   *  (profile + monitor), and rivals (profile + monitor). */
+  onProfileClick?: () => void;
+  /** Monitor state for this anchor: `null` hides the row entirely;
+   *  `'add'` shows the "+ monitor" CTA; `'monitored'` shows a link to
+   *  the live page. The container (LiveMatchView) owns the
+   *  subscription set + add-modal trigger and threads them in. */
+  monitorState?: 'add' | 'monitored' | null;
+  onMonitorClick?: () => void;
+  /** Used for the "monitored" link target — the handle without "@". */
+  monitorHandle?: string | null;
 }
 
 function BattlerCard({
@@ -3995,11 +4179,17 @@ function BattlerCard({
   fallbackHandle,
   align,
   winning,
+  onProfileClick,
+  monitorState,
+  onMonitorClick,
+  monitorHandle,
 }: BattlerCardProps) {
   const handle = person ? normalizeHandle(person) : fallbackHandle;
   const nickname = person?.nickname || handle || '—';
   const avatarUrl = person?.avatar_url || null;
   const tags = person?.tags || [];
+  const hasFooterActions =
+    !!onProfileClick || (monitorState != null && monitorState !== null);
 
   return (
     <div
@@ -4076,6 +4266,46 @@ function BattlerCard({
           deltaSize="sm"
         />
       </div>
+      {hasFooterActions && (
+        <div
+          className={`mt-3 pt-2.5 border-t flex flex-wrap items-center gap-1.5 ${align === 'right' ? 'justify-end' : ''}`}
+          style={{ borderColor: `${color}30` }}
+        >
+          {onProfileClick && (
+            <button
+              type="button"
+              onClick={onProfileClick}
+              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono uppercase tracking-wider text-gray-500 hover:text-primary-600 hover:bg-primary-50 dark:hover:bg-primary-500/10 transition-colors"
+              title="Open profile — gift / comment history"
+            >
+              <User className="w-3 h-3" />
+              Profile
+            </button>
+          )}
+          {monitorState === 'monitored' && monitorHandle && (
+            <Link
+              to="/admin/tiktok/$handle"
+              params={{ handle: monitorHandle }}
+              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono uppercase tracking-wider bg-emerald-100 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-200 dark:hover:bg-emerald-500/25 transition-colors"
+              title={`Open @${monitorHandle}'s live page — already monitored`}
+            >
+              <Radio className="w-3 h-3" />
+              Monitoring
+            </Link>
+          )}
+          {monitorState === 'add' && onMonitorClick && (
+            <button
+              type="button"
+              onClick={onMonitorClick}
+              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono uppercase tracking-wider bg-primary-100 dark:bg-primary-500/15 text-primary-700 dark:text-primary-300 hover:bg-primary-200 dark:hover:bg-primary-500/25 transition-colors"
+              title={monitorHandle ? `Start monitoring @${monitorHandle}'s lives` : 'Start monitoring'}
+            >
+              <Radio className="w-3 h-3" />
+              + Monitor
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }
