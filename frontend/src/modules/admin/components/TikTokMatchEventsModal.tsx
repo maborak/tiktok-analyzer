@@ -44,6 +44,7 @@ import {
   Swords,
   TrendingUp,
   Trophy,
+  User,
   UserPlus,
   Users,
 } from 'lucide-react';
@@ -69,6 +70,7 @@ import {
 } from '@admin/services/tiktok';
 import { useTikTokApi } from '@admin/contexts/TikTokApiContext';
 import { TikTokAddLiveModal } from '@admin/components/TikTokAddLiveModal';
+import { TikTokCommonGifterDetailModal } from '@admin/components/TikTokCommonGifterDetailModal';
 
 echarts.use([
   LineChart,
@@ -218,6 +220,17 @@ export function TikTokMatchEventsModal({
   // (avatar, follower count, live state, bio, warnings) is identical
   // to the Add-Live flow on /admin/tiktok.
   const [addCandidate, setAddCandidate] = useState<TikTokMatchOpponent | null>(null);
+  // Cross-host (common gifter) modal — opens when any top-gifter row
+  // is clicked. Mirrors the pattern used on the live-detail page's
+  // cross-live gifters bar (see `selectedCommonGifter` over there).
+  // The cross-host modal aggregates the user's footprint across every
+  // monitored live so the operator can spot ride-the-whale patterns.
+  const [selectedCommonGifter, setSelectedCommonGifter] = useState<{
+    userId: string;
+    uniqueId: string | null;
+    nickname: string | null;
+    avatarUrl: string | null;
+  } | null>(null);
 
   useEffect(() => {
     if (isOpen) setTab('overview');
@@ -338,6 +351,7 @@ export function TikTokMatchEventsModal({
           match={match}
           hostHandle={hostHandle}
           onSelectGifter={onSelectGifter}
+          onOpenCommonGifter={setSelectedCommonGifter}
         />
       )}
       {match && tab === 'timeline' && (
@@ -348,6 +362,7 @@ export function TikTokMatchEventsModal({
           match={match}
           hostHandle={hostHandle}
           onSelectGifter={onSelectGifter}
+          onOpenCommonGifter={setSelectedCommonGifter}
         />
       )}
       {match && tab === 'activity' && (
@@ -374,6 +389,20 @@ export function TikTokMatchEventsModal({
           }}
         />
       )}
+
+      {/* Cross-host gifter detail — opens when any top-gifter row is
+          clicked. Rolls up the gifter's footprint across every
+          monitored live, distinct from `onSelectGifter`'s per-battle
+          scoped modal. Rendered inside the outer Modal so its own
+          chrome stacks above the battle dashboard. */}
+      <TikTokCommonGifterDetailModal
+        isOpen={selectedCommonGifter !== null}
+        userId={selectedCommonGifter?.userId ?? null}
+        initialNickname={selectedCommonGifter?.nickname ?? null}
+        initialUniqueId={selectedCommonGifter?.uniqueId ?? null}
+        initialAvatarUrl={selectedCommonGifter?.avatarUrl ?? null}
+        onClose={() => setSelectedCommonGifter(null)}
+      />
     </Modal>
   );
 }
@@ -695,14 +724,28 @@ function OpponentCell({
 
 // ─── Tab: Overview ──────────────────────────────────────────────────
 
+/** Shared "open the cross-host common-gifter modal" callback shape.
+ *  Threaded through every top-gifter list (`SideTopGifters`,
+ *  `SideGiftersList`, `MatchTopDonors`, `GiftersTab`) so each row can
+ *  open the same cross-host pane regardless of which surface it
+ *  lives on. */
+type OpenCommonGifter = (g: {
+  userId: string;
+  uniqueId: string | null;
+  nickname: string | null;
+  avatarUrl: string | null;
+}) => void;
+
 function OverviewTab({
   match,
   hostHandle,
   onSelectGifter,
+  onOpenCommonGifter,
 }: {
   match: TikTokMatch;
   hostHandle: string;
   onSelectGifter?: MatchEventsModalProps['onSelectGifter'];
+  onOpenCommonGifter?: OpenCommonGifter;
 }) {
   const tiktokApi = useTikTokApi();
   const [sides, setSides] = useState<TikTokMatchGiftersBySide | null>(null);
@@ -735,6 +778,7 @@ function OverviewTab({
         sides={sides}
         match={match}
         onSelectGifter={onSelectGifter}
+        onOpenCommonGifter={onOpenCommonGifter}
       />}
       {/* Unified "who paid into this match" ranking — combines both
           sides (and unknown-recipient gifts) sorted purely by diamonds.
@@ -746,6 +790,7 @@ function OverviewTab({
           match={match}
           hostHandle={hostHandle}
           onSelectGifter={onSelectGifter}
+          onOpenCommonGifter={onOpenCommonGifter}
         />
       )}
       {loading && !sides && (
@@ -767,14 +812,16 @@ function OverviewTab({
  *  — same flow as SideTopGifters' picker. */
 function MatchTopDonors({
   sides,
-  match,
+  match: _match,
   hostHandle,
-  onSelectGifter,
+  onSelectGifter: _onSelectGifter,
+  onOpenCommonGifter,
 }: {
   sides: TikTokMatchGiftersBySide;
   match: TikTokMatch;
   hostHandle: string;
   onSelectGifter?: MatchEventsModalProps['onSelectGifter'];
+  onOpenCommonGifter?: OpenCommonGifter;
 }) {
   type Row = TikTokMatchSideGifter & { side: 'host' | 'opponent' | 'unknown' };
   const rows: Row[] = [
@@ -786,23 +833,18 @@ function MatchTopDonors({
   if (rows.length === 0) return null;
 
   const total = rows.reduce((acc, r) => acc + r.diamonds, 0) || 1;
-  const since = match.started_at;
-  const until = match.ended_at ?? match.last_seen_at;
-  const siblingRoomIds = sides.totals?.sibling_room_ids;
+  // Row click now routes to the cross-host common-gifter modal so
+  // the operator can see this gifter's footprint across every
+  // monitored live — distinct from the per-battle modal that used
+  // to open here. The per-battle pivot is still reachable from the
+  // Recent activity feed elsewhere on the page.
   const pick = (r: Row) => {
-    if (!onSelectGifter) return;
-    onSelectGifter({
+    if (!onOpenCommonGifter || !r.user_id) return;
+    onOpenCommonGifter({
       userId: r.user_id,
       uniqueId: r.unique_id,
       nickname: r.nickname,
-      diamonds: r.diamonds,
-      gifts: r.gifts,
-      comments: 0,
-      tab: 'gifts',
-      since,
-      until,
-      windowLabel: 'This battle',
-      extraRoomIds: siblingRoomIds,
+      avatarUrl: r.avatar_url,
     });
   };
   const sideTone = (s: Row['side']) => {
@@ -832,8 +874,9 @@ function MatchTopDonors({
               <button
                 type="button"
                 onClick={() => pick(r)}
-                className="w-full flex items-center gap-2 px-2 py-1.5 rounded border border-gray-200 bg-gray-50 dark:bg-gray-100/[0.06] hover:bg-gray-100 dark:hover:bg-white/10 transition-colors text-left"
-                title="Open this gifter's full history scoped to this battle"
+                disabled={!r.user_id}
+                className="w-full flex items-center gap-2 px-2 py-1.5 rounded border border-gray-200 bg-gray-50 dark:bg-gray-100/[0.06] hover:bg-gray-100/50 dark:hover:bg-gray-100/5 cursor-pointer transition-colors text-left disabled:cursor-default disabled:opacity-70"
+                title={r.user_id ? "Open this gifter's cross-host profile" : 'No user_id captured for this row'}
               >
                 <span className="shrink-0 w-5 text-center text-gray-400 tabular-nums">
                   #{i + 1}
@@ -1094,30 +1137,24 @@ function SideStat({
 
 function SideTopGifters({
   sides,
-  match,
-  onSelectGifter,
+  match: _match,
+  onSelectGifter: _onSelectGifter,
+  onOpenCommonGifter,
 }: {
   sides: TikTokMatchGiftersBySide;
   match: TikTokMatch;
   onSelectGifter?: MatchEventsModalProps['onSelectGifter'];
+  onOpenCommonGifter?: OpenCommonGifter;
 }) {
-  const since = match.started_at;
-  const until = match.ended_at ?? match.last_seen_at;
-  const siblingRoomIds = sides.totals?.sibling_room_ids;
+  // Row click routes to the cross-host common-gifter modal — see
+  // `MatchTopDonors.pick` for the rationale.
   const pickGifter = (g: TikTokMatchSideGifter) => {
-    if (!onSelectGifter) return;
-    onSelectGifter({
+    if (!onOpenCommonGifter || !g.user_id) return;
+    onOpenCommonGifter({
       userId: g.user_id,
       uniqueId: g.unique_id,
       nickname: g.nickname,
-      diamonds: g.diamonds,
-      gifts: g.gifts,
-      comments: 0,
-      tab: 'gifts',
-      since,
-      until,
-      windowLabel: 'This battle',
-      extraRoomIds: siblingRoomIds,
+      avatarUrl: g.avatar_url,
     });
   };
   return (
@@ -1169,8 +1206,9 @@ function SideGiftersList({
                 <button
                   type="button"
                   onClick={() => onPick(g)}
-                  className="w-full flex items-center gap-2 px-2 py-1.5 rounded border border-gray-200 bg-gray-50 dark:bg-gray-100/[0.06] hover:bg-gray-100 dark:hover:bg-white/10 transition-colors text-left"
-                  title="Open this gifter's full history"
+                  disabled={!g.user_id}
+                  className="w-full flex items-center gap-2 px-2 py-1.5 rounded border border-gray-200 bg-gray-50 dark:bg-gray-100/[0.06] hover:bg-gray-100/50 dark:hover:bg-gray-100/5 cursor-pointer transition-colors text-left disabled:cursor-default disabled:opacity-70"
+                  title={g.user_id ? "Open this gifter's cross-host profile" : 'No user_id captured for this row'}
                 >
                   <span className="shrink-0 w-5 text-center text-gray-400 tabular-nums">
                     #{i + 1}
@@ -1527,11 +1565,13 @@ type GifterSide = 'all' | 'host' | 'opponent' | 'unknown';
 function GiftersTab({
   match,
   hostHandle,
-  onSelectGifter,
+  onSelectGifter: _onSelectGifter,
+  onOpenCommonGifter,
 }: {
   match: TikTokMatch;
   hostHandle: string;
   onSelectGifter?: MatchEventsModalProps['onSelectGifter'];
+  onOpenCommonGifter?: OpenCommonGifter;
 }) {
   const tiktokApi = useTikTokApi();
   const GIFTER_PAGE_SIZES = [25, 50, 100, 250] as const;
@@ -1615,9 +1655,6 @@ function GiftersTab({
   const safePage = Math.min(page, totalPages - 1);
   const offset = safePage * pageSize;
   const visible = merged.slice(offset, offset + pageSize);
-
-  const since = match.started_at;
-  const until = match.ended_at ?? match.last_seen_at;
 
   if (loading && !sides) {
     return (
@@ -1750,21 +1787,20 @@ function GiftersTab({
                   return (
                     <tr
                       key={`${g.user_id}-${g.side}`}
-                      className="border-t border-gray-200 hover:bg-gray-50 dark:hover:bg-white/[0.04] cursor-pointer"
-                      onClick={() =>
-                        onSelectGifter?.({
+                      className={`border-t border-gray-200 transition-colors ${
+                        g.user_id
+                          ? 'hover:bg-gray-100/50 dark:hover:bg-gray-100/5 cursor-pointer'
+                          : 'cursor-default opacity-80'
+                      }`}
+                      onClick={() => {
+                        if (!onOpenCommonGifter || !g.user_id) return;
+                        onOpenCommonGifter({
                           userId: g.user_id,
                           uniqueId: g.unique_id,
                           nickname: g.nickname,
-                          diamonds: g.diamonds,
-                          gifts: g.gifts,
-                          comments: 0,
-                          tab: 'gifts',
-                          since,
-                          until,
-                          windowLabel: 'This battle',
-                        })
-                      }
+                          avatarUrl: g.avatar_url,
+                        });
+                      }}
                     >
                       <td className="px-3 py-1.5 text-gray-400 tabular-nums">{offset + i + 1}</td>
                       <td className="px-3 py-1.5">
@@ -1824,21 +1860,20 @@ function GiftersTab({
               return (
                 <li
                   key={`${g.user_id}-${g.side}`}
-                  className="rounded-md border border-gray-200 bg-white dark:bg-white/[0.03] px-3 py-2.5 cursor-pointer hover:bg-gray-50 dark:hover:bg-white/[0.04] transition-colors"
-                  onClick={() =>
-                    onSelectGifter?.({
+                  className={`rounded-md border border-gray-200 bg-white dark:bg-white/[0.03] px-3 py-2.5 transition-colors ${
+                    g.user_id
+                      ? 'cursor-pointer hover:bg-gray-100/50 dark:hover:bg-gray-100/5'
+                      : 'cursor-default opacity-80'
+                  }`}
+                  onClick={() => {
+                    if (!onOpenCommonGifter || !g.user_id) return;
+                    onOpenCommonGifter({
                       userId: g.user_id,
                       uniqueId: g.unique_id,
                       nickname: g.nickname,
-                      diamonds: g.diamonds,
-                      gifts: g.gifts,
-                      comments: 0,
-                      tab: 'gifts',
-                      since,
-                      until,
-                      windowLabel: 'This battle',
-                    })
-                  }
+                      avatarUrl: g.avatar_url,
+                    });
+                  }}
                 >
                   <div className="flex items-center gap-2 min-w-0">
                     <span className="font-mono text-[10px] text-gray-400 tabular-nums shrink-0 w-6">

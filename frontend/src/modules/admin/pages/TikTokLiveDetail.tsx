@@ -6,8 +6,10 @@ import {
   Clock,
   Crown,
   Gem,
+  Heart,
   History,
   Loader2,
+  MessageSquare,
   Radio,
   RefreshCw,
   Swords,
@@ -16,6 +18,17 @@ import {
 } from 'lucide-react'; // Crown is used below in LiveMatchTopDonors
 import { Modal } from '@/components/ui/Modal';
 import toast from 'react-hot-toast';
+import * as echarts from 'echarts/core';
+import { PieChart } from 'echarts/charts';
+import { TooltipComponent as PieTooltipComponent } from 'echarts/components';
+import { CanvasRenderer as PieCanvasRenderer } from 'echarts/renderers';
+import ReactECharts from 'echarts-for-react/lib/core';
+
+// Tree-shaken ECharts setup for the Top Gifters tab pie charts. The
+// other modules (Worker Telemetry, Match Modal) register their own
+// charts; ECharts dedupes registrations so multiple call sites are
+// safe.
+echarts.use([PieChart, PieTooltipComponent, PieCanvasRenderer]);
 
 import { Button } from '@/components/ui/Button';
 import { PageShell, PageHeader } from '@/components/ui/PageShell';
@@ -1866,14 +1879,72 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
         </div>
 
         {giftersTab === 'gifters' && (
-          <TikTokRoomGiftersTable
-            roomId={roomId}
-            extraRoomIds={effectiveExtraRoomIds}
-            range={effectiveRange}
-            refreshKey={eventsRefreshKey}
-            onSelectGifter={setSelectedGifter}
-            onTotalChange={setTopGiftersTotal}
-          />
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            {/* LEFT column: the existing top-gifters list (2/3 width on
+                md+). Stays unchanged — the right column is purely
+                additive. */}
+            <div className="md:col-span-2 min-w-0">
+              <TikTokRoomGiftersTable
+                roomId={roomId}
+                extraRoomIds={effectiveExtraRoomIds}
+                range={effectiveRange}
+                refreshKey={eventsRefreshKey}
+                onSelectGifter={setSelectedGifter}
+                onTotalChange={setTopGiftersTotal}
+              />
+            </div>
+
+            {/* RIGHT column: three small pie cards. Drops below the list
+                on narrow viewports. Top gifter card derives its data
+                from `stats.top_gifters[0]` vs the remaining
+                `stats.diamonds_total`; the commenter + liker cards
+                show an empty state today (no per-user aggregate yet —
+                only per-event totals). */}
+            <div className="flex flex-col gap-3 min-w-0">
+              <TopUserPieCard
+                title="Top Gifter"
+                icon={<Crown className="w-3.5 h-3.5 text-amber-500" />}
+                topLabel={
+                  stats?.top_gifters?.[0]
+                    ? stats.top_gifters[0].nickname ||
+                      stats.top_gifters[0].unique_id ||
+                      'Unknown'
+                    : null
+                }
+                topValue={stats?.top_gifters?.[0]?.diamonds ?? null}
+                othersValue={
+                  stats?.top_gifters?.[0] && stats.diamonds_total != null
+                    ? Math.max(
+                        0,
+                        stats.diamonds_total - (stats.top_gifters[0].diamonds ?? 0),
+                      )
+                    : null
+                }
+                valueSuffix=" 💎"
+                accentColor="#f59e0b"
+              />
+              <TopUserPieCard
+                title="Top Commenter"
+                icon={<MessageSquare className="w-3.5 h-3.5 text-sky-500" />}
+                topLabel={null}
+                topValue={null}
+                othersValue={null}
+                valueSuffix=""
+                accentColor="#0ea5e9"
+                emptyHint="Per-user comment aggregate not yet exposed."
+              />
+              <TopUserPieCard
+                title="Top Liker"
+                icon={<Heart className="w-3.5 h-3.5 text-rose-500" />}
+                topLabel={null}
+                topValue={null}
+                othersValue={null}
+                valueSuffix=""
+                accentColor="#f43f5e"
+                emptyHint="Per-user like aggregate not yet exposed."
+              />
+            </div>
+          </div>
         )}
 
         {giftersTab === 'comments' && (
@@ -3858,6 +3929,120 @@ function LiveMatchTopDonors({
           );
         })}
       </ol>
+    </section>
+  );
+}
+
+/** Small "top user vs others" pie card. Drives the right-column
+ *  trio (Top Gifter / Commenter / Liker) on the Top Gifters tab.
+ *
+ *  Layout: title row on top, ~140-160px square pie below, footer
+ *  with the top user's name + value. Renders a "No data" empty
+ *  state when `topLabel` or `topValue` is null. */
+function TopUserPieCard({
+  title,
+  icon,
+  topLabel,
+  topValue,
+  othersValue,
+  valueSuffix,
+  accentColor,
+  emptyHint,
+}: {
+  title: string;
+  icon: React.ReactNode;
+  topLabel: string | null;
+  topValue: number | null;
+  othersValue: number | null;
+  valueSuffix: string;
+  accentColor: string;
+  emptyHint?: string;
+}) {
+  const hasData = topLabel !== null && topValue !== null && topValue > 0;
+  const others = othersValue ?? 0;
+  const total = (topValue ?? 0) + others;
+  const topPct = hasData && total > 0 ? ((topValue! / total) * 100) : 0;
+  const option = useMemo(() => {
+    if (!hasData) return null;
+    return {
+      tooltip: {
+        trigger: 'item' as const,
+        formatter: (params: { name: string; value: number; percent: number }) =>
+          `${params.name}: ${params.value.toLocaleString()}${valueSuffix} (${params.percent}%)`,
+      },
+      series: [
+        {
+          type: 'pie' as const,
+          radius: ['55%', '85%'],
+          center: ['50%', '50%'],
+          avoidLabelOverlap: false,
+          label: { show: false },
+          labelLine: { show: false },
+          data: [
+            { name: topLabel, value: topValue, itemStyle: { color: accentColor } },
+            { name: 'Others', value: others, itemStyle: { color: '#e5e7eb' } },
+          ],
+        },
+      ],
+    };
+  }, [hasData, topLabel, topValue, others, valueSuffix, accentColor]);
+
+  return (
+    <section className="rounded-lg border border-gray-200 bg-white dark:bg-gray-100/[0.05] p-3 shadow-sm">
+      <div className="auth-mono-label flex items-center gap-1.5 mb-2">
+        {icon}
+        {title}
+      </div>
+      {hasData && option ? (
+        <>
+          <div className="relative" style={{ height: 140 }}>
+            <ReactECharts
+              echarts={echarts}
+              option={option}
+              style={{ height: '100%', width: '100%' }}
+              opts={{ renderer: 'canvas' }}
+              notMerge
+              lazyUpdate
+            />
+            {/* Center label: top user's share % overlays the donut
+                hole so the headline stat is readable at a glance. */}
+            <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
+              <div className="text-lg font-bold tabular-nums text-gray-900">
+                {topPct.toFixed(0)}%
+              </div>
+              <div className="text-[9px] uppercase tracking-wider text-gray-500">
+                of total
+              </div>
+            </div>
+          </div>
+          <div className="mt-2 text-xs font-mono">
+            <div className="truncate text-gray-900" title={topLabel ?? ''}>
+              {topLabel}
+            </div>
+            <div className="tabular-nums text-gray-500">
+              {(topValue ?? 0).toLocaleString()}
+              {valueSuffix}
+              {total > 0 && (
+                <span className="ml-1 text-[10px] text-gray-400">
+                  / {total.toLocaleString()}{valueSuffix}
+                </span>
+              )}
+            </div>
+          </div>
+        </>
+      ) : (
+        <div
+          className="flex flex-col items-center justify-center text-center px-2 text-xs text-gray-500 font-mono"
+          style={{ height: 140 }}
+        >
+          <div className="mb-1">No data</div>
+          {emptyHint && (
+            <div className="text-[10px] text-gray-400 leading-snug">
+              {emptyHint}
+            </div>
+          )}
+        </div>
+      )}
     </section>
   );
 }
