@@ -143,6 +143,11 @@ function TikTokLivesBody() {
   // Live filter for the Lives table / mobile cards. Substring match
   // against nickname OR @unique_id; case-insensitive.
   const [livesQuery, setLivesQuery] = useState('');
+  // Status filter pill — narrow the list to ONLINE-only / OFFLINE-only.
+  // Live-truth derivation mirrors the per-card `isLive` rule:
+  // `summary.active_room_id` is authoritative when a summary slice
+  // exists, otherwise fall back to the cached `sub.is_live` flag.
+  const [statusFilter, setStatusFilter] = useState<'all' | 'online' | 'offline'>('all');
   // Sort key for the table — purely client-side over the loaded list.
   type SortKey =
     | 'live'
@@ -166,6 +171,18 @@ function TikTokLivesBody() {
           (s.unique_id || '').toLowerCase().includes(q) ||
           (s.nickname || '').toLowerCase().includes(q),
       );
+    }
+    // Status pill filter — derive `isLive` from the summary slice
+    // when present (authoritative), else fall back to the cached
+    // `sub.is_live` flag. Mirrors the per-card rule so the pill
+    // and the card accent agree.
+    if (statusFilter !== 'all') {
+      arr = arr.filter((s) => {
+        const slice = s.unique_id ? summary[s.unique_id.toLowerCase()] : undefined;
+        const isLive = slice?.active_room_id != null
+          || (slice == null && !!s.is_live);
+        return statusFilter === 'online' ? isLive : !isLive;
+      });
     }
     const tsKey = (s?: string | null) =>
       s ? new Date(s).getTime() : 0;
@@ -201,7 +218,7 @@ function TikTokLivesBody() {
       }
     });
     return sorted;
-  }, [subs, livesQuery, sortKey, summary]);
+  }, [subs, livesQuery, statusFilter, sortKey, summary]);
   const electron = isElectronClient();
 
   // ── data ──────────────────────────────────────────────────────────
@@ -568,33 +585,59 @@ function TikTokLivesBody() {
       {totals && (
         <LivesTotalsStrip totals={totals} />
       )}
-      {/* Lives search — single control above the table. The Add
-          subscription field lives OUTSIDE the tabs (page-level),
-          so this row is search-only. */}
-      <div className="relative">
-        <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-400" />
-        <input
-          type="search"
-          value={livesQuery}
-          onChange={(e) => setLivesQuery(e.target.value)}
-          placeholder={
-            subs.length > 0
-              ? `Search ${subs.length} subscriptions by nickname or @handle…`
-              : 'Search subscriptions…'
-          }
-          disabled={subs.length === 0}
-          className="w-full pl-8 pr-8 py-2 rounded-md border border-gray-200 text-sm font-mono dark:bg-white/5 disabled:opacity-50"
-        />
-        {livesQuery && (
-          <button
-            type="button"
-            onClick={() => setLivesQuery('')}
-            className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-700"
-            aria-label="Clear filter"
-          >
-            <X className="w-3.5 h-3.5" />
-          </button>
-        )}
+      {/* Lives search + status filter — same row on md+, stacked on
+          mobile. The Add subscription field lives OUTSIDE the tabs
+          (page-level), so this row is search + filter only. */}
+      <div className="flex flex-col md:flex-row md:items-center gap-2">
+        <div className="relative flex-1 focus-within:ring-2 focus-within:ring-primary-500/30 focus-within:border-primary-500 rounded-md border-2 border-gray-200 bg-white dark:bg-gray-100/5 transition-colors">
+          <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-500 pointer-events-none" />
+          <input
+            type="search"
+            value={livesQuery}
+            onChange={(e) => setLivesQuery(e.target.value)}
+            placeholder={
+              subs.length > 0
+                ? `Search ${subs.length} subscriptions by nickname or @handle…`
+                : 'Search subscriptions…'
+            }
+            disabled={subs.length === 0}
+            className="w-full pl-8 pr-8 py-2 rounded-md bg-transparent text-sm font-mono placeholder:text-gray-500 focus:outline-none disabled:opacity-50"
+          />
+          {livesQuery && (
+            <button
+              type="button"
+              onClick={() => setLivesQuery('')}
+              className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-700"
+              aria-label="Clear filter"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          )}
+        </div>
+        {/* Status pills — ALL / ONLINE / OFFLINE. Active = primary
+            tone; inactive = neutral so the highlighted pill draws
+            the eye. Pill (rounded-full) not button — matches the
+            sort selector visual language below. */}
+        <div className="flex items-center gap-1.5 shrink-0">
+          {([
+            { id: 'all',     label: 'ALL' },
+            { id: 'online',  label: 'ONLINE' },
+            { id: 'offline', label: 'OFFLINE' },
+          ] as { id: typeof statusFilter; label: string }[]).map((opt) => (
+            <button
+              key={opt.id}
+              type="button"
+              onClick={() => setStatusFilter(opt.id)}
+              className={`px-3 py-1.5 text-xs font-mono rounded-full transition-colors ${
+                statusFilter === opt.id
+                  ? 'bg-primary-100 text-primary-700 dark:bg-primary-500/20 dark:text-primary-300'
+                  : 'bg-white text-gray-600 border border-gray-200 hover:border-gray-300 dark:bg-gray-100/5'
+              }`}
+            >
+              {opt.label}
+            </button>
+          ))}
+        </div>
       </div>
 
       {/* Empty state (shared across both layouts). */}
@@ -610,7 +653,11 @@ function TikTokLivesBody() {
           natural one-per-creator block. */}
       {subs.length > 0 && filteredSubs.length === 0 && (
         <div className="rounded-lg border border-gray-200 px-4 py-8 text-center text-sm text-gray-500">
-          No subscriptions match <span className="font-mono">"{livesQuery}"</span>.
+          {livesQuery ? (
+            <>No subscriptions match <span className="font-mono">"{livesQuery}"</span>{statusFilter !== 'all' ? <> in <span className="font-mono uppercase">{statusFilter}</span></> : null}.</>
+          ) : (
+            <>No <span className="font-mono uppercase">{statusFilter}</span> subscriptions.</>
+          )}
         </div>
       )}
       {filteredSubs.length > 0 && (
@@ -804,7 +851,7 @@ function SubscriptionCardImpl({ sub, electron, summary, readOnly, onToggle, onDe
       ? 'border-l-4 border-l-rose-400'
       : isLive
         ? 'border-l-4 border-l-emerald-500'
-        : 'border-l-4 border-l-transparent';
+        : 'border-l-4 border-l-gray-300 dark:border-l-gray-100/10';
 
   return (
     <div
