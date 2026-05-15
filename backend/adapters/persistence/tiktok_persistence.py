@@ -1089,14 +1089,32 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                     update_clause["scores"] = stmt.excluded.scores
                 if settings:
                     update_clause["settings"] = stmt.excluded.settings
-                
+
                 stmt = stmt.on_conflict_do_update(
                     constraint="tiktok_matches_room_battle_uniq",
                     set_=update_clause
                 )
-                res = s.execute(stmt)
-                # Fetch the (possibly newly created) row to return the dataclass
-                row = s.query(TikTokMatchModel).filter_by(room_id=room_id, battle_id=battle_id).one()
+                s.execute(stmt)
+                # Commit BEFORE re-querying for the dataclass return.
+                # Without this, the INSERT lives only inside the
+                # session's open transaction — the re-query returns
+                # the row with its new id (visible within the same
+                # txn), but `RetrySession.__exit__` calls `close()`
+                # without committing, so SQLAlchemy rolls the txn
+                # back on session close. The sequence advances but
+                # the row never persists, and the caller stores an
+                # invalid `match.id` in `_active_match`. Subsequent
+                # `persist_event_full(match_id=...)` calls then hit
+                # `tiktok_events_match_id_fkey` violations because
+                # the referenced match row was never committed.
+                s.commit()
+                # Fetch the (possibly newly created) row to return
+                # the dataclass.
+                row = (
+                    s.query(TikTokMatchModel)
+                    .filter_by(room_id=room_id, battle_id=battle_id)
+                    .one()
+                )
                 return _match_to_dataclass(row)
             else:
                 # SQLite fallback
