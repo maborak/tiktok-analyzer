@@ -224,6 +224,14 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
      *  rival's room, which isn't in `effectiveExtraRoomIds`. Merging
      *  these in lets the per-room searchEvents query see them too. */
     extraRoomIds?: string[];
+    /** When set to 'profile-only', the modal opens with NO room/range
+     *  scope — the "Current" tab is suppressed and only the Profile
+     *  (cross-host overview) renders. Used by the host's own
+     *  "Gifter Profile" button on the header card, where "what this
+     *  user gifted in this room" is the wrong framing (the host
+     *  RECEIVES gifts here; their gifter activity lives in OTHER
+     *  monitored lives). */
+    scope?: 'profile-only';
   } | null>(null);
   // Selected past match for the events-modal drill-in.
   const [selectedMatch, setSelectedMatch] = useState<TikTokMatch | null>(null);
@@ -1397,7 +1405,13 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
                       diamonds: undefined,
                       gifts: undefined,
                       comments: undefined,
-                      tab: 'gifts',
+                      // `scope: 'profile-only'` tells the modal-render
+                      // block below to suppress the room/range props so
+                      // the "Current" tab hides itself. The host's own
+                      // profile is a general (cross-host) view; "what
+                      // this user gifted in this room" makes no sense
+                      // for the room's own host.
+                      scope: 'profile-only',
                     })
                 : undefined
             }
@@ -2117,9 +2131,14 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
         diamondsTotal={selectedGifter?.diamonds}
         giftsCount={selectedGifter?.gifts}
         commentsCount={selectedGifter?.comments}
-        defaultTab="current"
+        // Profile-only mode (the host's own "Gifter Profile" button)
+        // suppresses ALL scope props so `currentAvailable` in the
+        // modal resolves to false → the "Current" tab strip hides
+        // entirely and only the Profile (cross-host) view renders.
+        // Default-tab pinned to 'profile' for the same reason.
+        defaultTab={selectedGifter?.scope === 'profile-only' ? 'profile' : 'current'}
         currentInnerTab={selectedGifter?.tab ?? 'gifts'}
-        roomId={roomId}
+        roomId={selectedGifter?.scope === 'profile-only' ? null : roomId}
         // Pass the SAME room set the parent gifters/comments table
         // queries against (`effectiveExtraRoomIds`). In live scope
         // this is the day-aggregate extras (or undefined for a solo
@@ -2134,7 +2153,11 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
         // carries the rival's `room_id` (sibling-stream room). Merge
         // it in so opponent donors find their gifts — those events
         // live in the rival's broadcast, not the current page's room.
+        //
+        // In profile-only mode, drop the room set entirely so the
+        // modal's Current tab disappears.
         extraRoomIds={(() => {
+          if (selectedGifter?.scope === 'profile-only') return undefined;
           const base = effectiveExtraRoomIds ?? [];
           const extras = selectedGifter?.extraRoomIds ?? [];
           if (extras.length === 0) return effectiveExtraRoomIds;
@@ -2145,6 +2168,7 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
         // scope-chip labelling above so the modal's framing matches
         // the parent table.
         roomSetLabel={(() => {
+          if (selectedGifter?.scope === 'profile-only') return undefined;
           if (tabsScope === 'alltime') {
             const n = allHostRoomIds?.length ?? 0;
             return n > 0
@@ -2163,9 +2187,9 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
           }
           return undefined; // default "This broadcast"
         })()}
-        windowSince={selectedGifter?.since ?? null}
-        windowUntil={selectedGifter?.until ?? null}
-        windowLabel={selectedGifter?.windowLabel}
+        windowSince={selectedGifter?.scope === 'profile-only' ? null : (selectedGifter?.since ?? null)}
+        windowUntil={selectedGifter?.scope === 'profile-only' ? null : (selectedGifter?.until ?? null)}
+        windowLabel={selectedGifter?.scope === 'profile-only' ? undefined : selectedGifter?.windowLabel}
         currentHandle={handle}
         readOnly={readOnly}
       />
