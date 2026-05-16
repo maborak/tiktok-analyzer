@@ -535,3 +535,175 @@ def test_parity_first_time_gifters(persistence_with_cache, fake_handle, fake_roo
     assert sql_state.get("n_first_time_gifters") == 1, (
         f"sql n_first_time_gifters={sql_state.get('n_first_time_gifters')}"
     )
+
+
+# ── Stale-cache scenario tests ────────────────────────────────────────
+#
+# Regression suite for the "worker dropped silently → cache retains
+# session state forever" bug (fix shipped in 96b961b + 3fa561d).
+# The original parity test populates cache + SQL simultaneously and
+# verifies they match. These cases simulate the gap-after-disconnect:
+# cache populated, then SQL state changes underneath (room ages out
+# of the 5-min active predicate) without any clearing event firing.
+#
+# Three things to verify on each fix path:
+#   1. HTTP `get_lives_summary` overlay drops the stale fields.
+#   2. `sanitize_cached_snapshot` drops the stale fields (WS path).
+#   3. `sweep_stale_state_cache` clears them at the storage layer.
+
+
+def _age_out_active_room(persistence, room_id: int) -> None:
+    """Push `last_seen_at` of the room 10 minutes into the past so it
+    falls out of the `last_seen_at > NOW() - 5 min` active predicate.
+    Simulates the worker dropping without sending `live_end`."""
+    from sqlalchemy import text
+    with persistence._get_session() as session:
+        session.execute(
+            text("""
+                UPDATE tiktok_rooms
+                   SET last_seen_at = NOW() - INTERVAL '10 minutes'
+                 WHERE room_id = :r
+            """),
+            {"r": room_id},
+        )
+        session.commit()
+
+
+def test_stale_cache_overlay_drops_session_fields(
+    persistence_with_cache, fake_handle, fake_room_id,
+):
+    """When SQL says the host's room is no longer live (room aged out
+    of the 5-min `last_seen_at` predicate) but the cache still has
+    session state from before the disconnect, `get_lives_summary`
+    must NOT overlay the stale cached fields."""
+    p, state_cache, s = persistence_with_cache
+
+    # Populate cache + SQL with a live session.
+    p._state_apply_live_started(fake_handle, {"room_id": fake_room_id})
+    _push_gift(p, fake_room_id, fake_handle, 100, 200)
+    _push_simple(p, fake_room_id, fake_handle, "like", user_id=200)
+
+    # Sanity: cache has session state.
+    cached = state_cache.get(fake_handle)
+    assert cached is not None
+    _, cache_state = cached
+    assert cache_state.get("active_room_id") is not None, (
+        "preconditions: cache should have active_room_id before stale sim"
+    )
+
+    # Now age the room out — simulates the worker disconnect.
+    _age_out_active_room(p, fake_room_id)
+    s._lives_summary_cache.clear()  # drop the 60s TTL cache
+
+    # The overlay must NOT reassert active_room_id from cache.
+    result = s.get_lives_summary([fake_handle])
+    norm = fake_handle.lower()
+    slice_ = result.get(norm, {})
+
+    assert slice_.get("active_room_id") is None, (
+        f"stale active_room_id leaked through overlay: "
+        f"got {slice_.get('active_room_id')!r}"
+    )
+    assert slice_.get("viewer_count") is None, (
+        f"stale viewer_count leaked through overlay: "
+        f"got {slice_.get('viewer_count')!r}"
+    )
+    assert slice_.get("diamonds_session") is None, (
+        f"stale diamonds_session leaked through overlay: "
+        f"got {slice_.get('diamonds_session')!r}"
+    )
+
+
+def test_stale_cache_snapshot_sanitizer_drops_session_fields(
+    persistence_with_cache, fake_handle, fake_room_id,
+):
+    """`sanitize_cached_snapshot` (WS request-snapshot path) drops
+    session-scoped fields when SQL says the host has no active room.
+    Mirrors the overlay behavior for direct cache readers."""
+    p, state_cache, s = persistence_with_cache
+
+    p._state_apply_live_started(fake_handle, {"room_id": fake_room_id})
+    _push_gift(p, fake_room_id, fake_handle, 100, 500)
+
+    _age_out_active_room(p, fake_room_id)
+
+    cached = state_cache.get(fake_handle)
+    assert cached is not None
+    _, cache_state = cached
+    public_data = {k: v for k, v in cache_state.items() if not k.startswith("_")}
+    # Pre-condition: cache still has session fields (it hasn't been
+    # swept yet at this point — the sanitizer is the read-time gate).
+    assert public_data.get("active_room_id") is not None
+
+    norm = fake_handle.lower()
+    sanitized = s.sanitize_cached_snapshot(norm, public_data)
+
+    overlay_fields = s._CACHE_OVERLAY_FIELDS
+    leaked = [k for k in overlay_fields if k in sanitized and sanitized[k] is not None]
+    assert not leaked, (
+        f"sanitize_cached_snapshot did not drop stale session fields "
+        f"for a non-active host: {leaked!r}"
+    )
+
+
+def test_sweep_stale_state_cache_clears_inactive_hosts(
+    persistence_with_cache, fake_handle, fake_room_id,
+):
+    """`sweep_stale_state_cache` walks every cached host, cross-refs
+    against `get_hosts_with_active_room`, and applies a clearing patch
+    to hosts whose rooms are no longer live. Idempotent: a second run
+    after the first must NOT re-clear (would burn versions forever
+    and spam the delta channel)."""
+    p, state_cache, s = persistence_with_cache
+
+    p._state_apply_live_started(fake_handle, {"room_id": fake_room_id})
+    _push_gift(p, fake_room_id, fake_handle, 100, 1000)
+
+    _age_out_active_room(p, fake_room_id)
+
+    # First sweep: should clear our host.
+    cleared = s.sweep_stale_state_cache()
+    assert cleared == 1, f"expected 1 stale host cleared, got {cleared}"
+
+    # Verify the storage-layer state is actually cleared.
+    cached = state_cache.get(fake_handle)
+    assert cached is not None
+    _, post = cached
+    overlay_fields = s._CACHE_OVERLAY_FIELDS
+    leaked = [
+        k for k in overlay_fields
+        if k != "version" and post.get(k) is not None
+    ]
+    assert not leaked, (
+        f"sweep did not zero out session-scoped fields: still set: {leaked!r}"
+    )
+
+    # Second sweep: idempotent — no further clears.
+    cleared_again = s.sweep_stale_state_cache()
+    assert cleared_again == 0, (
+        f"second sweep should be idempotent, got cleared={cleared_again}"
+    )
+
+
+def test_sweep_stale_state_cache_skips_active_hosts(
+    persistence_with_cache, fake_handle, fake_room_id,
+):
+    """A host whose room is still actively live must NOT be touched
+    by the sweep — the active session is load-bearing for the UI."""
+    p, state_cache, s = persistence_with_cache
+
+    p._state_apply_live_started(fake_handle, {"room_id": fake_room_id})
+    _push_gift(p, fake_room_id, fake_handle, 100, 1000)
+
+    # Don't age the room out — it should be in the active set.
+    cleared = s.sweep_stale_state_cache()
+    assert cleared == 0, (
+        f"sweep should not clear active hosts, got cleared={cleared}"
+    )
+
+    cached = state_cache.get(fake_handle)
+    assert cached is not None
+    _, post = cached
+    assert post.get("active_room_id") is not None, (
+        "sweep zeroed an active host's session state"
+    )

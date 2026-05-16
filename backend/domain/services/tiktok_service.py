@@ -2303,6 +2303,95 @@ class TikTokService:
     def close_orphan_matches(self) -> int:
         return self._persistence.close_orphan_matches()
 
+    def sweep_stale_state_cache(self) -> int:
+        """Periodic sweeper that clears session-scoped fields from the
+        state cache for hosts whose room is no longer live by the SQL
+        predicate `_lives_summary_active_rooms` uses.
+
+        Without this, a host whose worker disconnected without firing
+        `live_end` retains stale `active_room_id`, `viewer_count`,
+        `session_stats`, etc. forever. The HTTP overlay + WS-snapshot
+        gates added in commits 96b961b/3fa561d filter the stale values
+        at read time, but the Redis cache still accumulates them
+        (memory pressure on a long-running install) AND any reader
+        bypassing the gate (future code path, debug script, etc.)
+        would still see them.
+
+        Strategy: build a clear-patch (every `_CACHE_OVERLAY_FIELDS`
+        key set to None) and `apply_patch` it onto each stale host.
+        Going through `apply_patch` — not a direct delete — bumps
+        the host's monotonic version AND publishes a delta on the
+        admin + public channels. Connected WS clients see the patch
+        and zero out their local state. Self-healing.
+
+        Returns the number of hosts cleared. Cheap on small caches;
+        the `list_versions()` call enumerates every entry once + a
+        single batched SQL query gates them; the per-host patches
+        only fire for hosts that actually need clearing.
+
+        Safe to run while events are flowing — the per-host
+        `apply_patch` is atomic w.r.t. the persist path, so a freshly-
+        arrived event on a host being cleared will simply land on
+        top of the cleared state with the next version bump.
+        """
+        if self._state_cache is None:
+            return 0
+        try:
+            versions = self._state_cache.list_versions()
+        except Exception:
+            logger.exception("sweep_stale_state_cache: list_versions failed")
+            return 0
+        if not versions:
+            return 0
+        handles = list(versions.keys())
+        try:
+            active = self._persistence.get_hosts_with_active_room(handles)
+        except Exception:
+            logger.exception(
+                "sweep_stale_state_cache: get_hosts_with_active_room failed"
+            )
+            return 0
+        stale = [h for h in handles if h not in active]
+        if not stale:
+            return 0
+        # Build a clear-patch from the overlay fields. Setting every
+        # session-scoped key to None propagates through deep-merge —
+        # frontends already handle null values correctly because the
+        # cold-start render path uses the same nulls.
+        clear_patch: dict[str, Any] = {k: None for k in self._CACHE_OVERLAY_FIELDS}
+        cleared = 0
+        for h in stale:
+            # Skip hosts whose cached state already has no session
+            # fields populated (idempotent — re-running the sweep
+            # doesn't keep bumping version on already-clean hosts).
+            try:
+                cached = self._state_cache.get(h)
+            except Exception:
+                continue
+            if cached is None:
+                continue
+            _, data = cached
+            if not any(
+                data.get(k) is not None
+                for k in self._CACHE_OVERLAY_FIELDS
+                if k != "version"
+            ):
+                continue
+            try:
+                self._state_cache.apply_patch(h, dict(clear_patch))
+                cleared += 1
+            except Exception:
+                logger.exception(
+                    "sweep_stale_state_cache: apply_patch failed for %s", h,
+                )
+        if cleared:
+            logger.info(
+                "sweep_stale_state_cache: cleared session state for %d hosts "
+                "(scanned %d, active %d).",
+                cleared, len(handles), len(active),
+            )
+        return cleared
+
     def list_user_matches(
         self,
         *,

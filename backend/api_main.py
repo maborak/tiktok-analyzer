@@ -592,6 +592,27 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 logger.error(f"close_orphan_matches failed: {e}")
 
+            # Sweep stale session state from the lives-list state cache.
+            # Hosts whose worker dropped silently (no `live_end` event)
+            # otherwise keep their cached `active_room_id`/`viewer_count`/
+            # `session_stats` forever. The HTTP overlay + WS-snapshot
+            # gates (96b961b / 3fa561d) already filter those at read
+            # time; this sweep also clears them at the storage layer
+            # so the Redis cache doesn't accumulate stale entries and
+            # so any non-gated reader (debug script, future code path)
+            # sees the same view. Idempotent — already-clean hosts skip.
+            try:
+                tiktok_svc = services.get("tiktok_service")
+                if tiktok_svc:
+                    n = tiktok_svc.sweep_stale_state_cache()
+                    if n:
+                        logger.info(
+                            "Cleared stale state cache for %d host%s.",
+                            n, "" if n == 1 else "s",
+                        )
+            except Exception as e:
+                logger.error(f"sweep_stale_state_cache failed: {e}")
+
             await asyncio.sleep(interval)
 
     monitor_task = asyncio.create_task(run_background_maintenance())
