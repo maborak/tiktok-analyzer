@@ -4125,13 +4125,11 @@ function TopUserPieCard({
   // Stable dep key for the extras array (identity flips every render).
   const extraKey = (extraRoomIds ?? []).join(',');
   const [items, setItems] = useState<TikTokGifter[]>([]);
-  const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
     if (!roomId) {
       setItems([]);
-      setTotal(0);
       return;
     }
     let cancelled = false;
@@ -4148,12 +4146,10 @@ function TopUserPieCard({
       .then((res) => {
         if (cancelled) return;
         setItems(res.items);
-        setTotal(res.total);
       })
       .catch(() => {
         if (cancelled) return;
         setItems([]);
-        setTotal(0);
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -4176,24 +4172,14 @@ function TopUserPieCard({
   );
   const hasData = cleanSlices.length > 0;
   const slicesSum = cleanSlices.reduce((acc, s) => acc + s.value, 0);
-  // `total` from the endpoint is the row count, not the diamond sum,
-  // so we can't derive "Others" from it. Pull the full-room sum from
-  // the page's `stats.diamonds_total` via the closure — but
-  // TopUserPieCard runs on its own props, so we approximate using the
-  // top-10 sum vs row count: when there are more than 10 rows, show
-  // an "Others" slice sized at the average per-rank value × extra
-  // rows so the donut visually accounts for the long tail. This is
-  // approximate; the tooltip on the slice clarifies the figure.
-  const extraRows = Math.max(0, total - cleanSlices.length);
-  const avgTopValue =
-    cleanSlices.length > 0 ? slicesSum / cleanSlices.length : 0;
-  const others =
-    extraRows > 0 && avgTopValue > 0
-      ? Math.round(avgTopValue * extraRows * 0.5)
-      : 0;
-  const grandTotal = slicesSum + others;
+  // No "Others" slice — the gifters endpoint returns row count, not
+  // diamond sum, so any approximation we'd make for the long tail is
+  // a lie (the tail's average diamonds-per-gifter is nowhere near the
+  // top-10's average; whales + trickle distribution kills the math).
+  // The donut therefore shows the top-10 proportions only. The header
+  // chip + #1-share label both make this scope explicit.
   const top = cleanSlices[0];
-  const topPct = hasData && grandTotal > 0 ? (top.value / grandTotal) * 100 : 0;
+  const topPct = hasData && slicesSum > 0 ? (top.value / slicesSum) * 100 : 0;
 
   // Build per-slice colors by alpha-fading the accent. Top slice gets
   // full opacity; each subsequent rank drops 7-8% down to a floor of
@@ -4232,32 +4218,15 @@ function TopUserPieCard({
           avoidLabelOverlap: false,
           label: { show: false },
           labelLine: { show: false },
-          data: [
-            ...cleanSlices.map((s, i) => ({
-              name: s.label,
-              value: s.value,
-              itemStyle: { color: sliceColors[i] },
-            })),
-            // "Others" slice — CSS var picks up dark-mode override
-            // from styles/tokens.css. Falls back to gray-300 hex if
-            // the var isn't defined; both values stay legible on the
-            // dark card surface.
-            ...(others > 0
-              ? [
-                  {
-                    name: 'Others',
-                    value: others,
-                    itemStyle: {
-                      color: 'var(--color-pie-others, #d1d5db)',
-                    },
-                  },
-                ]
-              : []),
-          ],
+          data: cleanSlices.map((s, i) => ({
+            name: s.label,
+            value: s.value,
+            itemStyle: { color: sliceColors[i] },
+          })),
         },
       ],
     };
-  }, [hasData, cleanSlices, sliceColors, others]);
+  }, [hasData, cleanSlices, sliceColors]);
 
   return (
     <section className="rounded-lg border border-gray-200 bg-white dark:bg-gray-100/[0.05] p-3 shadow-sm">
@@ -4291,8 +4260,8 @@ function TopUserPieCard({
               <div className="text-base font-bold tabular-nums text-gray-900 leading-none">
                 {topPct.toFixed(0)}%
               </div>
-              <div className="text-[9px] uppercase tracking-wider text-gray-500 mt-0.5">
-                #1 share
+              <div className="text-[9px] uppercase tracking-wider text-gray-500 mt-0.5 text-center px-1 leading-tight">
+                #1 of top {cleanSlices.length}
               </div>
             </div>
           </div>
@@ -4322,15 +4291,6 @@ function TopUserPieCard({
                 </span>
               </li>
             ))}
-            {others > 0 && (
-              <li className="flex items-center gap-2 border-t border-gray-100 dark:border-gray-100/10 pt-1 mt-1">
-                <span
-                  className="w-2 h-2 rounded-full shrink-0"
-                  style={{ backgroundColor: 'var(--color-pie-others, #d1d5db)' }}
-                />
-                <span className="truncate text-gray-500">Others</span>
-              </li>
-            )}
           </ol>
         </div>
       ) : loading ? (
