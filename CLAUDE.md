@@ -502,3 +502,45 @@ initialize_services`, `routes/main.py:setup_routes`,
   audit agents (`frontend-dark-mode-auditor`, `ai-slop-detector`).
   Dispatch them; they catch what grep misses (e.g. CSS-variable
   inversion traps).
+
+## Discipline rules (learned the hard way)
+
+Each rule below is here because we hit the bug in production. They
+override "looks like it should work" intuition.
+
+- **Every `async def` FastAPI route that calls sync SQL MUST use
+  `asyncio.to_thread`.** Single-user benchmarks won't surface the
+  bug; concurrent users serialize on the event loop. `/lives/bundle`
+  is the canonical pattern (`asyncio.gather + asyncio.to_thread`).
+- **When you create a new shared component or helper, migrate ≥1
+  call site in the same commit.** A new SafeAvatar with zero
+  consumers is worse than no SafeAvatar — operators believe the fix
+  is shipped when it isn't. See `feedback_migrate_when_creating`.
+- **Audit pre-existing modifications when you commit them.** Files
+  in the work tree at session start that you didn't write get the
+  SAME audit rigor as new code. Bundling them under a commit message
+  that describes only new work hides them from future audits. The
+  `open_match` FK-flood was exactly this miss.
+- **Same logical question → ONE source of truth.** When you find
+  the third implementation of "is X live?" or "who are top
+  gifters?", consolidate or document the difference explicitly.
+  Drift between read paths is invisible until a user spots an
+  inconsistency in the UI.
+- **Never ship `avg × N × 0.5`-style approximations for unknown
+  distributions.** Either compute the real value or omit the
+  derived field. The pie's bogus "Others" slice rendered the #1
+  gifter as 0% because the heuristic was 1000× wrong at production
+  scale. See `feedback_no_unmeasured_approximations`.
+- **State caches that depend on "every change fires an event"
+  always break.** Workers drop silently, `live_end` events go
+  missing, network blips happen. Every cache overlay needs an SQL-
+  authority gate at read time AND a periodic sweeper at the
+  storage layer. The 2026-05-16 fix shipped both.
+- **Heavy children of pages with high-frequency state churn need
+  `React.memo`.** The detail page's 5046-line tree reconciling on
+  every WS event was an always-on cost masked by other latency
+  wins. Memoize early.
+- **Run `/audit` before claiming work is done.** The slash command
+  exists for this exact reason. Its Step-5 landmine catalogue
+  accumulates every bug class we've hit; re-running it on each
+  commit costs ~2 minutes and saves hours of regression.

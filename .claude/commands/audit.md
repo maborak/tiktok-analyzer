@@ -173,6 +173,13 @@ have actually bit this codebase before:
 | PG-only SQL in a function that falls through on SQLite without `_is_postgres()` guard | `ANY(:` `INTERVAL` `NOW()` `date_trunc` in `else:` branches | `_lives_summary_hourly`, `_daily_buckets_cached` (carried — flagged) |
 | Sequence advanced but no row committed (silent rollback) | `pg_insert(.*).returning(...)` + no surrounding `s.commit()` | `open_match` (2026-05-15) |
 | Cache key not including TZ / handle-set when payload depends on those | `_*_cache: dict` definitions | n/a (pattern was fixed once) |
+| `async def` FastAPI route calling sync `svc.method(...)` without `asyncio.to_thread` | `async def \w+\(.*\n(?:.*\n){0,40}\s+return\s+svc\.` in `backend/routes/`, then verify the call is wrapped | 6 endpoints on the detail page (2026-05-16; surfaces under concurrent load only — single-user bench is fine) |
+| Same logical question implemented in N read paths that drift over time | grep for the question's domain field (`is_live`, `n_live`, `active_room_id`); count distinct read paths | `n_live` totals vs `active_room_id` cards vs `state_cache.active_room_id` WS — 3 paths, 3 different answers (2026-05-16) |
+| State-cache overlay re-asserts stale data when no clearing event fires | `_overlay_state_cache` / cache read paths that don't check SQL authority | session state persisted for 8+ hours after worker silently dropped (2026-05-16) |
+| New shared component created but call sites not migrated | newly-created `*.tsx` in `components/` with zero/few imports elsewhere | `SafeAvatar` (2026-05-15: built, 19 call sites stayed raw `<img>` for weeks) |
+| Approximation/heuristic that breaks at scale | `avg.*\*.*N\|* 0\.\d` in chart-data prep code | Pie "Others" slice (2026-05-16: heuristic was wrong by 1000× → #1 rendered as 0%) |
+| Frontend page with high-frequency state churn but no `React.memo` on heavy children | `export function .*` in `components/` AND parent has `setState` in a WS / interval handler | `TikTokLiveDetailBody` 5046-line tree reconciled per WS event before 2026-05-16 |
+| Pre-existing modification swept into commit without scrutiny | Files in `git diff --stat HEAD` whose path doesn't match the commit's headline theme | `open_match` refactor bundled into Phase 9 perf commit (2026-05-15, FK flood) |
 
 If any finding matches one of these landmines, mark it CRITICAL
 regardless of the agent's original severity.
