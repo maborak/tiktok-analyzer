@@ -1931,22 +1931,20 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
               <TopUserPieCard
                 title="Top Gifter"
                 icon={<Crown className="w-3.5 h-3.5 text-amber-500" />}
-                topLabel={
-                  stats?.top_gifters?.[0]
-                    ? stats.top_gifters[0].nickname ||
-                      stats.top_gifters[0].unique_id ||
-                      'Unknown'
-                    : null
-                }
-                topValue={stats?.top_gifters?.[0]?.diamonds ?? null}
-                othersValue={
-                  stats?.top_gifters?.[0] && stats.diamonds_total != null
-                    ? Math.max(
-                        0,
-                        stats.diamonds_total - (stats.top_gifters[0].diamonds ?? 0),
-                      )
-                    : null
-                }
+                slices={(stats?.top_gifters ?? []).slice(0, 10).map((g) => ({
+                  label: g.nickname || g.unique_id || 'Unknown',
+                  value: g.diamonds ?? 0,
+                }))}
+                othersValue={(() => {
+                  const arr = stats?.top_gifters ?? [];
+                  const totalKnown = arr
+                    .slice(0, 10)
+                    .reduce((s, g) => s + (g.diamonds ?? 0), 0);
+                  return stats?.diamonds_total != null
+                    ? Math.max(0, stats.diamonds_total - totalKnown)
+                    : null;
+                })()}
+                totalOverride={stats?.diamonds_total ?? null}
                 valueSuffix=" 💎"
                 accentColor={eventColor('gift')}
               />
@@ -4099,35 +4097,63 @@ function LiveMatchTopDonors({
   );
 }
 
-/** Small "top user vs others" pie card. Drives the right-column
- *  trio (Top Gifter / Commenter / Liker) on the Top Gifters tab.
+/** Top-N donut card. Drives the right-column trio (Top Gifter /
+ *  Commenter / Liker) on the Top Gifters tab.
  *
- *  Layout: title row on top, ~140-160px square pie below, footer
- *  with the top user's name + value. Renders a "No data" empty
- *  state when `topLabel` or `topValue` is null. */
+ *  Pass the top N user-shaped rows in `slices` and the long-tail
+ *  remainder in `othersValue` (or omit to compute from `totalOverride
+ *  - sum(slices)`). The slice colors fade alpha off `accentColor` so
+ *  the top user reads as full-saturation and lower-ranked users tint
+ *  down — gives the chart a "the top one dominates" visual without
+ *  losing per-user identity (tooltip on hover shows the row).
+ *
+ *  Layout: title row on top, ~140 px square pie below, footer with
+ *  the top user's name + value. Renders a "No data" empty state when
+ *  `slices` is empty or sums to zero. */
 function TopUserPieCard({
   title,
   icon,
-  topLabel,
-  topValue,
+  slices,
   othersValue,
+  totalOverride,
   valueSuffix,
   accentColor,
   emptyHint,
 }: {
   title: string;
   icon: React.ReactNode;
-  topLabel: string | null;
-  topValue: number | null;
-  othersValue: number | null;
+  slices: { label: string; value: number }[];
+  othersValue?: number | null;
+  totalOverride?: number | null;
   valueSuffix: string;
   accentColor: string;
   emptyHint?: string;
 }) {
-  const hasData = topLabel !== null && topValue !== null && topValue > 0;
-  const others = othersValue ?? 0;
-  const total = (topValue ?? 0) + others;
-  const topPct = hasData && total > 0 ? ((topValue! / total) * 100) : 0;
+  const cleanSlices = slices.filter((s) => s.value > 0);
+  const hasData = cleanSlices.length > 0;
+  const slicesSum = cleanSlices.reduce((acc, s) => acc + s.value, 0);
+  const others = Math.max(0, othersValue ?? 0);
+  const total = totalOverride != null ? totalOverride : slicesSum + others;
+  const top = cleanSlices[0];
+  const topPct = hasData && total > 0 ? (top.value / total) * 100 : 0;
+
+  // Build per-slice colors by alpha-fading the accent. Top slice gets
+  // full opacity; each subsequent rank drops 7-8% down to a floor of
+  // 35% so even the 10th slice stays visible against the card surface.
+  // Accepts `#RRGGBB` or `#RGB` shorthand; falls back to accent only
+  // when the format is unrecognized.
+  const sliceColors = useMemo(() => {
+    const m = /^#([0-9a-f]{6}|[0-9a-f]{3})$/i.exec(accentColor.trim());
+    if (!m) return cleanSlices.map(() => accentColor);
+    let hex = m[1];
+    if (hex.length === 3) hex = hex.split('').map((c) => c + c).join('');
+    return cleanSlices.map((_, i) => {
+      const alpha = Math.max(0.35, 1 - i * 0.07);
+      const a = Math.round(alpha * 255).toString(16).padStart(2, '0');
+      return `#${hex}${a}`;
+    });
+  }, [cleanSlices, accentColor]);
+
   const option = useMemo(() => {
     if (!hasData) return null;
     return {
@@ -4145,30 +4171,42 @@ function TopUserPieCard({
           label: { show: false },
           labelLine: { show: false },
           data: [
-            { name: topLabel, value: topValue, itemStyle: { color: accentColor } },
+            ...cleanSlices.map((s, i) => ({
+              name: s.label,
+              value: s.value,
+              itemStyle: { color: sliceColors[i] },
+            })),
             // "Others" slice — CSS var picks up dark-mode override
             // from styles/tokens.css. Falls back to gray-300 hex if
             // the var isn't defined; both values stay legible on the
-            // dark card surface (was: `#e5e7eb` = gray-200, invisible
-            // on dark background).
-            {
-              name: 'Others',
-              value: others,
-              itemStyle: {
-                color: 'var(--color-pie-others, #d1d5db)',
-              },
-            },
+            // dark card surface.
+            ...(others > 0
+              ? [
+                  {
+                    name: 'Others',
+                    value: others,
+                    itemStyle: {
+                      color: 'var(--color-pie-others, #d1d5db)',
+                    },
+                  },
+                ]
+              : []),
           ],
         },
       ],
     };
-  }, [hasData, topLabel, topValue, others, valueSuffix, accentColor]);
+  }, [hasData, cleanSlices, sliceColors, others, valueSuffix]);
 
   return (
     <section className="rounded-lg border border-gray-200 bg-white dark:bg-gray-100/[0.05] p-3 shadow-sm">
       <div className="auth-mono-label flex items-center gap-1.5 mb-2">
         {icon}
         {title}
+        {hasData && (
+          <span className="ml-auto text-[10px] font-mono text-gray-400">
+            top {cleanSlices.length}
+          </span>
+        )}
       </div>
       {hasData && option ? (
         <>
@@ -4176,7 +4214,7 @@ function TopUserPieCard({
             className="relative"
             style={{ height: 140 }}
             role="img"
-            aria-label={`${title} — ${topLabel ?? 'top user'} at ${topPct.toFixed(0)}% of total${valueSuffix ? ` (${topValue?.toLocaleString() ?? '0'}${valueSuffix})` : ''}`}
+            aria-label={`${title} — top ${cleanSlices.length} users; leader ${top.label} at ${topPct.toFixed(0)}% of total${valueSuffix ? ` (${top.value.toLocaleString()}${valueSuffix})` : ''}`}
           >
             <ReactECharts
               echarts={echarts}
@@ -4193,16 +4231,16 @@ function TopUserPieCard({
                 {topPct.toFixed(0)}%
               </div>
               <div className="text-[9px] uppercase tracking-wider text-gray-500">
-                of total
+                #1 share
               </div>
             </div>
           </div>
           <div className="mt-2 text-xs font-mono">
-            <div className="truncate text-gray-900" title={topLabel ?? ''}>
-              {topLabel}
+            <div className="truncate text-gray-900" title={top.label}>
+              {top.label}
             </div>
             <div className="tabular-nums text-gray-500">
-              {(topValue ?? 0).toLocaleString()}
+              {top.value.toLocaleString()}
               {valueSuffix}
               {total > 0 && (
                 <span className="ml-1 text-[10px] text-gray-400">
