@@ -1569,15 +1569,44 @@ class TikTokService:
         task.add_done_callback(_on_done)
         return task
 
-    async def create_subscription(self, unique_id: str, *, enabled: bool = True) -> Subscription:
+    async def create_subscription(
+        self,
+        unique_id: str,
+        *,
+        enabled: bool = True,
+        profile: dict[str, Any] | None = None,
+    ) -> Subscription:
+        """Create + start a new subscription.
+
+        When `profile` is provided (from the Add-Live lookup the
+        frontend already paid for), seed the cached profile fields
+        BEFORE firing the background refresh — so the Lives table
+        shows avatar/nickname immediately AND we don't burn another
+        SIGI/Euler quota on the redundant refresh. The next periodic
+        refresh (1h cadence) will overwrite with fresh data anyway.
+        """
         unique_id = self._normalize(unique_id)
         sub = self._persistence.upsert_subscription(unique_id, enabled=enabled)
-        # Fire-and-forget profile refresh so the Lives table shows
-        # avatar/nickname immediately. Tracked so a crash actually surfaces.
-        self._spawn_bg(
-            self.refresh_profile(unique_id),
-            name=f"refresh_profile:{unique_id}",
-        )
+        seeded_from_lookup = False
+        if profile:
+            try:
+                self._persistence.update_subscription_profile(
+                    unique_id, profile=profile, error=None,
+                )
+                seeded_from_lookup = True
+            except Exception:
+                logger.exception(
+                    "Failed to seed profile from Add-Live lookup for @%s — "
+                    "falling back to background refresh.",
+                    unique_id,
+                )
+        if not seeded_from_lookup:
+            # No lookup data available (or seed failed) — fire the usual
+            # background refresh so the Lives table catches up.
+            self._spawn_bg(
+                self.refresh_profile(unique_id),
+                name=f"refresh_profile:{unique_id}",
+            )
         if sub.enabled:
             await self._start_session(sub.unique_id)
         return sub

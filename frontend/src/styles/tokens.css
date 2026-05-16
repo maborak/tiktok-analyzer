@@ -93,6 +93,10 @@
     --color-chart-4: #f59e0b;
     --color-chart-5: #10b981;
     --color-chart-6: #ec4899;
+    /* Neutral "Others" / unattributed segment in pie / donut charts.
+       Dark theme overrides this in themes.css so the slice stays
+       legible against the inverted card surface. */
+    --color-pie-others: #d1d5db;
 
     /* ─── Sidebar ─── */
     --color-sidebar-bg:              #ffffff;

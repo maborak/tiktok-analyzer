@@ -671,7 +671,7 @@ function OpponentCell({
   const seed = (display[0] || '?').toUpperCase();
   const url = (o as { avatar_url?: string }).avatar_url;
   return (
-    <div className="flex items-center gap-2.5 rounded-md border border-gray-200 bg-white dark:bg-white/[0.03] px-3 py-2 min-w-[220px]">
+    <div className="flex items-center gap-2.5 rounded-md border border-gray-200 bg-white dark:bg-white/[0.03] px-3 py-2 min-w-[180px] sm:min-w-[220px]">
       {url ? (
         <img
           src={url}
@@ -875,7 +875,7 @@ function MatchTopDonors({
                 type="button"
                 onClick={() => pick(r)}
                 disabled={!r.user_id}
-                className="w-full flex items-center gap-2 px-2 py-1.5 rounded border border-gray-200 bg-gray-50 dark:bg-gray-100/[0.06] hover:bg-gray-100/50 dark:hover:bg-gray-100/5 cursor-pointer transition-colors text-left disabled:cursor-default disabled:opacity-70"
+                className="w-full flex items-center gap-2 px-2 py-2 rounded border border-gray-200 bg-gray-50 dark:bg-gray-100/[0.06] hover:bg-gray-100/50 dark:hover:bg-gray-100/5 cursor-pointer transition-colors text-left disabled:cursor-default disabled:opacity-70"
                 title={r.user_id ? "Open this gifter's cross-host profile" : 'No user_id captured for this row'}
               >
                 <span className="shrink-0 w-5 text-center text-gray-400 tabular-nums">
@@ -1207,7 +1207,7 @@ function SideGiftersList({
                   type="button"
                   onClick={() => onPick(g)}
                   disabled={!g.user_id}
-                  className="w-full flex items-center gap-2 px-2 py-1.5 rounded border border-gray-200 bg-gray-50 dark:bg-gray-100/[0.06] hover:bg-gray-100/50 dark:hover:bg-gray-100/5 cursor-pointer transition-colors text-left disabled:cursor-default disabled:opacity-70"
+                  className="w-full flex items-center gap-2 px-2 py-2 rounded border border-gray-200 bg-gray-50 dark:bg-gray-100/[0.06] hover:bg-gray-100/50 dark:hover:bg-gray-100/5 cursor-pointer transition-colors text-left disabled:cursor-default disabled:opacity-70"
                   title={g.user_id ? "Open this gifter's cross-host profile" : 'No user_id captured for this row'}
                 >
                   <span className="shrink-0 w-5 text-center text-gray-400 tabular-nums">

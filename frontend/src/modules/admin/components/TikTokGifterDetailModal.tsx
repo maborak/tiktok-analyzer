@@ -207,9 +207,13 @@ export function TikTokGifterDetailModal({
           )}
         </div>
       </div>
-      <div className="flex items-center gap-3 flex-shrink-0">
+      {/* Right block stacks vertically on narrow screens (avatar + 3
+          stats + Go-to-Live button used to all fit one row, crowding
+          the identity column down to ~30 px and truncating the name).
+          On sm+ they sit side-by-side again. */}
+      <div className="flex flex-col items-end gap-1.5 flex-shrink-0 min-w-0">
         {headerStats.length > 0 && (
-          <div className="flex items-baseline gap-4">
+          <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1 justify-end">
             {headerStats.map((s) => (
               <div key={s.label} className="text-right">
                 <div className="text-[10px] font-mono uppercase tracking-wider text-gray-500">

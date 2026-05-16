@@ -640,7 +640,7 @@ function TikTokLivesBody() {
             tone; inactive = neutral so the highlighted pill draws
             the eye. Pill (rounded-full) not button — matches the
             sort selector visual language below. */}
-        <div className="flex items-center gap-1.5 shrink-0">
+        <div className="flex flex-wrap items-center gap-1.5 shrink-0">
           {([
             { id: 'all',     label: 'ALL' },
             { id: 'online',  label: 'ONLINE' },
@@ -653,7 +653,7 @@ function TikTokLivesBody() {
               className={`px-3 py-1.5 text-xs font-mono rounded-full transition-colors ${
                 statusFilter === opt.id
                   ? 'bg-primary-100 text-primary-700 dark:bg-primary-500/20 dark:text-primary-300'
-                  : 'bg-white text-gray-600 border border-gray-200 hover:border-gray-300 dark:bg-gray-100/5'
+                  : 'bg-white text-gray-600 border border-gray-200 hover:border-gray-300 dark:bg-gray-100/5 dark:border-gray-100/10 dark:hover:border-gray-100/20'
               }`}
             >
               {opt.label}

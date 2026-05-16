@@ -911,7 +911,18 @@ export const tiktokApi = {
   // Subscriptions
 
   listLives(): Promise<TikTokSubscription[]> {
-    return apiRequest({ method: 'GET', url: `${BASE}/lives` });
+    // 30s TTL cache + in-flight dedupe — multiple consumers
+    // (`getLiveByHandle`, gifter-modal `isMonitored` lookups, the
+    // CRUD-refresh path on TikTokLives, etc.) all collapse onto a
+    // single RTT within a poll window. Without this, every gifter
+    // modal open + every common-gifter modal open fires a fresh
+    // round-trip just to check `isMonitored` against the same list.
+    return apiRequest({
+      method: 'GET',
+      url: `${BASE}/lives`,
+      cacheTtlMs: 30_000,
+      dedupe: true,
+    });
   },
 
   /** Single-handle lookup. No dedicated admin endpoint — filter from

@@ -9,6 +9,7 @@ import {
   Heart,
   History,
   Loader2,
+  Lock,
   MessageSquare,
   Radio,
   RefreshCw,
@@ -1918,12 +1919,14 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
               />
             </div>
 
-            {/* RIGHT column: three small pie cards. Drops below the list
-                on narrow viewports. Top gifter card derives its data
-                from `stats.top_gifters[0]` vs the remaining
-                `stats.diamonds_total`; the commenter + liker cards
-                show an empty state today (no per-user aggregate yet —
-                only per-event totals). */}
+            {/* RIGHT column: pie cards for the per-user aggregates we
+                actually have. Today that's just gifters
+                (`stats.top_gifters[0]` vs `stats.diamonds_total`). The
+                commenter + liker aggregates aren't tracked per-user yet
+                (only per-event totals), so we collapse them into a
+                single "coming soon" notice instead of shipping two
+                permanently-empty donut rings.
+                Drops below the list on narrow viewports. */}
             <div className="flex flex-col gap-3 min-w-0">
               <TopUserPieCard
                 title="Top Gifter"
@@ -1945,28 +1948,20 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
                     : null
                 }
                 valueSuffix=" 💎"
-                accentColor="#f59e0b"
+                accentColor={eventColor('gift')}
               />
-              <TopUserPieCard
-                title="Top Commenter"
-                icon={<MessageSquare className="w-3.5 h-3.5 text-sky-500" />}
-                topLabel={null}
-                topValue={null}
-                othersValue={null}
-                valueSuffix=""
-                accentColor="#0ea5e9"
-                emptyHint="Per-user comment aggregate not yet exposed."
-              />
-              <TopUserPieCard
-                title="Top Liker"
-                icon={<Heart className="w-3.5 h-3.5 text-rose-500" />}
-                topLabel={null}
-                topValue={null}
-                othersValue={null}
-                valueSuffix=""
-                accentColor="#f43f5e"
-                emptyHint="Per-user like aggregate not yet exposed."
-              />
+              {/* Coming-soon placeholder for per-user comment/like
+                  aggregates — uses the project's established Lock +
+                  left-border-accent pattern for not-yet-shipped state. */}
+              <div className="rounded-lg border border-gray-200 dark:border-gray-100/10 bg-white dark:bg-gray-100/[0.05] border-l-4 border-l-gray-300 dark:border-l-gray-100/20 p-3">
+                <div className="auth-mono-label flex items-center gap-1.5 mb-1.5 text-gray-500">
+                  <Lock className="w-3 h-3" />
+                  Coming soon
+                </div>
+                <p className="text-[11px] text-gray-500 leading-snug">
+                  Top commenter &amp; top liker aggregates aren't tracked per-user yet — only per-event totals.
+                </p>
+              </div>
             </div>
           </div>
         )}
@@ -3743,7 +3738,7 @@ function LiveMatchView({
             so cards reflow under the host on narrow desktops rather than
             forcing horizontal scroll. */}
         <div className="flex flex-wrap gap-2 items-stretch">
-          <div className="flex-1 min-w-[200px]">
+          <div className="flex-1 min-w-[160px] sm:min-w-[200px]">
             <BattlerCard
               person={host}
               score={hostScore}
@@ -3793,7 +3788,7 @@ function LiveMatchView({
             return (
               <div
                 key={t.user_id || tHandle || i}
-                className="flex-1 min-w-[200px]"
+                className="flex-1 min-w-[160px] sm:min-w-[200px]"
               >
                 <BattlerCard
                   person={t}
@@ -3856,7 +3851,7 @@ function LiveMatchView({
             render multiple rivals side-by-side. */}
         {rivals.length === 0 ? (
           <div className="flex flex-wrap gap-2 items-stretch">
-            <div className="flex-1 min-w-[200px]">
+            <div className="flex-1 min-w-[160px] sm:min-w-[200px]">
               <BattlerCard
                 person={null}
                 score={rivalScore}
@@ -3885,7 +3880,7 @@ function LiveMatchView({
               return (
                 <div
                   key={r.user_id || rHandle || i}
-                  className="flex-1 min-w-[200px]"
+                  className="flex-1 min-w-[160px] sm:min-w-[200px]"
                 >
                   <BattlerCard
                     person={r}
@@ -4151,7 +4146,18 @@ function TopUserPieCard({
           labelLine: { show: false },
           data: [
             { name: topLabel, value: topValue, itemStyle: { color: accentColor } },
-            { name: 'Others', value: others, itemStyle: { color: '#e5e7eb' } },
+            // "Others" slice — CSS var picks up dark-mode override
+            // from styles/tokens.css. Falls back to gray-300 hex if
+            // the var isn't defined; both values stay legible on the
+            // dark card surface (was: `#e5e7eb` = gray-200, invisible
+            // on dark background).
+            {
+              name: 'Others',
+              value: others,
+              itemStyle: {
+                color: 'var(--color-pie-others, #d1d5db)',
+              },
+            },
           ],
         },
       ],
@@ -4166,7 +4172,12 @@ function TopUserPieCard({
       </div>
       {hasData && option ? (
         <>
-          <div className="relative" style={{ height: 140 }}>
+          <div
+            className="relative"
+            style={{ height: 140 }}
+            role="img"
+            aria-label={`${title} — ${topLabel ?? 'top user'} at ${topPct.toFixed(0)}% of total${valueSuffix ? ` (${topValue?.toLocaleString() ?? '0'}${valueSuffix})` : ''}`}
+          >
             <ReactECharts
               echarts={echarts}
               option={option}
@@ -4373,8 +4384,7 @@ function BattlerCard({
   const nickname = person?.nickname || handle || '—';
   const avatarUrl = person?.avatar_url || null;
   const tags = person?.tags || [];
-  const hasFooterActions =
-    !!onProfileClick || (monitorState != null && monitorState !== null);
+  const hasFooterActions = !!onProfileClick || monitorState != null;
 
   return (
     <div

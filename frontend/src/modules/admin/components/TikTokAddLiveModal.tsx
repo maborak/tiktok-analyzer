@@ -2,7 +2,6 @@ import { useEffect, useState } from 'react';
 import {
   AlertTriangle,
   CheckCircle2,
-  Circle,
   Eye,
   Loader2,
   Radio,
@@ -185,41 +184,24 @@ function LookupProgress({ handle }: { handle: string }) {
     };
   }, [handle]);
 
+  // Single indeterminate progress bar + current-step label. Replaces
+  // a 4-row "wizard step list" that read as generic onboarding UI —
+  // operator just needs to see "we're still working" + roughly where.
+  // The bar width is driven by the same `step` counter (25/50/75/100%).
+  const stepLabel = LOOKUP_STEPS[Math.min(step, LOOKUP_STEPS.length - 1)];
+  const progressPct = Math.min(100, ((step + 1) / LOOKUP_STEPS.length) * 100);
   return (
-    <div className="space-y-3">
-      <div className="text-xs auth-mono-label text-gray-500">
-        Looking up @{handle}
+    <div className="space-y-2">
+      <div className="flex items-center justify-between text-xs auth-mono-label text-gray-500">
+        <span className="truncate">Looking up @{handle}</span>
+        <span className="font-mono tabular-nums shrink-0">{stepLabel}…</span>
       </div>
-      <ul className="space-y-2">
-        {LOOKUP_STEPS.map((label, idx) => {
-          const done = idx < step;
-          const active = idx === step;
-          return (
-            <li
-              key={label}
-              className={
-                'flex items-center gap-2 text-sm transition-colors ' +
-                (done
-                  ? 'text-gray-500'
-                  : active
-                    ? 'text-gray-900 font-medium'
-                    : 'text-gray-400')
-              }
-            >
-              <span className="w-4 h-4 shrink-0 flex items-center justify-center">
-                {done ? (
-                  <CheckCircle2 className="w-4 h-4 text-primary-500" />
-                ) : active ? (
-                  <Loader2 className="w-4 h-4 text-primary-500 animate-spin" />
-                ) : (
-                  <Circle className="w-3.5 h-3.5 text-gray-300" />
-                )}
-              </span>
-              <span>{label}</span>
-            </li>
-          );
-        })}
-      </ul>
+      <div className="h-0.5 rounded-full bg-gray-200 dark:bg-gray-100/10 overflow-hidden">
+        <div
+          className="h-full bg-primary-500 transition-[width] duration-500 ease-out"
+          style={{ width: `${progressPct}%` }}
+        />
+      </div>
     </div>
   );
 }
@@ -248,7 +230,9 @@ function LookupBody({ data }: { data: TikTokHandleLookup }) {
           <div
             className={
               'w-20 h-20 rounded-full flex items-center justify-center text-3xl font-bold shrink-0 ' +
-              (notFound ? 'bg-rose-100 text-rose-500' : 'bg-gray-100 text-gray-400')
+              (notFound
+                ? 'bg-rose-100 text-rose-500 dark:bg-rose-500/15 dark:text-rose-300'
+                : 'bg-gray-100 text-gray-400 dark:bg-gray-100/10 dark:text-gray-500')
             }
           >
             {notFound ? <UserMinus className="w-8 h-8" /> : (data.handle[0] || '?').toUpperCase()}
@@ -420,28 +404,28 @@ function StatusBadges({
         </span>
       )}
       {offline && (
-        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-gray-200 text-gray-700 text-[10px] font-mono">
-          <span className="w-1.5 h-1.5 rounded-full bg-gray-500" />
+        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-gray-200 text-gray-700 dark:bg-gray-100/10 dark:text-gray-300 text-[10px] font-mono">
+          <span className="w-1.5 h-1.5 rounded-full bg-gray-500 dark:bg-gray-400" />
           OFFLINE
         </span>
       )}
       {unknown && (
-        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 text-[10px] font-mono">
+        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 dark:bg-amber-500/15 dark:text-amber-300 text-[10px] font-mono">
           STATUS UNKNOWN
         </span>
       )}
       {notFound && (
-        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-rose-100 text-rose-700 text-[10px] font-mono">
+        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-rose-100 text-rose-700 dark:bg-rose-500/15 dark:text-rose-300 text-[10px] font-mono">
           NOT FOUND
         </span>
       )}
       {source === 'cache' && (
-        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-gray-100 text-gray-600 text-[10px] font-mono">
+        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-gray-100 text-gray-600 dark:bg-gray-100/10 dark:text-gray-400 text-[10px] font-mono">
           from cache
         </span>
       )}
       {alreadySubscribed && (
-        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 text-[10px] font-mono">
+        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300 text-[10px] font-mono">
           already added
         </span>
       )}

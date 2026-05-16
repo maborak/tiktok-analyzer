@@ -40,9 +40,32 @@ config_service = None  # type: ignore[assignment]
 # ── request / response models ───────────────────────────────────────
 
 
+class ProfileSnapshot(BaseModel):
+    """Pre-captured profile fields from the Add-Live lookup. When the
+    frontend already paid for a SIGI/Euler probe (the preview step in
+    `TikTokAddLiveModal`), it forwards what it captured here so the
+    backend can seed the profile row without spending another check.
+
+    All fields optional — the backend writes only what's provided and
+    leaves the rest for the periodic refresh.
+    """
+
+    profile_user_id: Optional[int] = None
+    nickname: Optional[str] = None
+    avatar_url: Optional[str] = None
+    bio: Optional[str] = None
+    verified: Optional[bool] = None
+    follower_count: Optional[int] = None
+    following_count: Optional[int] = None
+
+
 class SubscriptionRequest(BaseModel):
     username: str = Field(min_length=1, max_length=64)
     enabled: bool = True
+    # When the Add-Live preview captured profile data, the frontend
+    # forwards it here to skip the redundant SIGI scrape + Euler probe
+    # the service would otherwise fire as a fresh background refresh.
+    profile: Optional[ProfileSnapshot] = None
 
 
 class SubscriptionUpdate(BaseModel):
@@ -256,7 +279,14 @@ async def create_live(
     _user: AuthContext = Depends(rbac.require("admin:write")),
 ):
     svc = _require_service()
-    sub = await svc.create_subscription(req.username, enabled=req.enabled)
+    profile_payload = (
+        req.profile.model_dump(exclude_none=True) if req.profile else None
+    )
+    sub = await svc.create_subscription(
+        req.username,
+        enabled=req.enabled,
+        profile=profile_payload or None,
+    )
     items = await svc.list_subscriptions()
     for s in items:
         if s["unique_id"] == sub.unique_id:

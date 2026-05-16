@@ -72,7 +72,7 @@ export function SafeAvatar({
   return (
     <div
       style={dims}
-      className={`${baseCls} flex items-center justify-center text-gray-400 dark:text-gray-500 ${className}`}
+      className={`${baseCls} flex items-center justify-center text-gray-400 ${className}`}
       title={src ? 'Avatar unavailable — being processed' : 'No avatar'}
     >
       <UserCircle2 className="w-2/3 h-2/3" />
