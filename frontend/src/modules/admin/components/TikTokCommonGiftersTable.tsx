@@ -21,6 +21,7 @@ import {
   openTikTokWebSocket,
   tiktokApi,
 } from '@admin/services/tiktok';
+import { SafeAvatar } from '@admin/components/SafeAvatar';
 // Lazy-load the gifter modal so the echarts chunk it pulls in is
 // only fetched when a row is actually clicked. Without this, every
 // page that mounts this table (TikTokLives, TikTokLiveDetail) pays
@@ -399,19 +400,16 @@ function CommonGifterRow({
           className="flex-1 flex items-start gap-3 text-left min-w-0 group"
           aria-label="Open deep analysis"
         >
-          {row.avatar_url ? (
-            <img
-              src={row.avatar_url}
-              alt=""
-              className="w-10 h-10 rounded-full object-cover ring-2 ring-gray-100 group-hover:ring-primary-200 transition-shadow shrink-0"
-              referrerPolicy="no-referrer"
-              loading="lazy"
-            />
-          ) : (
-            <div className="w-10 h-10 rounded-full bg-gray-100 text-gray-400 flex items-center justify-center text-sm font-bold shrink-0">
-              {(display[0] || '?').toUpperCase()}
-            </div>
-          )}
+          <SafeAvatar
+            src={row.avatar_url}
+            size={40}
+            className="ring-2 ring-gray-100 group-hover:ring-primary-200 transition-shadow shrink-0"
+            fallback={
+              <span className="font-mono text-sm text-gray-500">
+                {(display[0] || '?').toUpperCase()}
+              </span>
+            }
+          />
           <div className="min-w-0 flex-1">
             <div className="flex items-baseline gap-2 flex-wrap">
               <span className="font-medium text-gray-900 group-hover:text-primary-700 truncate">

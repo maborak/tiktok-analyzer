@@ -19,6 +19,7 @@
  *   <SafeAvatar src={url} size={64} rounded={false} className="ring-2 ring-white" />
  */
 
+import type { ReactNode } from 'react';
 import { useEffect, useState } from 'react';
 import { UserCircle2 } from 'lucide-react';
 
@@ -31,6 +32,12 @@ interface SafeAvatarProps {
   className?: string;
   /** Rounded-full (default) vs rounded-md. */
   rounded?: boolean;
+  /** Optional custom fallback rendered when the image is missing or
+   *  fails to load. Common pattern: a single uppercase letter from
+   *  the nickname (e.g. `seed="A"`). When omitted, an incognito
+   *  `<UserCircle2>` icon renders — the visual cue that "this
+   *  avatar is being processed / TikTok's signed URL expired". */
+  fallback?: ReactNode;
 }
 
 export function SafeAvatar({
@@ -39,6 +46,7 @@ export function SafeAvatar({
   size = 40,
   className = '',
   rounded = true,
+  fallback,
 }: SafeAvatarProps) {
   const [errored, setErrored] = useState(false);
 
@@ -66,16 +74,17 @@ export function SafeAvatar({
     );
   }
 
-  // Fallback: incognito-style icon. Subtle "being processed" vibe so
-  // operators understand the absence isn't permanent — TikTok's
-  // signed-URL refresh cadence usually catches up within a cycle.
+  // Fallback: either caller-supplied (letter-initial) or the default
+  // incognito icon. Subtle "being processed" vibe so operators see
+  // that the absence isn't permanent — TikTok's signed-URL refresh
+  // cadence usually catches up within a cycle.
   return (
     <div
       style={dims}
       className={`${baseCls} flex items-center justify-center text-gray-400 ${className}`}
       title={src ? 'Avatar unavailable — being processed' : 'No avatar'}
     >
-      <UserCircle2 className="w-2/3 h-2/3" />
+      {fallback ?? <UserCircle2 className="w-2/3 h-2/3" />}
     </div>
   );
 }

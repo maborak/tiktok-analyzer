@@ -4,6 +4,7 @@ import { ChevronLeft, ChevronRight, Loader2, Search, X } from 'lucide-react';
 import { type TikTokGifter } from '@admin/services/tiktok';
 import { useTikTokApi } from '@admin/contexts/TikTokApiContext';
 import { TikTokUserBadges } from '@admin/components/TikTokUserBadges';
+import { SafeAvatar } from '@admin/components/SafeAvatar';
 
 interface Props {
   roomId: string | null;
@@ -198,21 +199,16 @@ export function TikTokRoomGiftersTable({
                   </td>
                   <td className="py-2">
                     <div className="flex items-center gap-2 min-w-0">
-                      {g.avatar_url ? (
-                        <img
-                          src={g.avatar_url}
-                          alt=""
-                          className="w-6 h-6 rounded-full object-cover flex-shrink-0 bg-gray-100"
-                          loading="lazy"
-                        />
-                      ) : (
-                        <span
-                          aria-hidden
-                          className="w-6 h-6 rounded-full flex-shrink-0 bg-gray-100 inline-flex items-center justify-center text-[10px] font-mono text-gray-400"
-                        >
-                          {(g.nickname || g.unique_id || '?').slice(0, 1).toUpperCase()}
-                        </span>
-                      )}
+                      <SafeAvatar
+                        src={g.avatar_url}
+                        size={24}
+                        className="flex-shrink-0"
+                        fallback={
+                          <span className="font-mono text-[10px] text-gray-500">
+                            {(g.nickname || g.unique_id || '?').slice(0, 1).toUpperCase()}
+                          </span>
+                        }
+                      />
                       <div className="min-w-0">
                         <div className="flex items-center gap-1.5 flex-wrap">
                           <span className="font-medium truncate">{g.nickname ?? '—'}</span>
@@ -288,21 +284,16 @@ export function TikTokRoomGiftersTable({
                   <span className="font-mono text-[10px] text-gray-500 tabular-nums shrink-0 w-6">
                     #{offset + i + 1}
                   </span>
-                  {g.avatar_url ? (
-                    <img
-                      src={g.avatar_url}
-                      alt=""
-                      className="w-8 h-8 rounded-full object-cover flex-shrink-0 bg-gray-100"
-                      loading="lazy"
-                    />
-                  ) : (
-                    <span
-                      aria-hidden
-                      className="w-8 h-8 rounded-full flex-shrink-0 bg-gray-100 inline-flex items-center justify-center text-xs font-mono text-gray-400"
-                    >
-                      {(g.nickname || g.unique_id || '?').slice(0, 1).toUpperCase()}
-                    </span>
-                  )}
+                  <SafeAvatar
+                    src={g.avatar_url}
+                    size={32}
+                    className="flex-shrink-0"
+                    fallback={
+                      <span className="font-mono text-xs text-gray-500">
+                        {(g.nickname || g.unique_id || '?').slice(0, 1).toUpperCase()}
+                      </span>
+                    }
+                  />
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-1.5 flex-wrap">
                       <span className="font-medium truncate text-sm">{g.nickname ?? '—'}</span>

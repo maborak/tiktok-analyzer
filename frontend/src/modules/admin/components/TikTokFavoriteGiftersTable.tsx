@@ -22,6 +22,7 @@ import {
   openTikTokWebSocket,
   tiktokApi,
 } from '@admin/services/tiktok';
+import { SafeAvatar } from '@admin/components/SafeAvatar';
 // Lazy — see TikTokCommonGiftersTable for the same pattern. Keeps
 // the echarts-heavy modal out of the lives-page first-paint bundle.
 const TikTokGifterDetailModal = lazy(() =>
@@ -322,19 +323,16 @@ function FavoriteRowItem({
           className="flex-1 flex items-start gap-3 text-left min-w-0 group"
           aria-label="Open deep analysis"
         >
-          {row.avatar_url ? (
-            <img
-              src={row.avatar_url}
-              alt=""
-              className="w-10 h-10 rounded-full object-cover ring-2 ring-amber-100 group-hover:ring-amber-300 transition-shadow shrink-0"
-              referrerPolicy="no-referrer"
-              loading="lazy"
-            />
-          ) : (
-            <div className="w-10 h-10 rounded-full bg-amber-100/50 text-amber-600 flex items-center justify-center text-sm font-bold shrink-0">
-              {(display[0] || '?').toUpperCase()}
-            </div>
-          )}
+          <SafeAvatar
+            src={row.avatar_url}
+            size={40}
+            className="ring-2 ring-amber-100 group-hover:ring-amber-300 transition-shadow shrink-0"
+            fallback={
+              <span className="font-mono text-sm text-amber-600">
+                {(display[0] || '?').toUpperCase()}
+              </span>
+            }
+          />
           <div className="min-w-0 flex-1">
             <div className="flex items-baseline gap-2 flex-wrap">
               <Star className="w-3.5 h-3.5 text-amber-500 fill-amber-400 shrink-0" />

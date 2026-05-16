@@ -20,6 +20,7 @@ import {
   type TikTokHandleLookupProfile,
   tiktokApi,
 } from '@admin/services/tiktok';
+import { SafeAvatar } from '@admin/components/SafeAvatar';
 
 interface TikTokAddLiveModalProps {
   isOpen: boolean;
@@ -219,25 +220,20 @@ function LookupBody({ data }: { data: TikTokHandleLookup }) {
     <div className="space-y-4">
       {/* Header: avatar + identity */}
       <div className="flex items-start gap-4">
-        {data.avatar_url ? (
-          <img
-            src={data.avatar_url}
-            alt=""
-            className="w-20 h-20 rounded-full object-cover ring-4 ring-primary-100 shrink-0"
-            referrerPolicy="no-referrer"
-          />
-        ) : (
-          <div
-            className={
-              'w-20 h-20 rounded-full flex items-center justify-center text-3xl font-bold shrink-0 ' +
-              (notFound
-                ? 'bg-rose-100 text-rose-500 dark:bg-rose-500/15 dark:text-rose-300'
-                : 'bg-gray-100 text-gray-400 dark:bg-gray-100/10 dark:text-gray-500')
-            }
-          >
-            {notFound ? <UserMinus className="w-8 h-8" /> : (data.handle[0] || '?').toUpperCase()}
-          </div>
-        )}
+        <SafeAvatar
+          src={data.avatar_url}
+          size={80}
+          className="ring-4 ring-primary-100 shrink-0"
+          fallback={
+            notFound ? (
+              <UserMinus className="w-8 h-8 text-rose-500 dark:text-rose-300" />
+            ) : (
+              <span className="font-mono text-3xl text-gray-500">
+                {(data.handle[0] || '?').toUpperCase()}
+              </span>
+            )
+          }
+        />
         <div className="min-w-0 flex-1">
           <div className="text-xl font-bold truncate">
             {data.nickname || (notFound ? 'Unknown user' : `@${data.handle}`)}

@@ -50,6 +50,7 @@ import {
 } from 'lucide-react';
 
 import { AnimatedScore } from '@admin/components/AnimatedScore';
+import { SafeAvatar } from '@admin/components/SafeAvatar';
 import { Button } from '@/components/ui/Button';
 import { Modal } from '@/components/ui/Modal';
 import { Input } from '@/components/ui/Input';
@@ -672,19 +673,14 @@ function OpponentCell({
   const url = (o as { avatar_url?: string }).avatar_url;
   return (
     <div className="flex items-center gap-2.5 rounded-md border border-gray-200 bg-white dark:bg-white/[0.03] px-3 py-2 min-w-[180px] sm:min-w-[220px]">
-      {url ? (
-        <img
-          src={url}
-          alt=""
-          className="w-9 h-9 rounded-full object-cover ring-1 ring-gray-200 dark:ring-white/10 shrink-0"
-          referrerPolicy="no-referrer"
-          loading="lazy"
-        />
-      ) : (
-        <div className="w-9 h-9 rounded-full bg-gray-100 dark:bg-white/10 text-gray-500 flex items-center justify-center text-xs font-bold shrink-0">
-          {seed}
-        </div>
-      )}
+      <SafeAvatar
+        src={url}
+        size={36}
+        className="ring-1 ring-gray-200 dark:ring-white/10 shrink-0"
+        fallback={
+          <span className="font-mono text-xs text-gray-500">{seed}</span>
+        }
+      />
       <div className="min-w-0 flex-1">
         <div className="truncate text-sm font-medium text-gray-900">
           {display}
@@ -881,19 +877,16 @@ function MatchTopDonors({
                 <span className="shrink-0 w-5 text-center text-gray-400 tabular-nums">
                   #{i + 1}
                 </span>
-                {r.avatar_url ? (
-                  <img
-                    src={r.avatar_url}
-                    alt=""
-                    className="w-7 h-7 rounded-full object-cover shrink-0"
-                    referrerPolicy="no-referrer"
-                    loading="lazy"
-                  />
-                ) : (
-                  <div className="w-7 h-7 rounded-full bg-gray-200 dark:bg-white/10 text-gray-500 flex items-center justify-center text-[10px] font-bold shrink-0">
-                    {display[0]?.toUpperCase()}
-                  </div>
-                )}
+                <SafeAvatar
+                  src={r.avatar_url}
+                  size={28}
+                  className="shrink-0"
+                  fallback={
+                    <span className="font-mono text-[10px] text-gray-500">
+                      {display[0]?.toUpperCase()}
+                    </span>
+                  }
+                />
                 <div className="min-w-0 flex-1">
                   <div className="truncate text-gray-900">{display}</div>
                   {r.unique_id && r.unique_id !== display && (
@@ -1213,19 +1206,16 @@ function SideGiftersList({
                   <span className="shrink-0 w-5 text-center text-gray-400 tabular-nums">
                     #{i + 1}
                   </span>
-                  {g.avatar_url ? (
-                    <img
-                      src={g.avatar_url}
-                      alt=""
-                      className="w-7 h-7 rounded-full object-cover shrink-0"
-                      referrerPolicy="no-referrer"
-                      loading="lazy"
-                    />
-                  ) : (
-                    <div className="w-7 h-7 rounded-full bg-gray-200 dark:bg-white/10 text-gray-500 flex items-center justify-center text-[10px] font-bold shrink-0">
-                      {display[0]?.toUpperCase()}
-                    </div>
-                  )}
+                  <SafeAvatar
+                    src={g.avatar_url}
+                    size={28}
+                    className="shrink-0"
+                    fallback={
+                      <span className="font-mono text-[10px] text-gray-500">
+                        {display[0]?.toUpperCase()}
+                      </span>
+                    }
+                  />
                   <div className="min-w-0 flex-1">
                     <div className="truncate text-gray-900">{display}</div>
                     {g.unique_id && g.unique_id !== display && (
@@ -1805,19 +1795,15 @@ function GiftersTab({
                       <td className="px-3 py-1.5 text-gray-400 tabular-nums">{offset + i + 1}</td>
                       <td className="px-3 py-1.5">
                         <div className="flex items-center gap-2">
-                          {g.avatar_url ? (
-                            <img
-                              src={g.avatar_url}
-                              alt=""
-                              className="w-6 h-6 rounded-full object-cover"
-                              referrerPolicy="no-referrer"
-                              loading="lazy"
-                            />
-                          ) : (
-                            <div className="w-6 h-6 rounded-full bg-gray-200 dark:bg-white/10 text-gray-500 flex items-center justify-center text-[10px] font-bold">
-                              {display[0]?.toUpperCase()}
-                            </div>
-                          )}
+                          <SafeAvatar
+                            src={g.avatar_url}
+                            size={24}
+                            fallback={
+                              <span className="font-mono text-[10px] text-gray-500">
+                                {display[0]?.toUpperCase()}
+                              </span>
+                            }
+                          />
                           <span className="font-medium">{display}</span>
                           {g.unique_id && g.unique_id !== display && (
                             <span className="text-[10px] text-gray-500 font-mono">
@@ -1879,19 +1865,16 @@ function GiftersTab({
                     <span className="font-mono text-[10px] text-gray-400 tabular-nums shrink-0 w-6">
                       #{offset + i + 1}
                     </span>
-                    {g.avatar_url ? (
-                      <img
-                        src={g.avatar_url}
-                        alt=""
-                        className="w-8 h-8 rounded-full object-cover shrink-0"
-                        referrerPolicy="no-referrer"
-                        loading="lazy"
-                      />
-                    ) : (
-                      <div className="w-8 h-8 rounded-full bg-gray-200 dark:bg-white/10 text-gray-500 flex items-center justify-center text-xs font-bold shrink-0">
-                        {display[0]?.toUpperCase()}
-                      </div>
-                    )}
+                    <SafeAvatar
+                      src={g.avatar_url}
+                      size={32}
+                      className="shrink-0"
+                      fallback={
+                        <span className="font-mono text-xs text-gray-500">
+                          {display[0]?.toUpperCase()}
+                        </span>
+                      }
+                    />
                     <div className="min-w-0 flex-1">
                       <div className="text-sm font-medium truncate">{display}</div>
                       {g.unique_id && g.unique_id !== display && (
@@ -2841,19 +2824,16 @@ function H2HRegulars({
               key={g.user_id}
               className="flex items-center gap-2 px-2 py-1.5 rounded border border-gray-200 bg-gray-50 dark:bg-gray-100/[0.06]"
             >
-              {g.avatar_url ? (
-                <img
-                  src={g.avatar_url}
-                  alt=""
-                  className="w-7 h-7 rounded-full object-cover ring-1 ring-gray-200 dark:ring-white/10 shrink-0"
-                  referrerPolicy="no-referrer"
-                  loading="lazy"
-                />
-              ) : (
-                <div className="w-7 h-7 rounded-full bg-gray-200 dark:bg-white/10 text-gray-500 flex items-center justify-center text-[10px] font-bold shrink-0">
-                  {display[0]?.toUpperCase()}
-                </div>
-              )}
+              <SafeAvatar
+                src={g.avatar_url}
+                size={28}
+                className="ring-1 ring-gray-200 dark:ring-white/10 shrink-0"
+                fallback={
+                  <span className="font-mono text-[10px] text-gray-500">
+                    {display[0]?.toUpperCase()}
+                  </span>
+                }
+              />
               <div className="min-w-0 flex-1">
                 <div className="truncate text-xs">{display}</div>
                 {g.unique_id && g.unique_id !== display && (

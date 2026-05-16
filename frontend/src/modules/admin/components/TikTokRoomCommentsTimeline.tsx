@@ -37,6 +37,7 @@ import {
 import { type TikTokEvent } from '@admin/services/tiktok';
 import { useTikTokApi } from '@admin/contexts/TikTokApiContext';
 import { TikTokUserBadges, type IdentityBlock } from './TikTokUserBadges';
+import { SafeAvatar } from '@admin/components/SafeAvatar';
 import {
   useTikTokTimezone,
   dateKeyInZone,
@@ -684,22 +685,14 @@ function EventRow({
           marker. Falls back to an initials chip when avatar URL
           is missing (older events from before to_user capture). */}
       <div className="relative shrink-0">
-        {u.avatar_url ? (
-          <img
-            src={u.avatar_url}
-            alt=""
-            className="w-7 h-7 rounded-full object-cover ring-2 ring-white dark:ring-gray-900"
-            referrerPolicy="no-referrer"
-            loading="lazy"
-          />
-        ) : (
-          <div
-            className="w-7 h-7 rounded-full bg-gray-100 dark:bg-white/10 text-gray-500 flex items-center justify-center text-[11px] font-bold ring-2 ring-white dark:ring-gray-900"
-            aria-hidden
-          >
-            {seed}
-          </div>
-        )}
+        <SafeAvatar
+          src={u.avatar_url}
+          size={28}
+          className="ring-2 ring-white dark:ring-gray-900"
+          fallback={
+            <span className="font-mono text-[11px] text-gray-500">{seed}</span>
+          }
+        />
         {/* Type pip on the bottom-right of the avatar. Tiny 10px
             color dot — the type is also reflected by the body
             tag, so this is just a quick visual axis. */}

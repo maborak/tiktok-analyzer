@@ -101,6 +101,7 @@ function chartTheme(isDark: boolean) {
 
 import { Button } from '@/components/ui/Button';
 import { Modal } from '@/components/ui/Modal';
+import { SafeAvatar } from '@admin/components/SafeAvatar';
 import {
   type TikTokCommonGifterDetail,
 } from '@admin/services/tiktok';
@@ -491,19 +492,16 @@ export function TikTokCommonGifterDetailModal({
         return (
           <div className="mb-4 p-4 rounded-lg bg-gray-50 dark:bg-gray-100/[0.05] border border-gray-200">
             <div className="flex items-start gap-4">
-              {avatarUrl ? (
-                <img
-                  src={avatarUrl}
-                  alt=""
-                  className="w-16 h-16 rounded-full object-cover ring-2 ring-white dark:ring-white/10 shadow-sm shrink-0"
-                  referrerPolicy="no-referrer"
-                  loading="lazy"
-                />
-              ) : (
-                <div className="w-16 h-16 rounded-full bg-gray-100 dark:bg-white/5 text-gray-400 flex items-center justify-center text-xl font-bold shrink-0">
-                  {(display[0] || '?').toUpperCase()}
-                </div>
-              )}
+              <SafeAvatar
+                src={avatarUrl}
+                size={64}
+                className="ring-2 ring-white dark:ring-white/10 shadow-sm shrink-0"
+                fallback={
+                  <span className="font-mono text-xl text-gray-500">
+                    {(display[0] || '?').toUpperCase()}
+                  </span>
+                }
+              />
               <div className="min-w-0 flex-1">
                 <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
                   <span className="text-lg font-bold text-gray-900 truncate">
@@ -3587,19 +3585,16 @@ function CoGiftersPanel({
               key={c.user_id}
               className="flex items-center gap-2.5 px-2.5 py-1.5 rounded border border-gray-200 bg-gray-50 dark:bg-gray-100/[0.06]"
             >
-              {c.avatar_url ? (
-                <img
-                  src={c.avatar_url}
-                  alt=""
-                  className="w-8 h-8 rounded-full object-cover ring-1 ring-gray-200 dark:ring-white/10 shrink-0"
-                  referrerPolicy="no-referrer"
-                  loading="lazy"
-                />
-              ) : (
-                <div className="w-8 h-8 rounded-full bg-gray-200 dark:bg-gray-100/[0.15] flex items-center justify-center text-xs font-bold text-gray-500 shrink-0">
-                  {(display[0] || '?').toUpperCase()}
-                </div>
-              )}
+              <SafeAvatar
+                src={c.avatar_url}
+                size={32}
+                className="ring-1 ring-gray-200 dark:ring-white/10 shrink-0"
+                fallback={
+                  <span className="font-mono text-xs text-gray-500">
+                    {(display[0] || '?').toUpperCase()}
+                  </span>
+                }
+              />
               <div className="min-w-0 flex-1">
                 <div className="truncate text-xs text-gray-900">{display}</div>
                 {c.unique_id && c.unique_id !== display && (

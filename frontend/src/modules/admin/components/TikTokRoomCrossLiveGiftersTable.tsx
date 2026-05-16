@@ -4,6 +4,7 @@ import { ChevronLeft, ChevronRight, Loader2, Network, Search, X } from 'lucide-r
 import { type TikTokCrossLiveGifter } from '@admin/services/tiktok';
 import { useTikTokApi } from '@admin/contexts/TikTokApiContext';
 import { useTikTokRuntimeConfig } from '@admin/contexts/TikTokRuntimeConfigContext';
+import { SafeAvatar } from '@admin/components/SafeAvatar';
 
 interface Props {
   /** The host whose audience to cross-reference. The endpoint is
@@ -299,25 +300,21 @@ export function TikTokRoomCrossLiveGiftersTable({
 // ── helpers ─────────────────────────────────────────────────────────
 
 function UserCell({ g, size = 'md' }: { g: TikTokCrossLiveGifter; size?: 'md' | 'lg' }) {
-  const avatarSize = size === 'lg' ? 'w-8 h-8 text-xs' : 'w-6 h-6 text-[10px]';
+  const avatarPx = size === 'lg' ? 32 : 24;
+  const initialCls = size === 'lg' ? 'text-xs' : 'text-[10px]';
   const initial = (g.nickname || g.unique_id || '?').slice(0, 1).toUpperCase();
   return (
     <div className="flex items-center gap-2 min-w-0 flex-1">
-      {g.avatar_url ? (
-        <img
-          src={g.avatar_url}
-          alt=""
-          className={`${avatarSize} rounded-full object-cover flex-shrink-0 bg-gray-100`}
-          loading="lazy"
-        />
-      ) : (
-        <span
-          aria-hidden
-          className={`${avatarSize} rounded-full flex-shrink-0 bg-gray-100 inline-flex items-center justify-center font-mono text-gray-400`}
-        >
-          {initial}
-        </span>
-      )}
+      <SafeAvatar
+        src={g.avatar_url}
+        size={avatarPx}
+        className="flex-shrink-0"
+        fallback={
+          <span className={`font-mono ${initialCls} text-gray-500`}>
+            {initial}
+          </span>
+        }
+      />
       <div className="min-w-0">
         <div className="font-medium truncate">{g.nickname ?? '—'}</div>
         {g.unique_id && (

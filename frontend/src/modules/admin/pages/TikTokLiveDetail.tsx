@@ -48,6 +48,7 @@ import {
 import { MultiLineChart, eventColor } from '@admin/components/TikTokCharts';
 import { EChartsRangeArea } from '@admin/components/EChartsRangeArea';
 import { AnimatedScore } from '@admin/components/AnimatedScore';
+import { SafeAvatar } from '@admin/components/SafeAvatar';
 import { TikTokAddLiveModal } from '@admin/components/TikTokAddLiveModal';
 import { TikTokGifterDetailModal } from '@admin/components/TikTokGifterDetailModal';
 import { TikTokBroadcastSelector } from '@admin/components/TikTokBroadcastSelector';
@@ -2711,19 +2712,16 @@ function ProfileHeaderCard({
   return (
     <section className="card">
       <div className="flex items-start gap-4">
-        {profile?.avatar_url ? (
-          <img
-            src={profile.avatar_url}
-            alt=""
-            className="w-20 h-20 rounded-full object-cover ring-2 ring-gray-100 dark:ring-gray-100/30 shrink-0"
-            referrerPolicy="no-referrer"
-            loading="lazy"
-          />
-        ) : (
-          <div className="w-20 h-20 rounded-full bg-gray-100 text-gray-400 flex items-center justify-center text-2xl font-bold shrink-0">
-            {(profile?.nickname?.[0] || handle[0] || '?').toUpperCase()}
-          </div>
-        )}
+        <SafeAvatar
+          src={profile?.avatar_url}
+          size={80}
+          className="ring-2 ring-gray-100 dark:ring-gray-100/30 shrink-0"
+          fallback={
+            <span className="font-mono text-2xl text-gray-500">
+              {(profile?.nickname?.[0] || handle[0] || '?').toUpperCase()}
+            </span>
+          }
+        />
 
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2 flex-wrap">
@@ -4117,19 +4115,16 @@ function LiveMatchTopDonors({
               <span className="shrink-0 w-5 text-center text-gray-400 tabular-nums">
                 #{i + 1}
               </span>
-              {r.avatar_url ? (
-                <img
-                  src={r.avatar_url}
-                  alt=""
-                  className="w-7 h-7 rounded-full object-cover shrink-0"
-                  referrerPolicy="no-referrer"
-                  loading="lazy"
-                />
-              ) : (
-                <div className="w-7 h-7 rounded-full bg-gray-200 dark:bg-white/10 text-gray-500 flex items-center justify-center text-[10px] font-bold shrink-0">
-                  {display[0]?.toUpperCase()}
-                </div>
-              )}
+              <SafeAvatar
+                src={r.avatar_url}
+                size={28}
+                className="shrink-0"
+                fallback={
+                  <span className="font-mono text-[10px] text-gray-500">
+                    {display[0]?.toUpperCase()}
+                  </span>
+                }
+              />
               <div className="min-w-0 flex-1">
                 <div className="truncate text-gray-900">{display}</div>
                 {r.unique_id && r.unique_id !== display && (
@@ -4556,23 +4551,21 @@ function BattlerCard({
       <div
         className={`flex items-center gap-3 ${align === 'right' ? 'flex-row-reverse text-right' : ''}`}
       >
-        {avatarUrl ? (
-          <img
+        <div
+          className="shrink-0 rounded-full"
+          style={{ boxShadow: `0 0 0 3px ${color}`, backgroundColor: color }}
+        >
+          <SafeAvatar
             src={avatarUrl}
-            alt=""
-            className="w-16 h-16 rounded-full object-cover shrink-0"
-            style={{ boxShadow: `0 0 0 3px ${color}` }}
-            referrerPolicy="no-referrer"
-            loading="lazy"
+            size={64}
+            className="!bg-transparent dark:!bg-transparent"
+            fallback={
+              <span className="font-mono text-xl text-white">
+                {(nickname[0] || '?').toUpperCase()}
+              </span>
+            }
           />
-        ) : (
-          <div
-            className="w-16 h-16 rounded-full flex items-center justify-center shrink-0 text-white text-xl font-bold"
-            style={{ backgroundColor: color }}
-          >
-            {(nickname[0] || '?').toUpperCase()}
-          </div>
-        )}
+        </div>
         <div className="min-w-0 flex-1">
           <div className="font-bold text-base truncate">{nickname}</div>
           {handle && (
@@ -4986,28 +4979,20 @@ function OpponentChip({ opponent, side, winner = false }: OpponentChipProps) {
   return (
     <div className="flex items-center gap-2 min-w-0 relative">
       <div className="relative shrink-0">
-        {opponent.avatar_url ? (
-          <img
+        <div className={`rounded-full ${fallback}`}>
+          <SafeAvatar
             src={opponent.avatar_url}
-            alt=""
-            className={`w-7 h-7 rounded-full object-cover ring-1 ${ring}`}
-            referrerPolicy="no-referrer"
-            loading="lazy"
+            size={28}
+            className={`!bg-transparent dark:!bg-transparent ring-1 ${ring}`}
+            fallback={
+              showInitial ? (
+                <span className="font-mono text-[11px]">{initial}</span>
+              ) : (
+                <User className="w-3.5 h-3.5" />
+              )
+            }
           />
-        ) : showInitial ? (
-          <div
-            className={`w-7 h-7 rounded-full flex items-center justify-center text-[11px] font-bold ${fallback}`}
-          >
-            {initial}
-          </div>
-        ) : (
-          <div
-            className={`w-7 h-7 rounded-full flex items-center justify-center ${fallback}`}
-            title="No profile data"
-          >
-            <User className="w-3.5 h-3.5" />
-          </div>
-        )}
+        </div>
         {winner && (
           <span
             className="absolute -top-1.5 -right-1.5 w-4 h-4 rounded-full bg-amber-400 text-amber-900 dark:bg-amber-300 flex items-center justify-center shadow-sm ring-1 ring-white dark:ring-gray-900"
