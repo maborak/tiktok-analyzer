@@ -29,6 +29,16 @@ interface Props {
   /** Bubble the server-side total up to the parent — the live-detail
    *  page uses this to render `Top gifters (N)` on the tab label. */
   onTotalChange?: (total: number) => void;
+  /** Bubble the CURRENT page's items up so sibling visualizations
+   *  (the Top Gifter donut on the right of the table) can render the
+   *  same rows without firing a duplicate `getRoomGifters` call. The
+   *  donut visualises whatever page / search / page-size the user is
+   *  looking at — page 2 of the table → donut shows that page's slice. */
+  onItemsChange?: (items: TikTokGifter[]) => void;
+  /** Bubble the table's loading state up so siblings can mirror it
+   *  (donut shows a spinner during the fetch instead of an empty
+   *  "No data" flash between page changes). */
+  onLoadingChange?: (loading: boolean) => void;
 }
 
 const PAGE_SIZE_OPTIONS = [10, 25, 50, 100] as const;
@@ -41,6 +51,8 @@ export function TikTokRoomGiftersTable({
   refreshKey,
   onSelectGifter,
   onTotalChange,
+  onItemsChange,
+  onLoadingChange,
 }: Props) {
   const tiktokApi = useTikTokApi();
   // Stringify the extras for use as a stable dep key — array identity
@@ -70,10 +82,12 @@ export function TikTokRoomGiftersTable({
       setItems([]);
       setTotal(0);
       onTotalChange?.(0);
+      onItemsChange?.([]);
       return;
     }
     let cancelled = false;
     setLoading(true);
+    onLoadingChange?.(true);
     tiktokApi
       .getRoomGifters(roomId, {
         since: range.since,
@@ -88,15 +102,19 @@ export function TikTokRoomGiftersTable({
         setItems(res.items);
         setTotal(res.total);
         onTotalChange?.(res.total);
+        onItemsChange?.(res.items);
       })
       .catch(() => {
         if (cancelled) return;
         setItems([]);
         setTotal(0);
         onTotalChange?.(0);
+        onItemsChange?.([]);
       })
       .finally(() => {
-        if (!cancelled) setLoading(false);
+        if (cancelled) return;
+        setLoading(false);
+        onLoadingChange?.(false);
       });
     return () => {
       cancelled = true;

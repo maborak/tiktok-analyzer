@@ -34,6 +34,7 @@ echarts.use([PieChart, PieTooltipComponent, PieCanvasRenderer]);
 import { Button } from '@/components/ui/Button';
 import { PageShell, PageHeader } from '@/components/ui/PageShell';
 import {
+  type TikTokGifter,
   type TikTokMatch,
   type TikTokMatchGiftersBySide,
   type TikTokMatchOpponent,
@@ -405,6 +406,11 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
   // component never mounts → its `onTotalChange` never fires →
   // "Comments" stays uncounted until clicked.
   const [topGiftersTotal, setTopGiftersTotal] = useState<number | null>(null);
+  // Current page of the gifters table — bubbled up via the table's
+  // `onItemsChange` callback so the Top Gifter donut on the right can
+  // render the same rows without a duplicate `getRoomGifters` fetch.
+  const [topGiftersItems, setTopGiftersItems] = useState<TikTokGifter[]>([]);
+  const [topGiftersLoading, setTopGiftersLoading] = useState(false);
   const [commentsTotal, setCommentsTotal] = useState<number | null>(null);
   const [crossLiveTotal, setCrossLiveTotal] = useState<number | null>(null);
   // Clicking a cross-live gifter opens the shared cross-host detail
@@ -1916,6 +1922,11 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
                 refreshKey={eventsRefreshKey}
                 onSelectGifter={setSelectedGifter}
                 onTotalChange={setTopGiftersTotal}
+                // Bubble the table's current page into parent state
+                // so the donut card on the right consumes the same
+                // rows — single `getRoomGifters` request feeds both.
+                onItemsChange={setTopGiftersItems}
+                onLoadingChange={setTopGiftersLoading}
               />
             </div>
 
@@ -1931,10 +1942,8 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
               <TopUserPieCard
                 title="Top Gifter"
                 icon={<Crown className="w-3.5 h-3.5 text-amber-500" />}
-                roomId={roomId}
-                range={effectiveRange}
-                extraRoomIds={effectiveExtraRoomIds}
-                refreshKey={eventsRefreshKey}
+                items={topGiftersItems}
+                loading={topGiftersLoading}
                 accentColor={eventColor('gift')}
               />
               {/* Coming-soon placeholder for per-user comment/like
@@ -4089,11 +4098,12 @@ function LiveMatchTopDonors({
 /** Top-N donut card. Drives the right-column Top Gifter card on
  *  the Top Gifters tab.
  *
- *  Fetches `/admin/tiktok/rooms/{roomId}/gifters` with the SAME
- *  `since`/`until`/`extra_room_ids` the gifters table uses (line 1912)
- *  so the donut reflects the same filter scope. Renders the top 10
- *  gifters as distinct slices with the long-tail folded into
- *  "Others" (when `total > sum(top10)`).
+ *  Pure presentation — does NOT fetch. The parent owns the data via
+ *  `TikTokRoomGiftersTable`'s `onItemsChange` callback and passes
+ *  whatever rows the table is currently showing here. Result: the
+ *  donut visualises the CURRENT table page — paginate the table to
+ *  page 2 and the donut shows page 2's rows. No duplicate request to
+ *  `getRoomGifters`.
  *
  *  Slice colors fade alpha off `accentColor` — top slice full opacity,
  *  each rank drops ~7% to a 35% floor — so the donut reads as
@@ -4105,61 +4115,18 @@ function LiveMatchTopDonors({
 function TopUserPieCard({
   title,
   icon,
-  roomId,
-  range,
-  extraRoomIds,
-  refreshKey,
+  items,
+  loading,
   accentColor,
   emptyHint,
 }: {
   title: string;
   icon: React.ReactNode;
-  roomId: string | null;
-  range: { since?: string; until?: string };
-  extraRoomIds?: string[];
-  refreshKey: number;
+  items: TikTokGifter[];
+  loading?: boolean;
   accentColor: string;
   emptyHint?: string;
 }) {
-  const tiktokApi = useTikTokApi();
-  // Stable dep key for the extras array (identity flips every render).
-  const extraKey = (extraRoomIds ?? []).join(',');
-  const [items, setItems] = useState<TikTokGifter[]>([]);
-  const [loading, setLoading] = useState(false);
-
-  useEffect(() => {
-    if (!roomId) {
-      setItems([]);
-      return;
-    }
-    let cancelled = false;
-    setLoading(true);
-    tiktokApi
-      .getRoomGifters(roomId, {
-        since: range.since,
-        until: range.until,
-        limit: 10,
-        offset: 0,
-        extra_room_ids:
-          extraRoomIds && extraRoomIds.length > 0 ? extraRoomIds : undefined,
-      })
-      .then((res) => {
-        if (cancelled) return;
-        setItems(res.items);
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setItems([]);
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [roomId, extraKey, range.since, range.until, refreshKey]);
-
   const cleanSlices = useMemo(
     () =>
       items
