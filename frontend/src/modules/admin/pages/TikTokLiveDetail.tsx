@@ -1384,6 +1384,23 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
             selectedRoom={selectedRoom}
             readOnly={readOnly}
             activitySummary={activitySummary}
+            onOpenHostProfile={
+              hostProfile?.profile_user_id
+                ? () =>
+                    setSelectedGifter({
+                      userId: String(hostProfile.profile_user_id),
+                      uniqueId: hostProfile.unique_id ?? handle,
+                      nickname: hostProfile.nickname ?? null,
+                      // Lifetime counters aren't on the subscription row;
+                      // modal renders "(·)" badges + populates totals
+                      // from its own per-tab queries.
+                      diamonds: undefined,
+                      gifts: undefined,
+                      comments: undefined,
+                      tab: 'gifts',
+                    })
+                : undefined
+            }
           />
         </div>
         <div className="lg:w-[420px] lg:shrink-0">
@@ -2570,6 +2587,11 @@ interface ProfileHeaderCardProps {
    *  visually but share the headline number. `null` while the
    *  calendar fetch is in flight. */
   activitySummary?: import('@admin/components/TikTokLiveCalendar').TikTokLiveActivitySummary | null;
+  /** Opens the host's gifter profile modal — same modal used for any
+   *  user across the page, just pointed at the host themselves. Lets
+   *  the operator see this host's cross-live gifter footprint (if the
+   *  host has also gifted in any other monitored live). */
+  onOpenHostProfile?: () => void;
 }
 
 function ProfileHeaderCard({
@@ -2579,6 +2601,7 @@ function ProfileHeaderCard({
   selectedRoom,
   readOnly = false,
   activitySummary = null,
+  onOpenHostProfile,
 }: ProfileHeaderCardProps) {
   const tiktokApi = useTikTokApi();
   // Re-render once a second so the "last event Xs ago" stays accurate
@@ -2700,6 +2723,25 @@ function ProfileHeaderCard({
               </span>
             )}
             <FreshnessBadge ageS={lastEventAgeS} />
+            {/* Gifter Profile shortcut — opens the same per-user modal
+                used for any gifter, pointed at this host. Surfaces
+                cross-live gifter activity (if the host has also
+                gifted on other monitored lives) + any badges /
+                identity captured on prior gift events.  Suppressed
+                in read-only (public) mode and when we don't have a
+                resolved profile_user_id yet (modal needs an id to
+                fetch). */}
+            {!readOnly && onOpenHostProfile && profile?.profile_user_id && (
+              <button
+                type="button"
+                onClick={onOpenHostProfile}
+                className="ml-auto inline-flex items-center gap-1 px-2.5 py-1 rounded font-mono text-[10px] uppercase tracking-wider border border-gray-200 text-gray-700 hover:bg-primary-50 hover:border-primary-300 hover:text-primary-700 dark:border-gray-100/15 dark:hover:bg-primary-500/10 dark:hover:border-primary-400 dark:hover:text-primary-300 transition-colors"
+                title={`Open ${profile.nickname || `@${handle}`}'s gifter profile`}
+              >
+                <User className="w-3 h-3" />
+                Gifter Profile
+              </button>
+            )}
           </div>
 
           <div className="mt-2 flex items-center gap-x-5 gap-y-1 flex-wrap text-sm">
