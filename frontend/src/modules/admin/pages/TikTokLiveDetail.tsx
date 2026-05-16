@@ -4156,21 +4156,37 @@ function TopUserPieCard({
 
   // Per-slice colors via HSL rotation — each slice gets a distinct
   // hue so 10 users are visually identifiable at a glance. Starts at
-  // `--accent-hue` (defaults to 38° = amber, matching the gift event
-  // color from `eventColor('gift')`) and rotates the wheel evenly.
-  // Saturation 70% + lightness 55% keeps every slice vivid on both
-  // light and dark card surfaces.
+  // 38° (amber, matching `eventColor('gift')`) and rotates the wheel
+  // evenly. Saturation 70% + lightness 55% keeps every slice vivid
+  // on both light and dark card surfaces.
   //
-  // Why not the single-hue alpha-fade used previously? A pie chart's
-  // job is to make N categories visually distinct. Same-hue slices
-  // defeat that — you can't tell which slice is which without
-  // hovering for the tooltip.
-  const sliceColors = useMemo(() => {
+  // `sliceColorsFlat`: single color per slice for the legend dots on
+  // the right. `sliceGradients`: radial-gradient ECharts spec per
+  // slice (bright center → darker rim) so the donut reads with a
+  // subtle dome-like depth. Faked-3D-via-shading is honest: it gives
+  // the visual weight the user asked for without distorting slice
+  // proportions the way a perspective-tilted "3D pie" would.
+  const { sliceColorsFlat, sliceGradients } = useMemo(() => {
     const n = Math.max(cleanSlices.length, 1);
-    return cleanSlices.map((_, i) => {
+    const flat: string[] = [];
+    const grad: {
+      type: 'radial'; x: number; y: number; r: number;
+      colorStops: { offset: number; color: string }[];
+    }[] = [];
+    for (let i = 0; i < cleanSlices.length; i++) {
       const hue = (38 + (360 / n) * i) % 360;
-      return `hsl(${hue}, 70%, 55%)`;
-    });
+      flat.push(`hsl(${hue}, 70%, 55%)`);
+      grad.push({
+        type: 'radial',
+        x: 0.5, y: 0.5, r: 0.85,
+        colorStops: [
+          { offset: 0,    color: `hsl(${hue}, 80%, 68%)` },
+          { offset: 0.85, color: `hsl(${hue}, 75%, 52%)` },
+          { offset: 1,    color: `hsl(${hue}, 70%, 40%)` },
+        ],
+      });
+    }
+    return { sliceColorsFlat: flat, sliceGradients: grad };
   }, [cleanSlices]);
 
   const option = useMemo(() => {
@@ -4188,20 +4204,30 @@ function TopUserPieCard({
       series: [
         {
           type: 'pie' as const,
-          radius: ['55%', '85%'],
+          radius: ['55%', '88%'],
           center: ['50%', '50%'],
           avoidLabelOverlap: false,
           label: { show: false },
           labelLine: { show: false },
+          // Thin separator stroke between slices + subtle outer
+          // shadow makes the donut read with depth (the "3D feel"
+          // requested, without perspective distortion).
+          itemStyle: {
+            borderWidth: 1.5,
+            borderColor: 'rgba(255, 255, 255, 0.65)',
+            shadowBlur: 10,
+            shadowColor: 'rgba(0, 0, 0, 0.18)',
+            shadowOffsetY: 3,
+          },
           data: cleanSlices.map((s, i) => ({
             name: s.label,
             value: s.value,
-            itemStyle: { color: sliceColors[i] },
+            itemStyle: { color: sliceGradients[i] },
           })),
         },
       ],
     };
-  }, [hasData, cleanSlices, sliceColors]);
+  }, [hasData, cleanSlices, sliceGradients]);
 
   return (
     <section className="rounded-lg border border-gray-200 bg-white dark:bg-gray-100/[0.05] p-3 shadow-sm">
@@ -4215,11 +4241,13 @@ function TopUserPieCard({
         )}
       </div>
       {hasData && option ? (
-        <div className="grid grid-cols-2 gap-3 items-center">
-          {/* LEFT: donut fills its 50% column as a square. Center label
-              shows the #1's share of the visible top N. */}
+        <div className="flex items-center gap-3">
+          {/* LEFT: donut takes the rest of the card width as a square.
+              `flex-1` lets it expand into space the list doesn't use;
+              `min-w-0` lets it shrink on narrow viewports. Center
+              label shows the #1's share of the visible top N. */}
           <div
-            className="relative aspect-square w-full min-w-0"
+            className="flex-1 min-w-0 aspect-square relative"
             role="img"
             aria-label={`${title} — top ${cleanSlices.length} users; leader ${top.label} at ${topPct.toFixed(0)}% of total`}
           >
@@ -4240,15 +4268,13 @@ function TopUserPieCard({
               </div>
             </div>
           </div>
-          {/* RIGHT: ranked label list — color-dot + truncated name
-              only. The dot matches its slice color so the row maps
-              visually to the donut segment. Exact values intentionally
-              omitted (the gifters table on the left carries them);
-              the pie's job here is to answer "who's in the top N",
-              and the donut tooltip shows the value on hover when
-              needed. `min-w-0` on the flex item + `truncate` on the
-              name lets long handles ellipsize cleanly. */}
-          <ol className="flex-1 min-w-0 space-y-0.5 text-[10px] font-mono">
+          {/* RIGHT: ranked label list — color-dot + truncated handle
+              only. `w-[140px]` hugs the content (most @handles fit
+              comfortably; longer ones ellipsize) so the donut on the
+              left can claim the rest of the card width. Values are
+              intentionally absent (the table to the left has them);
+              the pie's job is "who's in the top N". */}
+          <ol className="shrink-0 w-[140px] space-y-0.5 text-[10px] font-mono">
             {cleanSlices.map((s, i) => (
               <li
                 key={`${s.label}-${i}`}
@@ -4256,7 +4282,7 @@ function TopUserPieCard({
               >
                 <span
                   className="w-1.5 h-1.5 rounded-full shrink-0"
-                  style={{ backgroundColor: sliceColors[i] }}
+                  style={{ backgroundColor: sliceColorsFlat[i] }}
                 />
                 <span
                   className="truncate text-gray-700"
