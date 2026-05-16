@@ -588,9 +588,24 @@ async def public_ws_events(ws: WebSocket):
                     if not isinstance(handles, list):
                         continue
                     public_set = tiktok_service.get_public_handle_set()
-                    for h in handles:
-                        if not isinstance(h, str):
-                            continue
+                    # SQL-authority gate: batch-fetch the set of hosts
+                    # that ACTUALLY have an active room right now. See
+                    # the admin WS handler above for the rationale —
+                    # silently-dropped workers leave stale cache state
+                    # that would mis-render hosts as live for hours.
+                    str_handles = [h for h in handles if isinstance(h, str)]
+                    try:
+                        active_hosts = (
+                            tiktok_service._persistence.get_hosts_with_active_room(
+                                str_handles
+                            )
+                        )
+                    except Exception:
+                        logger.exception(
+                            "get_hosts_with_active_room failed (public ws snapshot)"
+                        )
+                        active_hosts = set()
+                    for h in str_handles:
                         norm = h.lstrip("@").strip().lower()
                         # Public-set check: requests for non-public hosts
                         # get an empty snapshot (same as "no entry yet")
@@ -618,15 +633,20 @@ async def public_ws_events(ws: WebSocket):
                             }
                         else:
                             version, data = cached
-                            # Strip aux + apply public sanitizer so a
-                            # snapshot reply can't leak operator-only
-                            # fields. Mirrors the delta channel's
-                            # pre-publish sanitization.
+                            # Strip aux fields + SQL-authority gate
+                            # (drops session-scoped state when no
+                            # active room) + public allowlist sanitizer.
+                            # Order matters: SQL gate first so stale
+                            # cached values are dropped before they can
+                            # leak into the allowlisted output.
                             stripped = {
                                 k: v for k, v in data.items()
                                 if not k.startswith("_")
                             }
-                            sanitized = tiktok_service.sanitize_public_patch(stripped)
+                            gated = tiktok_service.sanitize_cached_snapshot(
+                                norm, stripped, active_hosts=active_hosts,
+                            )
+                            sanitized = tiktok_service.sanitize_public_patch(gated)
                             payload = {
                                 "type": "snapshot", "host": norm,
                                 "version": version, "data": sanitized,

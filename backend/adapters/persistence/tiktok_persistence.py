@@ -1259,6 +1259,40 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                 existing.winner_user_id = winner_user_id
             s.commit()
 
+    def get_hosts_with_active_room(self, handles: list[str]) -> set[str]:
+        """Return the subset of `handles` whose `tiktok_rooms` has an
+        actively-live row (matches the same predicate
+        `_lives_summary_active_rooms` uses: `ended_at IS NULL AND
+        last_seen_at > NOW() - 5 min`). Single batched query —
+        used by the WS snapshot handlers to gate the state-cache
+        overlay against SQL authority so a silently-dropped worker
+        doesn't leave a host phantom-live in subsequent snapshots.
+        Returns lowercased handles."""
+        if not handles:
+            return set()
+        norm = [h.lstrip("@").strip().lower() for h in handles if h]
+        if not norm:
+            return set()
+        with self._get_session() as s:
+            if self._is_postgres():
+                rows = s.execute(text("""
+                    SELECT DISTINCT host_unique_id
+                    FROM tiktok_rooms
+                    WHERE host_unique_id = ANY(:hs)
+                      AND ended_at IS NULL
+                      AND last_seen_at > NOW() - INTERVAL '5 minutes'
+                """), {"hs": norm}).all()
+            else:
+                # SQLite dev path
+                rows = s.execute(text("""
+                    SELECT DISTINCT host_unique_id
+                    FROM tiktok_rooms
+                    WHERE host_unique_id IN :hs
+                      AND ended_at IS NULL
+                      AND last_seen_at > datetime('now', '-5 minutes')
+                """), {"hs": tuple(norm)}).all()
+        return {r[0] for r in rows if r[0]}
+
     def get_active_match(self, room_id: int) -> Match | None:
         """Return the latest match in this room that's *actually live*
         right now. A match is live when:

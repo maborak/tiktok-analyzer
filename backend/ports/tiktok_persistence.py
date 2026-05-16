@@ -183,6 +183,13 @@ class TikTokPersistencePort(ABC):
         """Mark ended_at and optionally record the winner."""
 
     @abstractmethod
+    def get_hosts_with_active_room(self, handles: list[str]) -> set[str]:
+        """Subset of `handles` that currently have an active room row
+        (ended_at IS NULL AND last_seen_at > NOW() - 5 min). Returns
+        lowercased handles. Used by snapshot/overlay paths to gate
+        cached session state against SQL authority."""
+
+    @abstractmethod
     def get_active_match(self, room_id: int) -> Match | None:
         """The currently-open match for a room (ended_at IS NULL), if any."""
 

@@ -3515,6 +3515,41 @@ class TikTokService:
             slice_["version"] = version
         return out
 
+    def sanitize_cached_snapshot(
+        self,
+        host: str,
+        cached_data: dict[str, Any],
+        active_hosts: set[str] | None = None,
+    ) -> dict[str, Any]:
+        """Strip session-scoped fields from a cached state snapshot
+        when SQL says the host's room is no longer live. Same gate as
+        `_overlay_state_cache`, but exposed for direct cache readers
+        (the WS `request-snapshot` handlers) that bypass the SQL
+        overlay path.
+
+        When `active_hosts` is provided, uses it as the source of truth
+        for "which hosts are currently live" — caller passes the set
+        from a single batched `get_hosts_with_active_room` call so a
+        snapshot for N hosts does one DB round-trip instead of N.
+
+        When `active_hosts` is None, falls back to a single-host check
+        via `get_hosts_with_active_room`.
+        """
+        norm = host.lstrip("@").strip().lower()
+        if active_hosts is None:
+            active_hosts = self._persistence.get_hosts_with_active_room([norm])
+        if norm in active_hosts:
+            return cached_data
+        # Host has no active room — drop every session-scoped field
+        # from the cached snapshot before serving. `_*` aux fields are
+        # already stripped at the publish layer; we mirror that here
+        # for safety.
+        return {
+            k: v
+            for k, v in cached_data.items()
+            if k not in self._CACHE_OVERLAY_FIELDS and not k.startswith("_")
+        }
+
     # ── Public-lives sanitizer allowlists ────────────────────────────
     #
     # Two allowlists, one per object in each `items[]` entry. Anything

@@ -2196,9 +2196,31 @@ async def ws_events(ws: WebSocket):
                     handles = msg.get("handles") or []
                     if not isinstance(handles, list):
                         continue
-                    for h in handles:
-                        if not isinstance(h, str):
-                            continue
+                    # Batched SQL-authority gate — fetch the set of
+                    # hosts that ACTUALLY have an active room (matches
+                    # `_lives_summary_active_rooms`'s 5-min predicate).
+                    # Cached state-cache entries can outlive their
+                    # session when a worker drops silently without
+                    # firing `live_end`. Without this gate, snapshots
+                    # would serve stale `active_room_id`/`viewer_count`/
+                    # `session_stats` for hosts whose rooms ended hours
+                    # ago, re-resurrecting them as "live" on the
+                    # reconnecting client.
+                    str_handles = [h for h in handles if isinstance(h, str)]
+                    try:
+                        active_hosts = (
+                            tiktok_service._persistence.get_hosts_with_active_room(
+                                str_handles
+                            )
+                            if tiktok_service is not None
+                            else set()
+                        )
+                    except Exception:
+                        logger.exception(
+                            "get_hosts_with_active_room failed (admin ws snapshot)"
+                        )
+                        active_hosts = set()
+                    for h in str_handles:
                         norm = h.lstrip("@").strip().lower()
                         try:
                             cached = state_cache.get(norm)
@@ -2217,16 +2239,26 @@ async def ws_events(ws: WebSocket):
                         else:
                             version, data = cached
                             # Strip `_*` aux fields — same convention the
-                            # delta-publish path uses.
-                            public_data = {
+                            # delta-publish path uses — then apply the
+                            # SQL-authority gate. `sanitize_cached_snapshot`
+                            # drops every session-scoped field when the
+                            # host has no active room.
+                            stripped = {
                                 k: v for k, v in data.items()
                                 if not k.startswith("_")
                             }
+                            sanitized = (
+                                tiktok_service.sanitize_cached_snapshot(
+                                    norm, stripped, active_hosts=active_hosts
+                                )
+                                if tiktok_service is not None
+                                else stripped
+                            )
                             payload = {
                                 "type": "snapshot",
                                 "host": norm,
                                 "version": version,
-                                "data": public_data,
+                                "data": sanitized,
                             }
                         try:
                             await ws.send_json(payload)
