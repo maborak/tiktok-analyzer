@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { ChevronLeft, ChevronRight, Loader2, Search, X } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Loader2, Search, User, X } from 'lucide-react';
 
 import { type TikTokGifter } from '@admin/services/tiktok';
 import { useTikTokApi } from '@admin/contexts/TikTokApiContext';
@@ -164,7 +164,7 @@ export function TikTokRoomGiftersTable({
         </p>
       ) : (
         <>
-          {/* Desktop: dense 5-column table (md+). Hidden below md
+          {/* Desktop: dense 6-column table (md+). Hidden below md
               where the columns would force horizontal scroll. */}
           <table className="hidden md:table w-full text-sm">
             <thead>
@@ -174,6 +174,7 @@ export function TikTokRoomGiftersTable({
                 <th className="text-right py-2 auth-mono-label">Diamonds</th>
                 <th className="text-right py-2 auth-mono-label">Gifts</th>
                 <th className="text-right py-2 auth-mono-label">Comments</th>
+                <th className="text-right py-2 auth-mono-label w-24"></th>
               </tr>
             </thead>
             <tbody>
@@ -253,6 +254,32 @@ export function TikTokRoomGiftersTable({
                       <span className="text-gray-300 font-mono text-[10px]">—</span>
                     )}
                   </td>
+                  <td className="text-right py-2">
+                    {/* Explicit Profile button — discoverable affordance
+                        for opening the gifter modal. The whole row stays
+                        clickable as a shortcut; this button is the
+                        primary "I want their profile" action. */}
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onSelectGifter({
+                          userId: g.user_id,
+                          uniqueId: g.unique_id,
+                          nickname: g.nickname,
+                          diamonds: g.diamonds,
+                          gifts: g.gifts,
+                          comments: g.comments,
+                          tab: 'gifts',
+                        });
+                      }}
+                      className="inline-flex items-center gap-1 px-2 py-1 rounded font-mono text-[10px] uppercase tracking-wider border border-gray-200 text-gray-700 hover:bg-primary-50 hover:border-primary-300 hover:text-primary-700 dark:border-gray-100/15 dark:hover:bg-primary-500/10 dark:hover:border-primary-400 dark:hover:text-primary-300 transition-colors"
+                      title={`Open profile — ${g.nickname || (g.unique_id ? `@${g.unique_id}` : 'user')}`}
+                    >
+                      <User className="w-3 h-3" />
+                      Profile
+                    </button>
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -317,7 +344,7 @@ export function TikTokRoomGiftersTable({
                     <span className="text-[10px] uppercase tracking-wider text-gray-400">gifts</span>
                     <span className="tabular-nums">{g.gifts.toLocaleString()}</span>
                   </span>
-                  {g.comments > 0 ? (
+                  {g.comments > 0 && (
                     <button
                       type="button"
                       onClick={(e) => {
@@ -332,14 +359,35 @@ export function TikTokRoomGiftersTable({
                           tab: 'comments',
                         });
                       }}
-                      className="ml-auto inline-flex items-center gap-1 px-2 py-0.5 rounded font-mono text-[10px] bg-sky-50 text-sky-700 dark:bg-sky-500/10 dark:text-sky-300 hover:bg-sky-100 dark:hover:bg-sky-500/20 transition-colors"
+                      className="inline-flex items-center gap-1 px-2 py-0.5 rounded font-mono text-[10px] bg-sky-50 text-sky-700 dark:bg-sky-500/10 dark:text-sky-300 hover:bg-sky-100 dark:hover:bg-sky-500/20 transition-colors"
                       title="View this user's comments"
                     >
                       💬 {g.comments}
                     </button>
-                  ) : (
-                    <span className="ml-auto text-gray-300 text-[10px]">no comments</span>
                   )}
+                  {/* Explicit Profile button — primary action affordance
+                      on mobile where row-tap also opens but a labeled
+                      button makes it obvious. Pushed to the right edge. */}
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onSelectGifter({
+                        userId: g.user_id,
+                        uniqueId: g.unique_id,
+                        nickname: g.nickname,
+                        diamonds: g.diamonds,
+                        gifts: g.gifts,
+                        comments: g.comments,
+                        tab: 'gifts',
+                      });
+                    }}
+                    className="ml-auto inline-flex items-center gap-1 px-2 py-0.5 rounded font-mono text-[10px] uppercase tracking-wider border border-gray-200 text-gray-700 hover:bg-primary-50 hover:border-primary-300 hover:text-primary-700 dark:border-gray-100/15 dark:hover:bg-primary-500/10 dark:hover:border-primary-400 dark:hover:text-primary-300 transition-colors"
+                    title={`Open profile — ${g.nickname || (g.unique_id ? `@${g.unique_id}` : 'user')}`}
+                  >
+                    <User className="w-3 h-3" />
+                    Profile
+                  </button>
                 </div>
               </li>
             ))}
