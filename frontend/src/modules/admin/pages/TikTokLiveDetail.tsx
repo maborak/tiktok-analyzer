@@ -1910,11 +1910,12 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
         </div>
 
         {giftersTab === 'gifters' && (
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-            {/* LEFT column: the existing top-gifters list (2/3 width on
-                md+). Stays unchanged — the right column is purely
-                additive. */}
-            <div className="md:col-span-2 min-w-0">
+          <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
+            {/* LEFT column: the existing top-gifters list (60% of the
+                row on md+, i.e. 3/5). The right column gets the
+                remaining 40% (2/5). Stays unchanged otherwise — the
+                right column is purely additive. */}
+            <div className="md:col-span-3 min-w-0">
               <TikTokRoomGiftersTable
                 roomId={roomId}
                 extraRoomIds={effectiveExtraRoomIds}
@@ -1938,7 +1939,7 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
                 single "coming soon" notice instead of shipping two
                 permanently-empty donut rings.
                 Drops below the list on narrow viewports. */}
-            <div className="flex flex-col gap-3 min-w-0">
+            <div className="md:col-span-2 flex flex-col gap-3 min-w-0">
               <TopUserPieCard
                 title="Top Gifter"
                 icon={<Crown className="w-3.5 h-3.5 text-amber-500" />}
@@ -4131,7 +4132,12 @@ function TopUserPieCard({
     () =>
       items
         .map((g) => ({
-          label: g.nickname || g.unique_id || 'Unknown',
+          // Use the @username (unique_id) as the slice label so the
+          // list reads as a row of TikTok handles; fall back to the
+          // display nickname only when the handle is missing.
+          label: g.unique_id
+            ? `@${g.unique_id}`
+            : g.nickname || 'Unknown',
           value: g.diamonds ?? 0,
         }))
         .filter((s) => s.value > 0),
@@ -4240,18 +4246,18 @@ function TopUserPieCard({
               and the donut tooltip shows the value on hover when
               needed. `min-w-0` on the flex item + `truncate` on the
               name lets long handles ellipsize cleanly. */}
-          <ol className="flex-1 min-w-0 space-y-1 text-xs">
+          <ol className="flex-1 min-w-0 space-y-0.5 text-[10px] font-mono">
             {cleanSlices.map((s, i) => (
               <li
                 key={`${s.label}-${i}`}
-                className="flex items-center gap-2"
+                className="flex items-center gap-1.5 leading-tight"
               >
                 <span
-                  className="w-2 h-2 rounded-full shrink-0"
+                  className="w-1.5 h-1.5 rounded-full shrink-0"
                   style={{ backgroundColor: sliceColors[i] }}
                 />
                 <span
-                  className="truncate text-gray-900"
+                  className="truncate text-gray-700"
                   title={s.label}
                 >
                   {s.label}
