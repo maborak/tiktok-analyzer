@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { memo, useEffect, useState } from 'react';
 import { ChevronLeft, ChevronRight, Loader2, Search, User, X } from 'lucide-react';
 
 import { type TikTokGifter } from '@admin/services/tiktok';
@@ -45,7 +45,7 @@ interface Props {
 const PAGE_SIZE_OPTIONS = [10, 25, 50, 100] as const;
 const DEFAULT_PAGE_SIZE = 10;
 
-export function TikTokRoomGiftersTable({
+function TikTokRoomGiftersTableImpl({
   roomId,
   extraRoomIds,
   range,
@@ -452,3 +452,11 @@ export function TikTokRoomGiftersTable({
     </div>
   );
 }
+
+/** Memoized wrapper — shields the table from the live-detail page's
+ *  re-render storm. The parent's `recent` state updates on every WS
+ *  event (1-5 events/sec on a busy live), which previously cascaded
+ *  full reconciliation through every child. With memo + stable useState
+ *  setter props from the parent, the table now only re-renders when
+ *  its own props actually change. */
+export const TikTokRoomGiftersTable = memo(TikTokRoomGiftersTableImpl);

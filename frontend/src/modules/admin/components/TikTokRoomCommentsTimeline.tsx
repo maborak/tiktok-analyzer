@@ -11,7 +11,7 @@
  * behavior.
  */
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
   ArrowDown,
@@ -125,7 +125,7 @@ const TYPE_OPTIONS: Array<{
   { key: 'live_pause',  label: 'Pauses',    icon: <Pause className="w-3 h-3" />,         color: '#9ca3af' },
 ];
 
-export function TikTokRoomCommentsTimeline({
+function TikTokRoomCommentsTimelineImpl({
   roomId,
   extraRoomIds,
   range,
@@ -1138,3 +1138,7 @@ function highlight(text: string, query: string): React.ReactNode {
   if (last < text.length) out.push(text.slice(last));
   return out;
 }
+
+/** Memoized — shielded from the live-detail page's per-WS-event
+ *  reconcile cascade. */
+export const TikTokRoomCommentsTimeline = memo(TikTokRoomCommentsTimelineImpl);

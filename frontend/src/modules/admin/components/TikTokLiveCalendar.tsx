@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useMemo, useState } from 'react';
+import { Fragment, memo, useEffect, useMemo, useState } from 'react';
 import { Calendar as CalendarIcon } from 'lucide-react';
 
 import { type TikTokRoom } from '@admin/services/tiktok';
@@ -71,7 +71,7 @@ interface CalendarData {
  * Cell colour = number of distinct broadcasts on that day. Hover shows
  * the date, broadcast count, and total observed duration.
  */
-export function TikTokLiveCalendar({
+function TikTokLiveCalendarImpl({
   handle,
   weeks = 5,
   rooms,
@@ -637,3 +637,7 @@ function formatDuration(minutes: number): string {
   const hh = h % 24;
   return hh === 0 ? `${d}d` : `${d}d ${hh}h`;
 }
+
+/** Memoized — heatmap is expensive to re-render (N×7 cells); shielded
+ *  from the live-detail page's per-WS-event reconcile cascade. */
+export const TikTokLiveCalendar = memo(TikTokLiveCalendarImpl);

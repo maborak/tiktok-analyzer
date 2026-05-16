@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { memo, useEffect, useState } from 'react';
 import { ChevronLeft, ChevronRight, Loader2, Network, Search, X } from 'lucide-react';
 
 import { type TikTokCrossLiveGifter } from '@admin/services/tiktok';
@@ -25,7 +25,7 @@ interface Props {
 const PAGE_SIZE_OPTIONS = [10, 25, 50, 100] as const;
 const DEFAULT_PAGE_SIZE = 10;
 
-export function TikTokRoomCrossLiveGiftersTable({
+function TikTokRoomCrossLiveGiftersTableImpl({
   handle,
   refreshKey,
   onSelectCrossGifter,
@@ -374,3 +374,7 @@ function compact(n: number): string {
   if (n < 1_000_000) return `${Math.round(n / 1000)}k`;
   return `${(n / 1_000_000).toFixed(1)}M`;
 }
+
+/** Memoized — shields the table from the live-detail page's per-WS-
+ *  event re-render cascade. */
+export const TikTokRoomCrossLiveGiftersTable = memo(TikTokRoomCrossLiveGiftersTableImpl);

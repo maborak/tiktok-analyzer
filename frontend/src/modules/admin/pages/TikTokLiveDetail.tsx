@@ -641,15 +641,13 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
       setRoomId(targetRid);
       if (targetRid) {
         const room = list.find((r) => r.room_id === targetRid) ?? null;
+        // Stats fan-out only — match history is owned by its own
+        // `useEffect([roomId, ...])` further down the page (~L979).
+        // Previously `refresh()` ALSO fired `listMatches` here, which
+        // raced with that effect: roomId state-flush triggered the
+        // effect's fetch before `refresh()`'s own await resolved →
+        // one wasted RTT per mount + refresh. Removed.
         await fetchStats(targetRid, effectiveWindow, room);
-        // Match history is now scoped to the selected broadcast — no
-        // mixing PK history across separate lives.
-        const ms = await tiktokApi.listMatches({
-          handle,
-          room_id: targetRid,
-          limit: 50,
-        });
-        setMatches(ms);
       } else {
         setStats(null);
         setMatches([]);
@@ -4317,7 +4315,6 @@ function TopUserPieCard({
               option={option}
               style={{ height: '100%', width: '100%' }}
               opts={{ renderer: 'canvas' }}
-              notMerge
               lazyUpdate
             />
             <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { memo, useEffect, useState } from 'react';
 import { Loader2, Users } from 'lucide-react';
 
 import { type TikTokRoomRecipient } from '@admin/services/tiktok';
@@ -22,7 +22,7 @@ interface Props {
   }) => void;
 }
 
-export function TikTokRoomRecipientsCard({
+function TikTokRoomRecipientsCardImpl({
   roomId,
   range,
   refreshKey,
@@ -147,3 +147,7 @@ export function TikTokRoomRecipientsCard({
     </section>
   );
 }
+
+/** Memoized — shielded from the live-detail page's per-WS-event
+ *  reconcile cascade. */
+export const TikTokRoomRecipientsCard = memo(TikTokRoomRecipientsCardImpl);

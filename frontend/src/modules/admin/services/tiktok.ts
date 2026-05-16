@@ -929,12 +929,16 @@ export const tiktokApi = {
    *  `listLives()`. Mirrors the shape of `publicTiktokApi.getLiveByHandle`
    *  so the shared live-detail component (used by both admin and public
    *  routes via the `TikTokApiContext`) can fetch the host record
-   *  uniformly without branching on the active namespace. */
+   *  uniformly without branching on the active namespace.
+   *
+   *  Delegates to `listLives()` so we inherit its `cacheTtlMs: 30_000`
+   *  + `dedupe: true` config. Previously this method called
+   *  `apiRequest` directly with no cache, causing every 30s host-
+   *  profile poll on the detail page to fire a redundant `/lives`
+   *  RTT even though the lives-page poll cycle was already fetching
+   *  the same data. Single source of truth, single cache slot. */
   getLiveByHandle(handle: string): Promise<TikTokSubscription> {
-    return apiRequest<TikTokSubscription[]>({
-      method: 'GET',
-      url: `${BASE}/lives`,
-    }).then((rows) => {
+    return this.listLives().then((rows) => {
       const needle = handle.toLowerCase();
       const found = rows.find((r) => (r.unique_id || '').toLowerCase() === needle);
       if (!found) {

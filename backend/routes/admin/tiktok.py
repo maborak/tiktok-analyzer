@@ -392,7 +392,7 @@ async def get_room(
     _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
 ):
     svc = _require_service()
-    room = svc.get_room(room_id)
+    room = await asyncio.to_thread(svc.get_room, room_id)
     if room is None:
         raise HTTPException(status_code=404, detail="room not found")
     return RoomResponse(
@@ -416,7 +416,9 @@ async def list_room_events(
     _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
 ):
     svc = _require_service()
-    rows = svc.list_events(room_id, type=type, limit=limit, before_id=before_id)
+    rows = await asyncio.to_thread(
+        svc.list_events, room_id, type=type, limit=limit, before_id=before_id,
+    )
     return [
         EventResponse(
             id=str(r.id or 0),
@@ -530,10 +532,16 @@ async def host_calendar(
 ):
     """Per-day broadcast counts for the GitHub-style heatmap on the
     live-detail page. Window ends today and reaches `weeks` weeks back,
-    snapped to Monday so the 7×N grid is rectangular."""
+    snapped to Monday so the 7×N grid is rectangular.
+
+    Off-loaded to the threadpool via `asyncio.to_thread` so a slow
+    query doesn't block the event loop for concurrent requests. The
+    `/lives/bundle` endpoint follows the same pattern; the detail-page
+    endpoints were missing it until this commit.
+    """
     svc = _require_service()
     handle = handle.lstrip("@")
-    return svc.host_calendar(handle, weeks=weeks, tz=tz)
+    return await asyncio.to_thread(svc.host_calendar, handle, weeks=weeks, tz=tz)
 
 
 @router.get("/lives/{handle}/rooms", response_model=list[RoomResponse])
@@ -557,14 +565,18 @@ async def list_host_rooms(
 ):
     svc = _require_service()
     handle = handle.lstrip("@")
-    rooms = svc.list_rooms_for_host(handle, limit=limit)
-    # Per-room rollups (diamonds / matches / likes) so the dropdown
-    # selector can show them inline. One extra round-trip; the SQL
-    # itself is a single CTE join scoped to this host's rooms. When
-    # `since` / `until` are provided, totals are clipped to that
-    # window so the modal chips match the day-aggregate chart.
+    # Both calls offloaded to the threadpool so concurrent admin
+    # requests don't serialize behind each other on the event loop.
+    # The two are sequential because `room_totals` needs the room
+    # ids from `list_rooms_for_host`; can't parallelize that step.
+    rooms = await asyncio.to_thread(svc.list_rooms_for_host, handle, limit=limit)
     totals = (
-        svc.room_totals([r.room_id for r in rooms], since=since, until=until)
+        await asyncio.to_thread(
+            svc.room_totals,
+            [r.room_id for r in rooms],
+            since=since,
+            until=until,
+        )
         if rooms else {}
     )
     return [
@@ -1516,7 +1528,12 @@ async def get_room_stats(
     _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
 ):
     svc = _require_service()
-    return svc.get_room_stats(
+    # Offload to threadpool — `get_room_stats` issues ~5 sequential
+    # SQL round-trips internally. Without this, two concurrent admin
+    # requests on the same room serialize behind each other on the
+    # event loop.
+    return await asyncio.to_thread(
+        svc.get_room_stats,
         room_id,
         window_minutes=window_minutes,
         bucket_seconds=bucket_seconds,
@@ -1534,7 +1551,8 @@ async def get_room_recipients(
     _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
 ):
     svc = _require_service()
-    return svc.get_room_recipients(
+    return await asyncio.to_thread(
+        svc.get_room_recipients,
         room_id,
         since=since,
         until=until,
@@ -1576,7 +1594,8 @@ async def get_room_gifters(
         target = list({int(room_id), *extras})
     else:
         target = int(room_id)
-    return svc.get_room_gifters(
+    return await asyncio.to_thread(
+        svc.get_room_gifters,
         target,
         since=since,
         until=until,
