@@ -3493,7 +3493,23 @@ class TikTokService:
                 slice_.setdefault("version", 0)
                 continue
             version, cache_state = cached
+            # SQL is authoritative for "is this host's room currently
+            # live" — `_lives_summary_active_rooms` only sets
+            # `active_room_id` when `ended_at IS NULL AND last_seen_at
+            # > NOW() - 5 min`. If SQL didn't return an active_room_id
+            # for this host, the room is OVER (clean disconnect OR
+            # silent worker drop) — every session-scoped cached field
+            # is stale and would mis-render the host as "still live"
+            # for hours. Skip the overlay of session fields in that
+            # case; safe fields (last_*_age_s) are session-scoped too
+            # so we exclude them all when the session ended.
+            sql_says_live = slice_.get("active_room_id") is not None
             for k in self._CACHE_OVERLAY_FIELDS:
+                if not sql_says_live and k != "version":
+                    # Drop any stale session-scoped cached value when
+                    # SQL says the room isn't live. Don't write it onto
+                    # the slice; let the SQL `null`/absent value win.
+                    continue
                 if k in cache_state:
                     slice_[k] = cache_state[k]
             slice_["version"] = version

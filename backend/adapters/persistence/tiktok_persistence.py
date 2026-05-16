@@ -6252,14 +6252,44 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
     def get_lives_totals(self) -> dict[str, Any]:
         """Page-level rollup: how many live, how many subs, total
         diamonds last 24h, events/min across all tracked hosts.
-        Cheap — three single-row aggregates."""
+        Cheap — three single-row aggregates.
+
+        `n_live` uses the SAME predicate as the per-host summary
+        `active_room_id` (see `_lives_summary_active_rooms`):
+        `EXISTS (SELECT 1 FROM tiktok_rooms WHERE ended_at IS NULL
+        AND last_seen_at > NOW() - 5 min)`. Counting the cached
+        `subscriptions.is_live` flag instead under-reports the live
+        count — that flag is updated by the central probe loop
+        every ~60s and lags the WS-driven room state. A host whose
+        live WS just detected them streaming would render as ONLINE
+        on the per-card check but missing from the totals strip
+        until the probe caught up. Now they agree.
+        """
         with self._get_session() as s:
-            r1 = s.execute(text("""
-                SELECT
-                  COUNT(*) FILTER (WHERE is_live = true) AS n_live,
-                  COUNT(*) AS n_total
-                FROM tiktok_subscriptions
-            """)).first()
+            if self._is_postgres():
+                r1 = s.execute(text("""
+                    SELECT
+                      COUNT(*) FILTER (
+                        WHERE EXISTS (
+                          SELECT 1 FROM tiktok_rooms r
+                          WHERE r.host_unique_id = s.unique_id
+                            AND r.ended_at IS NULL
+                            AND r.last_seen_at > NOW() - INTERVAL '5 minutes'
+                        )
+                      ) AS n_live,
+                      COUNT(*) AS n_total
+                    FROM tiktok_subscriptions s
+                """)).first()
+            else:
+                # SQLite dev path — fall back to the cached flag; the
+                # rooms-join EXISTS subquery costs more here without
+                # the partial index Postgres has.
+                r1 = s.execute(text("""
+                    SELECT
+                      COUNT(*) FILTER (WHERE is_live = true) AS n_live,
+                      COUNT(*) AS n_total
+                    FROM tiktok_subscriptions
+                """)).first()
             n_live = int(r1[0] or 0) if r1 else 0
             n_total = int(r1[1] or 0) if r1 else 0
 
