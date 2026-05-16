@@ -1945,7 +1945,6 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
                 icon={<Crown className="w-3.5 h-3.5 text-amber-500" />}
                 items={topGiftersItems}
                 loading={topGiftersLoading}
-                accentColor={eventColor('gift')}
               />
               {/* Coming-soon placeholder for per-user comment/like
                   aggregates — uses the project's established Lock +
@@ -4106,26 +4105,27 @@ function LiveMatchTopDonors({
  *  page 2 and the donut shows page 2's rows. No duplicate request to
  *  `getRoomGifters`.
  *
- *  Slice colors fade alpha off `accentColor` — top slice full opacity,
- *  each rank drops ~7% to a 35% floor — so the donut reads as
- *  "leader dominates" while still distinguishing 10 users via tooltip
- *  hover. The right-side list shows only color-dot + truncated name
- *  (value is intentionally absent — the user only wants to identify
- *  who's in the top N; the actual amounts already live in the table
- *  on the left). */
+ *  Slice colors via HSL rotation — each rank gets a distinct hue
+ *  (starts at amber/38° to match the gift event color, then rotates
+ *  the wheel evenly). Distinct colors let an operator identify any
+ *  of the 10 users at a glance; single-hue alpha-fade was the wrong
+ *  call for a categorical chart.
+ *
+ *  The right-side list shows only color-dot + truncated @handle —
+ *  exact diamond values are intentionally absent (the gifters table
+ *  on the left already carries them; the donut's role is just
+ *  "who's in the top N"). */
 function TopUserPieCard({
   title,
   icon,
   items,
   loading,
-  accentColor,
   emptyHint,
 }: {
   title: string;
   icon: React.ReactNode;
   items: TikTokGifter[];
   loading?: boolean;
-  accentColor: string;
   emptyHint?: string;
 }) {
   const cleanSlices = useMemo(
@@ -4154,22 +4154,24 @@ function TopUserPieCard({
   const top = cleanSlices[0];
   const topPct = hasData && slicesSum > 0 ? (top.value / slicesSum) * 100 : 0;
 
-  // Build per-slice colors by alpha-fading the accent. Top slice gets
-  // full opacity; each subsequent rank drops 7-8% down to a floor of
-  // 35% so even the 10th slice stays visible against the card surface.
-  // Accepts `#RRGGBB` or `#RGB` shorthand; falls back to accent only
-  // when the format is unrecognized.
+  // Per-slice colors via HSL rotation — each slice gets a distinct
+  // hue so 10 users are visually identifiable at a glance. Starts at
+  // `--accent-hue` (defaults to 38° = amber, matching the gift event
+  // color from `eventColor('gift')`) and rotates the wheel evenly.
+  // Saturation 70% + lightness 55% keeps every slice vivid on both
+  // light and dark card surfaces.
+  //
+  // Why not the single-hue alpha-fade used previously? A pie chart's
+  // job is to make N categories visually distinct. Same-hue slices
+  // defeat that — you can't tell which slice is which without
+  // hovering for the tooltip.
   const sliceColors = useMemo(() => {
-    const m = /^#([0-9a-f]{6}|[0-9a-f]{3})$/i.exec(accentColor.trim());
-    if (!m) return cleanSlices.map(() => accentColor);
-    let hex = m[1];
-    if (hex.length === 3) hex = hex.split('').map((c) => c + c).join('');
+    const n = Math.max(cleanSlices.length, 1);
     return cleanSlices.map((_, i) => {
-      const alpha = Math.max(0.35, 1 - i * 0.07);
-      const a = Math.round(alpha * 255).toString(16).padStart(2, '0');
-      return `#${hex}${a}`;
+      const hue = (38 + (360 / n) * i) % 360;
+      return `hsl(${hue}, 70%, 55%)`;
     });
-  }, [cleanSlices, accentColor]);
+  }, [cleanSlices]);
 
   const option = useMemo(() => {
     if (!hasData) return null;
@@ -4213,11 +4215,11 @@ function TopUserPieCard({
         )}
       </div>
       {hasData && option ? (
-        <div className="flex items-start gap-3">
-          {/* LEFT: donut with #1-share overlay in the hole */}
+        <div className="grid grid-cols-2 gap-3 items-center">
+          {/* LEFT: donut fills its 50% column as a square. Center label
+              shows the #1's share of the visible top N. */}
           <div
-            className="relative shrink-0"
-            style={{ width: 120, height: 120 }}
+            className="relative aspect-square w-full min-w-0"
             role="img"
             aria-label={`${title} — top ${cleanSlices.length} users; leader ${top.label} at ${topPct.toFixed(0)}% of total`}
           >
@@ -4230,10 +4232,10 @@ function TopUserPieCard({
               lazyUpdate
             />
             <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
-              <div className="text-base font-bold tabular-nums text-gray-900 leading-none">
+              <div className="text-2xl font-bold tabular-nums text-gray-900 leading-none">
                 {topPct.toFixed(0)}%
               </div>
-              <div className="text-[9px] uppercase tracking-wider text-gray-500 mt-0.5 text-center px-1 leading-tight">
+              <div className="text-[10px] uppercase tracking-wider text-gray-500 mt-1 text-center px-2 leading-tight">
                 #1 of top {cleanSlices.length}
               </div>
             </div>
@@ -4269,7 +4271,7 @@ function TopUserPieCard({
       ) : loading ? (
         <div
           className="flex items-center justify-center text-xs text-gray-500 font-mono"
-          style={{ height: 140 }}
+          style={{ minHeight: 180 }}
         >
           <Loader2 className="w-4 h-4 animate-spin mr-2" />
           Loading…
@@ -4277,7 +4279,7 @@ function TopUserPieCard({
       ) : (
         <div
           className="flex flex-col items-center justify-center text-center px-2 text-xs text-gray-500 font-mono"
-          style={{ height: 140 }}
+          style={{ minHeight: 180 }}
         >
           <div className="mb-1">No data</div>
           {emptyHint && (
