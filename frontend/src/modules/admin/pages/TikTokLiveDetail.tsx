@@ -4209,10 +4209,11 @@ function TopUserPieCard({
         )}
       </div>
       {hasData && option ? (
-        <>
+        <div className="flex items-start gap-3">
+          {/* LEFT: donut with #1-share overlay in the hole */}
           <div
-            className="relative"
-            style={{ height: 140 }}
+            className="relative shrink-0"
+            style={{ width: 120, height: 120 }}
             role="img"
             aria-label={`${title} — top ${cleanSlices.length} users; leader ${top.label} at ${topPct.toFixed(0)}% of total${valueSuffix ? ` (${top.value.toLocaleString()}${valueSuffix})` : ''}`}
           >
@@ -4224,32 +4225,56 @@ function TopUserPieCard({
               notMerge
               lazyUpdate
             />
-            {/* Center label: top user's share % overlays the donut
-                hole so the headline stat is readable at a glance. */}
             <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
-              <div className="text-lg font-bold tabular-nums text-gray-900">
+              <div className="text-base font-bold tabular-nums text-gray-900 leading-none">
                 {topPct.toFixed(0)}%
               </div>
-              <div className="text-[9px] uppercase tracking-wider text-gray-500">
+              <div className="text-[9px] uppercase tracking-wider text-gray-500 mt-0.5">
                 #1 share
               </div>
             </div>
           </div>
-          <div className="mt-2 text-xs font-mono">
-            <div className="truncate text-gray-900" title={top.label}>
-              {top.label}
-            </div>
-            <div className="tabular-nums text-gray-500">
-              {top.value.toLocaleString()}
-              {valueSuffix}
-              {total > 0 && (
-                <span className="ml-1 text-[10px] text-gray-400">
-                  / {total.toLocaleString()}{valueSuffix}
+          {/* RIGHT: ranked label list — color-dot + truncated name +
+              value. Each dot matches its slice color so the row maps
+              visually to the donut segment. `min-w-0` on the flex item
+              + `truncate` on the name lets long handles ellipsize. */}
+          <ol className="flex-1 min-w-0 space-y-1 text-xs">
+            {cleanSlices.map((s, i) => (
+              <li
+                key={`${s.label}-${i}`}
+                className="flex items-center gap-2"
+              >
+                <span
+                  className="w-2 h-2 rounded-full shrink-0"
+                  style={{ backgroundColor: sliceColors[i] }}
+                />
+                <span
+                  className="truncate text-gray-900"
+                  title={s.label}
+                >
+                  {s.label}
                 </span>
-              )}
-            </div>
-          </div>
-        </>
+                <span className="ml-auto tabular-nums text-gray-500 shrink-0 font-mono">
+                  {s.value.toLocaleString()}
+                  {valueSuffix}
+                </span>
+              </li>
+            ))}
+            {others > 0 && (
+              <li className="flex items-center gap-2 border-t border-gray-100 dark:border-gray-100/10 pt-1 mt-1">
+                <span
+                  className="w-2 h-2 rounded-full shrink-0"
+                  style={{ backgroundColor: 'var(--color-pie-others, #d1d5db)' }}
+                />
+                <span className="truncate text-gray-500">Others</span>
+                <span className="ml-auto tabular-nums text-gray-500 shrink-0 font-mono">
+                  {others.toLocaleString()}
+                  {valueSuffix}
+                </span>
+              </li>
+            )}
+          </ol>
+        </div>
       ) : (
         <div
           className="flex flex-col items-center justify-center text-center px-2 text-xs text-gray-500 font-mono"
