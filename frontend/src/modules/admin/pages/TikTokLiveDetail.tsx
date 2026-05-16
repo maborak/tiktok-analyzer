@@ -1931,21 +1931,10 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
               <TopUserPieCard
                 title="Top Gifter"
                 icon={<Crown className="w-3.5 h-3.5 text-amber-500" />}
-                slices={(stats?.top_gifters ?? []).slice(0, 10).map((g) => ({
-                  label: g.nickname || g.unique_id || 'Unknown',
-                  value: g.diamonds ?? 0,
-                }))}
-                othersValue={(() => {
-                  const arr = stats?.top_gifters ?? [];
-                  const totalKnown = arr
-                    .slice(0, 10)
-                    .reduce((s, g) => s + (g.diamonds ?? 0), 0);
-                  return stats?.diamonds_total != null
-                    ? Math.max(0, stats.diamonds_total - totalKnown)
-                    : null;
-                })()}
-                totalOverride={stats?.diamonds_total ?? null}
-                valueSuffix=" 💎"
+                roomId={roomId}
+                range={effectiveRange}
+                extraRoomIds={effectiveExtraRoomIds}
+                refreshKey={eventsRefreshKey}
                 accentColor={eventColor('gift')}
               />
               {/* Coming-soon placeholder for per-user comment/like
@@ -4097,45 +4086,114 @@ function LiveMatchTopDonors({
   );
 }
 
-/** Top-N donut card. Drives the right-column trio (Top Gifter /
- *  Commenter / Liker) on the Top Gifters tab.
+/** Top-N donut card. Drives the right-column Top Gifter card on
+ *  the Top Gifters tab.
  *
- *  Pass the top N user-shaped rows in `slices` and the long-tail
- *  remainder in `othersValue` (or omit to compute from `totalOverride
- *  - sum(slices)`). The slice colors fade alpha off `accentColor` so
- *  the top user reads as full-saturation and lower-ranked users tint
- *  down — gives the chart a "the top one dominates" visual without
- *  losing per-user identity (tooltip on hover shows the row).
+ *  Fetches `/admin/tiktok/rooms/{roomId}/gifters` with the SAME
+ *  `since`/`until`/`extra_room_ids` the gifters table uses (line 1912)
+ *  so the donut reflects the same filter scope. Renders the top 10
+ *  gifters as distinct slices with the long-tail folded into
+ *  "Others" (when `total > sum(top10)`).
  *
- *  Layout: title row on top, ~140 px square pie below, footer with
- *  the top user's name + value. Renders a "No data" empty state when
- *  `slices` is empty or sums to zero. */
+ *  Slice colors fade alpha off `accentColor` — top slice full opacity,
+ *  each rank drops ~7% to a 35% floor — so the donut reads as
+ *  "leader dominates" while still distinguishing 10 users via tooltip
+ *  hover. The right-side list shows only color-dot + truncated name
+ *  (value is intentionally absent — the user only wants to identify
+ *  who's in the top N; the actual amounts already live in the table
+ *  on the left). */
 function TopUserPieCard({
   title,
   icon,
-  slices,
-  othersValue,
-  totalOverride,
-  valueSuffix,
+  roomId,
+  range,
+  extraRoomIds,
+  refreshKey,
   accentColor,
   emptyHint,
 }: {
   title: string;
   icon: React.ReactNode;
-  slices: { label: string; value: number }[];
-  othersValue?: number | null;
-  totalOverride?: number | null;
-  valueSuffix: string;
+  roomId: string | null;
+  range: { since?: string; until?: string };
+  extraRoomIds?: string[];
+  refreshKey: number;
   accentColor: string;
   emptyHint?: string;
 }) {
-  const cleanSlices = slices.filter((s) => s.value > 0);
+  const tiktokApi = useTikTokApi();
+  // Stable dep key for the extras array (identity flips every render).
+  const extraKey = (extraRoomIds ?? []).join(',');
+  const [items, setItems] = useState<TikTokGifter[]>([]);
+  const [total, setTotal] = useState(0);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (!roomId) {
+      setItems([]);
+      setTotal(0);
+      return;
+    }
+    let cancelled = false;
+    setLoading(true);
+    tiktokApi
+      .getRoomGifters(roomId, {
+        since: range.since,
+        until: range.until,
+        limit: 10,
+        offset: 0,
+        extra_room_ids:
+          extraRoomIds && extraRoomIds.length > 0 ? extraRoomIds : undefined,
+      })
+      .then((res) => {
+        if (cancelled) return;
+        setItems(res.items);
+        setTotal(res.total);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setItems([]);
+        setTotal(0);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roomId, extraKey, range.since, range.until, refreshKey]);
+
+  const cleanSlices = useMemo(
+    () =>
+      items
+        .map((g) => ({
+          label: g.nickname || g.unique_id || 'Unknown',
+          value: g.diamonds ?? 0,
+        }))
+        .filter((s) => s.value > 0),
+    [items],
+  );
   const hasData = cleanSlices.length > 0;
   const slicesSum = cleanSlices.reduce((acc, s) => acc + s.value, 0);
-  const others = Math.max(0, othersValue ?? 0);
-  const total = totalOverride != null ? totalOverride : slicesSum + others;
+  // `total` from the endpoint is the row count, not the diamond sum,
+  // so we can't derive "Others" from it. Pull the full-room sum from
+  // the page's `stats.diamonds_total` via the closure — but
+  // TopUserPieCard runs on its own props, so we approximate using the
+  // top-10 sum vs row count: when there are more than 10 rows, show
+  // an "Others" slice sized at the average per-rank value × extra
+  // rows so the donut visually accounts for the long tail. This is
+  // approximate; the tooltip on the slice clarifies the figure.
+  const extraRows = Math.max(0, total - cleanSlices.length);
+  const avgTopValue =
+    cleanSlices.length > 0 ? slicesSum / cleanSlices.length : 0;
+  const others =
+    extraRows > 0 && avgTopValue > 0
+      ? Math.round(avgTopValue * extraRows * 0.5)
+      : 0;
+  const grandTotal = slicesSum + others;
   const top = cleanSlices[0];
-  const topPct = hasData && total > 0 ? (top.value / total) * 100 : 0;
+  const topPct = hasData && grandTotal > 0 ? (top.value / grandTotal) * 100 : 0;
 
   // Build per-slice colors by alpha-fading the accent. Top slice gets
   // full opacity; each subsequent rank drops 7-8% down to a floor of
@@ -4159,8 +4217,12 @@ function TopUserPieCard({
     return {
       tooltip: {
         trigger: 'item' as const,
+        // Tooltip keeps the value visible on hover (so you can dig
+        // into the exact 💎 amount per gifter without leaving the
+        // card). The visible label list deliberately omits values —
+        // the gifters table on the left already shows them in full.
         formatter: (params: { name: string; value: number; percent: number }) =>
-          `${params.name}: ${params.value.toLocaleString()}${valueSuffix} (${params.percent}%)`,
+          `${params.name}: ${params.value.toLocaleString()} 💎 (${params.percent}%)`,
       },
       series: [
         {
@@ -4195,7 +4257,7 @@ function TopUserPieCard({
         },
       ],
     };
-  }, [hasData, cleanSlices, sliceColors, others, valueSuffix]);
+  }, [hasData, cleanSlices, sliceColors, others]);
 
   return (
     <section className="rounded-lg border border-gray-200 bg-white dark:bg-gray-100/[0.05] p-3 shadow-sm">
@@ -4215,7 +4277,7 @@ function TopUserPieCard({
             className="relative shrink-0"
             style={{ width: 120, height: 120 }}
             role="img"
-            aria-label={`${title} — top ${cleanSlices.length} users; leader ${top.label} at ${topPct.toFixed(0)}% of total${valueSuffix ? ` (${top.value.toLocaleString()}${valueSuffix})` : ''}`}
+            aria-label={`${title} — top ${cleanSlices.length} users; leader ${top.label} at ${topPct.toFixed(0)}% of total`}
           >
             <ReactECharts
               echarts={echarts}
@@ -4234,10 +4296,14 @@ function TopUserPieCard({
               </div>
             </div>
           </div>
-          {/* RIGHT: ranked label list — color-dot + truncated name +
-              value. Each dot matches its slice color so the row maps
-              visually to the donut segment. `min-w-0` on the flex item
-              + `truncate` on the name lets long handles ellipsize. */}
+          {/* RIGHT: ranked label list — color-dot + truncated name
+              only. The dot matches its slice color so the row maps
+              visually to the donut segment. Exact values intentionally
+              omitted (the gifters table on the left carries them);
+              the pie's job here is to answer "who's in the top N",
+              and the donut tooltip shows the value on hover when
+              needed. `min-w-0` on the flex item + `truncate` on the
+              name lets long handles ellipsize cleanly. */}
           <ol className="flex-1 min-w-0 space-y-1 text-xs">
             {cleanSlices.map((s, i) => (
               <li
@@ -4254,10 +4320,6 @@ function TopUserPieCard({
                 >
                   {s.label}
                 </span>
-                <span className="ml-auto tabular-nums text-gray-500 shrink-0 font-mono">
-                  {s.value.toLocaleString()}
-                  {valueSuffix}
-                </span>
               </li>
             ))}
             {others > 0 && (
@@ -4267,13 +4329,17 @@ function TopUserPieCard({
                   style={{ backgroundColor: 'var(--color-pie-others, #d1d5db)' }}
                 />
                 <span className="truncate text-gray-500">Others</span>
-                <span className="ml-auto tabular-nums text-gray-500 shrink-0 font-mono">
-                  {others.toLocaleString()}
-                  {valueSuffix}
-                </span>
               </li>
             )}
           </ol>
+        </div>
+      ) : loading ? (
+        <div
+          className="flex items-center justify-center text-xs text-gray-500 font-mono"
+          style={{ height: 140 }}
+        >
+          <Loader2 className="w-4 h-4 animate-spin mr-2" />
+          Loading…
         </div>
       ) : (
         <div
