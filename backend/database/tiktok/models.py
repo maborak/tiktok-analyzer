@@ -132,6 +132,25 @@ class SubscriptionModel(Base):
     current_room_id = Column(BigInteger, nullable=True)
     # Last error message from the scraper, if the most recent attempt failed.
     profile_error = Column(Text, nullable=True)
+    # Owner — who pays the 1 credit + sees this sub in their user
+    # dashboard. Pre-existing rows were backfilled to the admin user
+    # by the `add_tiktok_subscription_ownership` migration. Admin sees
+    # every sub via `/admin/tiktok/all-subscriptions`; regular users
+    # only see rows where `owner_user_id = current_user.id`.
+    owner_user_id = Column(
+        Integer,
+        ForeignKey("users.id"),
+        nullable=False,
+        index=True,
+    )
+    # When this monitor was added. Source of truth for the 24 h
+    # refund window on remove — if `NOW() - added_at < 24h`, the
+    # remove path returns the credit to the user's ledger.
+    added_at = Column(
+        DateTime(timezone=True),
+        server_default=func.current_timestamp(),
+        nullable=False,
+    )
     created_at = Column(DateTime(timezone=True), server_default=func.current_timestamp(), nullable=False)
     updated_at = Column(
         DateTime(timezone=True),
@@ -197,9 +216,17 @@ class TikTokViewerModel(Base):
     # under. Append-only. Surfaced as small badges next to the real
     # name on the profile modal so the operator can recognise which
     # placeholder identities map back to which real user.
+    # `default=list` removed deliberately: the schema_checker.py
+    # validator (utils/database/schema_checker.py:331) prefers
+    # `Column.default` over `server_default` when comparing against
+    # the live DB, and a Python-callable `default` (list) can't be
+    # equated to the DB's `'[]'::jsonb` — startup blocks with
+    # "Critical column changes". The DB-side `server_default="[]"`
+    # covers the only inserts that omit the field; every persistence
+    # write-path here passes `enigma_aliases=...` explicitly anyway.
     enigma_aliases = Column(
         JSONB().with_variant(Text(), "sqlite"),
-        nullable=False, server_default="[]", default=list,
+        nullable=False, server_default="[]",
     )
 
 

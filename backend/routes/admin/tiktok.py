@@ -263,6 +263,79 @@ async def list_lives(
     return await svc.list_subscriptions()
 
 
+@router.get("/all-subscriptions")
+async def list_all_subscriptions(
+    q: Optional[str] = Query(
+        None,
+        description=(
+            "Substring match on handle, nickname, or owner email "
+            "(case-insensitive)."
+        ),
+    ),
+    owner_user_id: Optional[int] = Query(
+        None,
+        description="Narrow to one owner. Pair with the users endpoint to drive a dropdown.",
+    ),
+    is_public: Optional[bool] = Query(
+        None,
+        description="Filter by public-opt-in. Drives the public-only filter toggle.",
+    ),
+    enabled: Optional[bool] = Query(
+        None,
+        description="Filter by enabled/disabled state.",
+    ),
+    sort: str = Query(
+        "unique_id",
+        regex="^(unique_id|added_at|owner_email|follower_count)$",
+        description="Sort key. Defaults to alpha on handle.",
+    ),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+):
+    """Admin god-view of every TikTok subscription on the install.
+    Returns `{items, total, limit, offset, filters}` for a paginated
+    datatable. Unlike `/admin/tiktok/lives` (which returns the
+    operator's own dashboard slice), this surfaces every user's
+    monitored handles + their owning user's email so the admin can
+    see who's monitoring what, search across owners, and drive the
+    Make-Public toggle (admin-only) from a single page.
+
+    The user-facing `/tiktok/lives` endpoint returns ONLY the caller's
+    own subs — admins use THIS endpoint to see the cross-user list.
+    """
+    svc = _require_service()
+    pers = getattr(svc, "_persistence", None)
+    if pers is None or not hasattr(pers, "list_all_subscriptions_admin"):
+        raise HTTPException(
+            status_code=503,
+            detail="All-subscriptions view unavailable (persistence adapter missing method)",
+        )
+    items, total = await asyncio.to_thread(
+        pers.list_all_subscriptions_admin,
+        q=q,
+        owner_user_id=owner_user_id,
+        is_public=is_public,
+        enabled=enabled,
+        sort=sort,
+        limit=limit,
+        offset=offset,
+    )
+    return {
+        "items":  items,
+        "total":  total,
+        "limit":  limit,
+        "offset": offset,
+        "filters": {
+            "q": q,
+            "owner_user_id": owner_user_id,
+            "is_public": is_public,
+            "enabled": enabled,
+            "sort": sort,
+        },
+    }
+
+
 @router.get("/lookup", response_model=HandleLookupResponse)
 async def lookup_handle(
     handle: str = Query(..., min_length=1, max_length=64, description="@handle to preview"),
@@ -282,8 +355,13 @@ async def create_live(
     profile_payload = (
         req.profile.model_dump(exclude_none=True) if req.profile else None
     )
+    # Admin-created subs are owned by the admin themselves (no credit
+    # debit on this path — admin acquisition is free). User-facing
+    # /tiktok/subscriptions path does the credit debit at the route
+    # level. The admin all-subs view can re-assign ownership later.
     sub = await svc.create_subscription(
         req.username,
+        owner_user_id=int(_user.user.id),
         enabled=req.enabled,
         profile=profile_payload or None,
     )
@@ -359,8 +437,12 @@ async def delete_live(
     _user: AuthContext = Depends(rbac.require("admin:write")),
 ):
     svc = _require_service()
-    ok = await svc.delete_subscription(handle)
-    if not ok:
+    # Admin delete path — no refund (the admin all-subs view is the
+    # operator's tool, not a self-service surface). The user-facing
+    # /tiktok/subscriptions/{handle} DELETE path is where the 24-h
+    # refund window applies, since users pay credits there.
+    result = await svc.delete_subscription(handle)
+    if not result["deleted"]:
         raise HTTPException(status_code=404, detail="subscription not found")
     return {"ok": True}
 

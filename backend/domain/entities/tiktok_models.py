@@ -73,6 +73,11 @@ class Subscription:
     live_checked_at: datetime | None = None
     current_room_id: int | None = None
     profile_error: str | None = None
+    # Who added this monitor + when. `owner_user_id` is FK to `users.id`;
+    # `added_at` is used to evaluate the 24 h refund window when the
+    # owner removes the monitor.
+    owner_user_id: int | None = None
+    added_at: datetime | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 

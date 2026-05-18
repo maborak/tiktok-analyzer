@@ -64,8 +64,18 @@ def setup_routes(
     if credit_service:
         auth.credit_service = credit_service
 
-    # Set user dependencies
-    user.set_dependencies(data_persistence_adapter, auth_service=auth_service, ticket_service=ticket_service, payment_service=payment_service)
+    # Set user dependencies. `tiktok_service` + `credit_service` thread
+    # through for the /tiktok/* user-facing monitoring product (added
+    # 2026-05-18 — users pay 1 credit per monitor, refundable within
+    # 24h).
+    user.set_dependencies(
+        data_persistence_adapter,
+        auth_service=auth_service,
+        ticket_service=ticket_service,
+        payment_service=payment_service,
+        tiktok_service=tiktok_service,
+        credit_service=credit_service,
+    )
 
     # Set webhooks dependencies
     admin.set_dependencies(

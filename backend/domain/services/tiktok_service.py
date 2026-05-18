@@ -1576,10 +1576,19 @@ class TikTokService:
         self,
         unique_id: str,
         *,
+        owner_user_id: int,
         enabled: bool = True,
         profile: dict[str, Any] | None = None,
     ) -> Subscription:
-        """Create + start a new subscription.
+        """Create + start a new subscription owned by `owner_user_id`.
+
+        `owner_user_id` is required — every monitor must have an
+        owner (admin or regular user). Callers in routes/admin/*
+        pass the admin's id; callers in routes/user/* pass the
+        authenticated user's id. The route layer is also responsible
+        for the credit debit (1 credit per add for user-owned subs);
+        this method only writes the row. If the route already
+        debited and this call raises, the route must refund.
 
         When `profile` is provided (from the Add-Live lookup the
         frontend already paid for), seed the cached profile fields
@@ -1589,7 +1598,9 @@ class TikTokService:
         refresh (1h cadence) will overwrite with fresh data anyway.
         """
         unique_id = self._normalize(unique_id)
-        sub = self._persistence.upsert_subscription(unique_id, enabled=enabled)
+        sub = self._persistence.upsert_subscription(
+            unique_id, enabled=enabled, owner_user_id=owner_user_id,
+        )
         seeded_from_lookup = False
         if profile:
             try:
@@ -1625,10 +1636,43 @@ class TikTokService:
             await self._stop_session(unique_id)
         return sub
 
-    async def delete_subscription(self, unique_id: str) -> bool:
+    async def delete_subscription(self, unique_id: str) -> dict[str, Any]:
+        """Delete a subscription. Returns enough info for the route to
+        decide whether to refund the credit:
+
+          {
+            "deleted":           bool,    # row was removed
+            "owner_user_id":     int|None, # owner before delete (None if not found)
+            "within_refund_window": bool,  # added_at > now - 24h
+          }
+
+        The route is the billing composition point:
+          - user route: refund via credit_service if within window.
+          - admin route: typically NO refund (admin deletes don't
+            reimburse the original owner).
+        """
         unique_id = self._normalize(unique_id)
+        # Read the sub BEFORE deleting so we can compute the refund
+        # window — once it's gone, `added_at` is unrecoverable.
+        sub = self._persistence.get_subscription(unique_id)
+        within_window = False
+        owner_id: int | None = None
+        if sub is not None:
+            owner_id = sub.owner_user_id
+            if sub.added_at is not None:
+                added = sub.added_at
+                if added.tzinfo is None:
+                    added = added.replace(tzinfo=timezone.utc)
+                within_window = (
+                    datetime.now(timezone.utc) - added
+                ) < timedelta(hours=24)
         await self._stop_session(unique_id)
-        return self._persistence.delete_subscription(unique_id)
+        deleted = self._persistence.delete_subscription(unique_id)
+        return {
+            "deleted": bool(deleted),
+            "owner_user_id": owner_id,
+            "within_refund_window": within_window,
+        }
 
     def set_subscription_public(self, unique_id: str, is_public: bool) -> dict[str, Any]:
         """Flip the public flag for `unique_id`. Returns the updated

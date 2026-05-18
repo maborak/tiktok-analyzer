@@ -27,6 +27,12 @@ class LedgerSource(str, Enum):
     PURCHASE = "purchase"
     ADMIN_GRANT = "admin_grant"
     TRACK_PRODUCT = "track_product"
+    # TikTok-monitor product: user adds a handle to monitor → 1 credit
+    # debit (amount=-1, source=MONITOR_TIKTOK). If they remove the
+    # monitor within 24 h, a positive entry with source
+    # MONITOR_TIKTOK_REFUND restores the credit.
+    MONITOR_TIKTOK = "monitor_tiktok"
+    MONITOR_TIKTOK_REFUND = "monitor_tiktok_refund"
 
 @dataclass
 class CreditPackage:

@@ -189,6 +189,8 @@ def _sub_to_dataclass(m: SubscriptionModel) -> Subscription:
         is_live=getattr(m, "is_live", None),
         live_checked_at=getattr(m, "live_checked_at", None),
         current_room_id=getattr(m, "current_room_id", None),
+        owner_user_id=getattr(m, "owner_user_id", None),
+        added_at=getattr(m, "added_at", None),
         created_at=m.created_at,
         updated_at=m.updated_at,
     )
@@ -319,6 +321,119 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                 q = q.filter(SubscriptionModel.enabled.is_(True))
             return [_sub_to_dataclass(r) for r in q.order_by(SubscriptionModel.unique_id).all()]
 
+    def list_all_subscriptions_admin(
+        self,
+        *,
+        q: Optional[str] = None,
+        owner_user_id: Optional[int] = None,
+        is_public: Optional[bool] = None,
+        enabled: Optional[bool] = None,
+        sort: str = "unique_id",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Admin god-view of every subscription on the install, plus
+        the owning user's email so the admin datatable can render
+        ownership inline.
+
+        Returns `(rows, total_count_before_pagination)`. Each row is a
+        plain dict so the admin route can serialise it directly:
+
+            {
+              "unique_id":       "...",
+              "owner_user_id":   1,
+              "owner_email":     "wilmer@maborak.com",
+              "added_at":        "2026-05-18T...",
+              "is_public":       true,
+              "enabled":         true,
+              "nickname":        "...",
+              "follower_count":  12345,
+              "is_live":         false,
+              "current_room_id": null,
+            }
+
+        Filters (all optional):
+          q              — case-insensitive substring on unique_id /
+                           nickname / email.
+          owner_user_id  — narrow to one owner.
+          is_public      — narrow to opted-public subs.
+          enabled        — narrow to enabled / disabled.
+        Sort: unique_id | added_at | owner_email | follower_count.
+        """
+        # Whitelist sort keys to prevent SQL injection through a free-
+        # form sort parameter. Each maps to the actual SQL expression.
+        sort_map = {
+            "unique_id":       "s.unique_id ASC",
+            "added_at":        "s.added_at DESC NULLS LAST",
+            "owner_email":     "u.email ASC NULLS LAST",
+            "follower_count":  "COALESCE(s.follower_count, 0) DESC",
+        }
+        sort_sql = sort_map.get(sort, sort_map["unique_id"])
+
+        # Build filter clause + params. Use raw SQL because we need a
+        # JOIN to `users` for the owner email + filter against it.
+        where: list[str] = ["1=1"]
+        params: dict[str, Any] = {"limit": int(limit), "offset": int(offset)}
+        if q:
+            where.append(
+                "(s.unique_id ILIKE :q OR s.nickname ILIKE :q OR u.email ILIKE :q)"
+            )
+            params["q"] = f"%{q}%"
+        if owner_user_id is not None:
+            where.append("s.owner_user_id = :owner_user_id")
+            params["owner_user_id"] = int(owner_user_id)
+        if is_public is not None:
+            where.append("s.is_public = :is_public")
+            params["is_public"] = bool(is_public)
+        if enabled is not None:
+            where.append("s.enabled = :enabled")
+            params["enabled"] = bool(enabled)
+        where_sql = " AND ".join(where)
+
+        with self._get_session() as s:
+            if not self._is_postgres():
+                # SQLite dev: ILIKE doesn't exist; swap to LIKE +
+                # lower(). Same correctness, slightly different syntax.
+                where_sql = where_sql.replace("ILIKE", "LIKE")
+
+            total = s.execute(text(
+                f"SELECT COUNT(*) FROM tiktok_subscriptions s "
+                f"LEFT JOIN users u ON u.id = s.owner_user_id "
+                f"WHERE {where_sql}"
+            ), params).scalar() or 0
+
+            rows = s.execute(text(f"""
+                SELECT s.unique_id, s.owner_user_id, u.email AS owner_email,
+                       s.added_at, s.is_public, s.enabled,
+                       s.nickname, s.avatar_url, s.follower_count,
+                       s.is_live, s.current_room_id
+                FROM tiktok_subscriptions s
+                LEFT JOIN users u ON u.id = s.owner_user_id
+                WHERE {where_sql}
+                ORDER BY {sort_sql}
+                LIMIT :limit OFFSET :offset
+            """), params).mappings().all()
+
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            added = r["added_at"]
+            out.append({
+                "unique_id":       r["unique_id"],
+                "owner_user_id":   r["owner_user_id"],
+                "owner_email":     r["owner_email"],
+                "added_at":        added.isoformat() if added is not None else None,
+                "is_public":       bool(r["is_public"]),
+                "enabled":         bool(r["enabled"]),
+                "nickname":        r["nickname"],
+                "avatar_url":      r["avatar_url"],
+                "follower_count":  r["follower_count"],
+                "is_live":         r["is_live"],
+                "current_room_id": (
+                    str(r["current_room_id"]) if r["current_room_id"] is not None else None
+                ),
+            })
+        return out, int(total)
+
     def get_subscriptions_by_user_ids(self, user_ids: list[int]) -> dict[int, Subscription]:
         if not user_ids:
             return {}
@@ -335,14 +450,36 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
             row = s.query(SubscriptionModel).filter_by(unique_id=unique_id).one_or_none()
             return _sub_to_dataclass(row) if row else None
 
-    def upsert_subscription(self, unique_id: str, *, enabled: bool = True) -> Subscription:
+    def upsert_subscription(
+        self,
+        unique_id: str,
+        *,
+        enabled: bool = True,
+        owner_user_id: int | None = None,
+    ) -> Subscription:
+        """Upsert a subscription row.
+
+        `owner_user_id` — REQUIRED on insert (the schema enforces NOT
+        NULL). On update of an existing row, leave the owner unchanged
+        (we never re-assign ownership through the upsert path; admin
+        all-subs view will have a dedicated re-assign endpoint if we
+        ever need it). When `owner_user_id` is None at insert time we
+        fall through to the schema NOT NULL constraint, which raises
+        a clear DB error.
+        """
         with self._get_session() as s:
             row = s.query(SubscriptionModel).filter_by(unique_id=unique_id).one_or_none()
             if row is None:
-                row = SubscriptionModel(unique_id=unique_id, enabled=enabled)
+                row = SubscriptionModel(
+                    unique_id=unique_id,
+                    enabled=enabled,
+                    owner_user_id=owner_user_id,
+                )
                 s.add(row)
             else:
                 row.enabled = enabled
+                # Never overwrite owner_user_id on existing rows — only
+                # the admin re-assign endpoint should change ownership.
             s.commit()
             s.refresh(row)
             return _sub_to_dataclass(row)
