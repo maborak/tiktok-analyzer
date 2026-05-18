@@ -6,20 +6,21 @@ Session` block below is rewritten on every `/session-commit` run.
 ---
 
 ## Last Session
-Date: 2026-05-15
+Date: 2026-05-18
 Branch: fix/euler-quota-burn
-Summary: Lives-list cold-mount overhauled from 29.4 s to 667 ms (44×) via `tiktok_room_stats` write-time pre-agg, `wk_diam` switched to `tiktok_event_hour_counts.diamonds`, public route `async def` + `Cache-Control: public, max-age=15`, WS `seedVersions` on reconnect, and `GET /admin/tiktok/cache/stats` hit/miss observability. Doc at `docs/antigravity/db_perf_2026_05_15_phase9.md`.
+Summary: Tier 1–3 service-layer caching across ~20 TikTok read methods + L2 DB-backed cache tables for `host_calendar` and `room_stats` + `warm-caches` CLI daemon + every fix from the multi-agent `/audit` (2 CRITICAL, 5 HIGH, 8 MEDIUM, 5 LOW). Headline: `host_calendar` 2,880 ms → 4 ms L2 hit (~700×); singleflight collapses 10-thread stampede on `list_enigma_viewers` from ~7,500 ms to ~288 ms wall-clock. Commit `1442f4a`.
 
 ### Remaining Work
 
-- **Restart `run-listener` worker + re-run `add_tiktok_room_stats.py`** — the worker (PID 57440, started before this session) still runs the old persistence code, so `_bump_room_stats` doesn't fire on new events. Reads work (backfill in place); the idempotent backfill re-run bridges the gap after worker restart. Worker is user-controlled; I won't restart it.
-- **Multi-agent audit of Phase 9 implementation** — user's NEXT request after commit. Review the new write path (`_bump_room_stats` + tuple return from `_bump_event_hour_count`), WS hook `seedVersions`, public route async + cache-header change, singleflight, and migration safety for missed bugs / regressions.
-- **CTE long-running-room blind spot** — `_week_calendar_cached`, `_lives_summary_hourly`, `_daily_buckets_cached` all bound rooms by `first_seen_at > NOW() - INTERVAL '...'`. Add `OR ended_at IS NULL` to cover marathon broadcasters. Low impact today, important before scale.
-- **SQLite dialect guards** — `_lives_summary_hourly` + `_daily_buckets_cached` else-branch use Postgres-only syntax (`ANY(:hs)`, `NOW()`, `INTERVAL`) without `_is_postgres()` early-return. Errors on a SQLite dev DB with multi-handle queries.
+- **Push the branch** — `fix/euler-quota-burn` has 10+ unpushed commits including the big `1442f4a` audit-fix commit. `git push origin fix/euler-quota-burn` when ready.
+- **Restart uvicorn + run new migrations** — the API process needs a restart to pick up the cache code. Two new migrations (`add_tiktok_host_calendar_cache.py`, `add_tiktok_room_stats_cache.py`) need running before the cache tables exist. Both idempotent. Also re-run any worker-mode `run-listener` since persistence layer changed.
+- **Optional: start `./build.sh cache-warmer` daemon** — proactively populates the `tiktok_host_calendar_cache` L2 table so the first page-load of any host is already warm. Without it, the API lazily fills the cache on first hit (still <1 s per host on cold L2).
+- **CTE long-running-room blind spot** — `_week_calendar_cached`, `_lives_summary_hourly`, `_daily_buckets_cached` bound rooms by `first_seen_at > NOW() - INTERVAL '...'`. Add `OR ended_at IS NULL` for marathon broadcasters. Low impact today.
+- **SQLite dialect guards** — `_lives_summary_hourly` + `_daily_buckets_cached` else-branch use PG-only syntax (`ANY(:hs)`, `NOW()`, `INTERVAL`) without `_is_postgres()` early-return. Errors on SQLite dev DB with multi-handle queries.
 - **2v2 / 3v3 rival rendering** — multiple rival anchors sharing a team duplicate the team score across `<BattlerCard>`s. Group by `team_id`, render one card per rival team with members inside.
-- **Popular-Vote / anonymous-recipient gift attribution** — multi-guest battles where `to_user.user_id=0` and `team_id` is absent can't be attributed per-anchor. Defer until operator need emerges. (STALE — fourth session.)
+- **Popular-Vote / anonymous-recipient gift attribution** — multi-guest battles where `to_user.user_id=0` and `team_id` is absent can't be attributed per-anchor. Defer until operator need emerges. (STALE — fifth session.)
 - **UI features pending from earlier sessions**: viewer-count sparkline (RoomUserSeqEvent), live captions panel, polls widget, Q&A inbox, stream-uptime panel (LivePauseEvent/LiveUnpauseEvent). Backend capture only — frontend rendering surface still missing.
-- **WAF-probe modal verification** — probe-debug pipeline complete (worker_log persistence + modal UI). Pending: trigger a refresh on a WAF-blocked handle and confirm the "Recent probe events from worker_log" panel populates.
+- **WAF-probe modal verification** — probe-debug pipeline complete. Pending: trigger a refresh on a WAF-blocked handle and confirm the "Recent probe events from worker_log" panel populates.
 
 ---
 

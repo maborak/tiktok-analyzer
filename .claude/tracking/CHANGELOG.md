@@ -5,6 +5,87 @@ Format: https://keepachangelog.com/en/1.0.0/
 
 ---
 
+## [Unreleased] — 2026-05-18
+
+> Commit: `1442f4a` — 39 files / +6,154 / −710. Tier 1–3 caching
+> overhaul across the TikTok read surface + every fix from the
+> multi-agent `/audit` run (2 CRITICAL, 5 HIGH, 8 MEDIUM, 5 LOW).
+
+### Backend
+
+- **Service-layer L1 caches** for ~20 read methods covering room
+  stats, gifter ledger, enigma roster, match endpoints, public
+  resolvers, daily series, host-rooms-with-totals. TTLs 15–120 s
+  with frozen-when-immutable semantics. Singleflight locks on the
+  four heavy ones (`get_room_stats`, `list_enigma_viewers`,
+  `get_common_gifters`, `get_cross_live_gifters_for_host`) — verified
+  10 concurrent threads collapse to 1 cold compute (~288 ms vs
+  ~2,870 ms expected without locking).
+- **Two new DB-backed L2 cache tables** survive uvicorn restart and
+  serve operators across worker processes:
+  `tiktok_host_calendar_cache` (per host × tz × day, frozen past +
+  5-min TTL today) and `tiktok_room_stats_cache` (immutable windows
+  only). Both have idempotent migrations.
+  Big-O wins on real data: host_calendar **2,880 ms → 4 ms L2 hit
+  (~700×)**; cold-load full warm of 101 hosts × 184 days in 72 s.
+- **`python cli.py system tiktok warm-caches`** new CLI proactively
+  populates the host_calendar L2. Watch-mode daemon with
+  `--watch --interval`, `--force`, `--host`, repeatable `--tz`.
+  Reuses one adapter across ticks; `signal.Event.wait` instead of
+  sleep-loop. `./build.sh cache-warmer` wraps it.
+- **Public surface fully async**: all 22 `def public_*` handlers
+  converted to `async def` + `asyncio.to_thread` for SQL work.
+  Resolvers (`_resolve_public_host`/`_resolve_public_room`/
+  `_resolve_public_match`/`_resolve_public_room_set`) now async too.
+  Eliminates the threadpool pile-up that produced 10–44 s p95 spikes
+  under concurrent load.
+- **Audit fixes**: C1 cache mutation poisoning across admin/public
+  (shallow-copy on read); C2 `host_calendar` tz cache-key built
+  before validation (moved inside session block); H1
+  `set_subscription_public` invalidates `_public_subscription_cache`;
+  H2 FIFO `_cap_cache` helper caps high-cardinality caches at 5,000
+  entries; H3 `active_match` extracted from cache (computed fresh
+  every return so battle start is never hidden by the 15 s TTL);
+  H4 JSONB columns add `.with_variant(Text(), "sqlite")` for dev
+  parity; M5 documented orphan-closed-match cache limitation;
+  M6 dropped frozen heuristic on H2H caches (set grows over time);
+  M7 `common_gifter_detail` TTL 60 s → 15 s (cross-process
+  invalidation impossible); L1 `match_diamonds_totals` dedupes
+  input ids; L2 `_perf_persister` caches resolved adapter.
+- **Pre-existing folded in**: `add_viewer_is_enigma` + `add_viewer_enigma_aliases`
+  migrations, `tiktok_state_ticker` updates, perf-tracer middleware
+  + module-level `cache_hit`/`cache_miss` helpers, `_FakeTikTokService`
+  test fake now mirrors real `sanitize_cached_snapshot` strip.
+
+### Frontend
+
+- **New pages**: `/admin/tiktok/enigmas` (paginated Enigma viewer
+  ledger with filter+sort), `/admin/tiktok/perf` (perf-trace
+  inspector with expandable span breakdown).
+- **DebugLabel overlay component** — operator-toggleable
+  per-component label codes so screenshots can reference UI
+  regions by ID. MutationObserver-driven, click-to-blink, copy
+  to clipboard.
+- **TikTokGifterDetailModal** "Seen as (N): [Enigma X][Enigma Y]"
+  alias surfacing on profile header.
+- **TikTokRoomGiftersTable** per-room Enigma badges on rows where
+  the gift arrived under a mask.
+- **TikTokLiveDetail** — heavy children memoized via `React.memo`;
+  removed dead Recent-activity section; `useCallback` wrapper on
+  click handlers for prop stability.
+
+### Tooling / Docs
+
+- `/audit` slash command — new landmines in catalogue:
+  cache-mutation-poisoning, tz-cache-key-before-validation,
+  async-route-calling-sync-svc, new-shared-component-without-migration,
+  react-hook-imports.
+- `MEMORY.md` updated with cross-process cache-invalidation rule.
+- `build.sh cache-warmer` target with env-var tuning
+  (`CACHE_WARMER_INTERVAL`, `CACHE_WARMER_TZS`).
+
+---
+
 ## [Unreleased] — 2026-05-15
 
 > Commit: `260dbfb` — 23 files / +1,792 / −295. Lives-list cold-mount
