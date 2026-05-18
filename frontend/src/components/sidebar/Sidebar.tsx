@@ -122,6 +122,11 @@ const adminTikTokSection: NavigationSection = {
   items: [
     { name: 'Dashboard',   href: `/admin/tiktok/dashboard`,   icon: BarChart3 },
     { name: 'Lives',       href: `/admin/tiktok`,             icon: Radio, end: true },
+    // All-Subscriptions — every user's monitored handles. The
+    // "Make Public" admin-only toggle lives here per-row (was
+    // historically sprinkled across multiple user-facing surfaces
+    // before the per-user monetised monitoring pivot).
+    { name: 'All Subscriptions', href: `/admin/tiktok/all-subscriptions`, icon: Layers },
     { name: 'History',     href: `/admin/tiktok/history`,     icon: History },
     { name: 'Gifts',       href: `/admin/tiktok/gifts`,       icon: Gift },
     { name: 'Enigmas',     href: `/admin/tiktok/enigmas`,     icon: VenetianMask },
@@ -146,6 +151,20 @@ const userSection: NavigationSection = {
   items: [
     { name: 'My Account', href: '/account', icon: User, end: true },
     { name: 'Recipients', href: `/account/recipients`, icon: UserPlus },
+  ],
+};
+
+// User-facing TikTok product: monetised monitoring. Distinct from
+// the admin TikTok section (which is the operator god view); a
+// regular user sees ONLY this section, never the admin one. Admin
+// users see both — the admin section under "Admin · TikTok" gives
+// them the cross-user surface, and this section is their personal
+// monitoring list.
+const tiktokUserSection: NavigationSection = {
+  title: 'TikTok',
+  key: 'user-tiktok',
+  items: [
+    { name: 'My Monitors', href: `/tiktok`, icon: Radio, end: true },
   ],
 };
 
@@ -364,6 +383,7 @@ export function Sidebar({
       {isAuthenticated && (
         <>
           {renderSection(userSection, logoutButton)}
+          {renderSection(tiktokUserSection)}
           {renderSection(billingSection)}
           {renderSection(supportSection)}
         </>

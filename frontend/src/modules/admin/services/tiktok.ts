@@ -926,8 +926,64 @@ const BASE = '/admin/tiktok';
 
 // ─── API client ─────────────────────────────────────────────────────────────
 
+export interface AdminAllSubscriptionsRow {
+  unique_id: string;
+  owner_user_id: number;
+  owner_email: string | null;
+  added_at: string | null;
+  is_public: boolean;
+  enabled: boolean;
+  nickname: string | null;
+  avatar_url: string | null;
+  follower_count: number | null;
+  is_live: boolean | null;
+  current_room_id: string | null;
+}
+
+export interface AdminAllSubscriptionsResponse {
+  items: AdminAllSubscriptionsRow[];
+  total: number;
+  limit: number;
+  offset: number;
+  filters: {
+    q: string | null;
+    owner_user_id: number | null;
+    is_public: boolean | null;
+    enabled: boolean | null;
+    sort: string;
+  };
+}
+
 export const tiktokApi = {
   // Subscriptions
+
+  /** Admin all-subscriptions datatable — every user's monitored
+   *  handles + the owner's email. Drives /admin/tiktok/all-subscriptions.
+   *  The "Make Public" admin-only toggle calls
+   *  `setSubscriptionPublic(handle, is_public)` below. */
+  listAllSubscriptions(params: {
+    q?: string | null;
+    owner_user_id?: number | null;
+    is_public?: boolean | null;
+    enabled?: boolean | null;
+    sort?: 'unique_id' | 'added_at' | 'owner_email' | 'follower_count';
+    limit?: number;
+    offset?: number;
+  } = {}): Promise<AdminAllSubscriptionsResponse> {
+    return apiRequest({
+      method: 'GET',
+      url: `${BASE}/all-subscriptions`,
+      params: {
+        ...(params.q ? { q: params.q } : {}),
+        ...(params.owner_user_id != null ? { owner_user_id: params.owner_user_id } : {}),
+        ...(params.is_public != null ? { is_public: params.is_public } : {}),
+        ...(params.enabled != null ? { enabled: params.enabled } : {}),
+        ...(params.sort ? { sort: params.sort } : {}),
+        ...(params.limit != null ? { limit: params.limit } : {}),
+        ...(params.offset != null ? { offset: params.offset } : {}),
+      },
+    });
+  },
 
   listLives(): Promise<TikTokSubscription[]> {
     // 30s TTL cache + in-flight dedupe — multiple consumers
