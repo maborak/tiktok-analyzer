@@ -4,9 +4,40 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+
+
+# TikTok renders gifters who opt into anonymous gifting (a.k.a. the
+# "Enigma" mode) with a placeholder display name like "Enigma 9213"
+# while preserving the real `user_id` on the event payload. We detect
+# the placeholder, set a sticky `is_enigma` flag on the viewer row,
+# and AVOID overwriting any real nickname/avatar we already have.
+# Pattern: case-insensitive "Enigma" + one or more spaces + digits.
+# Anchored end-to-end so a real nickname containing "Enigma" as a
+# substring (e.g. "EnigmaPlayer123") doesn't false-positive.
+_ENIGMA_NICK_RE = re.compile(r"^enigma\s+\d+$", re.IGNORECASE)
+
+
+def _is_enigma_nick(nick: Optional[str]) -> bool:
+    if not nick:
+        return False
+    return bool(_ENIGMA_NICK_RE.match(nick.strip()))
+
+
+def _is_enigma_event(nick: Optional[str], uid: Optional[str]) -> bool:
+    """True ONLY when this event came from TikTok's anonymous-gifter
+    mode — both the displayed nickname AND the displayed unique_id
+    must be the placeholder string. When TikTok masks a user the
+    SAME placeholder ("Enigma NNN", with a space — never a valid
+    handle) is written to BOTH fields, so requiring both to match
+    rejects vanity users who legitimately chose a display name
+    like "Enigma 89757" while their `unique_id` remains a real
+    `@handle`. See `tiktok_viewers.is_enigma` for the sticky flag
+    and the migration history that backfilled it."""
+    return _is_enigma_nick(nick) and _is_enigma_nick(uid)
 
 
 def _utcnow() -> datetime:
@@ -74,6 +105,8 @@ from domain.entities.tiktok_models import (
     TikTokWorkerLog,
 )
 from ports.tiktok_persistence import TikTokPersistencePort
+from utils.perf_tracer import cache_hit as _perf_cache_hit
+from utils.perf_tracer import cache_miss as _perf_cache_miss
 
 logger = logging.getLogger(__name__)
 
@@ -543,6 +576,16 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
             )
             return [_room_to_dataclass(r) for r in q.all()]
 
+    # In-process cache of room_totals for ENDED broadcasts. Once a
+    # room ends (TikTok-flagged via `ended_at` OR our heuristic via
+    # `last_seen_at` older than 5 min), no new events can land in it
+    # so the diamonds / matches / likes counters are immutable.
+    # We compute each ended room's totals once and cache forever.
+    # Key shape: (room_id, since_iso_or_None, until_iso_or_None).
+    # Cleared on adapter rebuild (process restart) — that's fine,
+    # warm-up cost is one cold-load per ended room per process.
+    _room_totals_frozen_cache: dict[tuple[int, str | None, str | None], dict[str, int]] = {}
+
     def room_totals(
         self,
         room_ids: list[int],
@@ -568,6 +611,13 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
         nearest sample BEFORE the window — that yields the like
         increment that happened during the slice, matching what the
         chart will show.
+
+        Performance: events from past broadcasts NEVER change, so we
+        permanently cache totals for rooms with `ended_at IS NOT NULL`
+        OR `last_seen_at > 5 minutes ago`. Only currently-live rooms
+        (typically 0-2 per call on the detail page) go to SQL on each
+        request. For a 44-broadcast host this turns 451 ms into ~5 ms
+        in steady state.
         """
         out: dict[int, dict[str, int]] = {
             int(rid): {"diamonds": 0, "matches": 0, "likes": 0}
@@ -575,6 +625,39 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
         }
         if not room_ids:
             return out
+
+        # Pull cached "frozen" rooms FIRST so we only hit SQL for the
+        # rooms that actually need it (currently-live OR cache-miss).
+        since_iso = since.isoformat() if since else None
+        until_iso = until.isoformat() if until else None
+        uncached: list[int] = []
+        for rid in room_ids:
+            cached = self._room_totals_frozen_cache.get((int(rid), since_iso, until_iso))
+            if cached is not None:
+                out[int(rid)] = dict(cached)
+            else:
+                uncached.append(int(rid))
+        if uncached:
+            _perf_cache_miss("room_totals.frozen", n=len(uncached))
+        hit_count = len(room_ids) - len(uncached)
+        if hit_count:
+            _perf_cache_hit("room_totals.frozen", n=hit_count)
+        if not uncached:
+            return out
+
+        # Look up which of the uncached rooms are STILL LIVE. Anything
+        # not live is "ended" and its result will be cached permanently
+        # after this SQL pass.
+        live_now: set[int] = set()
+        with self._get_session() as s:
+            if self._is_postgres():
+                live_rows = s.execute(text("""
+                    SELECT room_id FROM tiktok_rooms
+                    WHERE room_id = ANY(:ids)
+                      AND ended_at IS NULL
+                      AND last_seen_at > NOW() - INTERVAL '5 minutes'
+                """), {"ids": uncached}).all()
+                live_now = {int(r.room_id) for r in live_rows}
         with self._get_session() as s:
             if self._is_postgres():
                 rows = s.execute(text("""
@@ -633,16 +716,28 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                     LEFT JOIN matches      m  ON m.room_id  = r.room_id
                     LEFT JOIN likes_window lw ON lw.room_id = r.room_id
                 """), {
-                    "ids": [int(x) for x in room_ids],
+                    "ids": uncached,
                     "since": since,
                     "until": until,
                 }).mappings().all()
                 for r in rows:
-                    out[int(r["room_id"])] = {
+                    rid_int = int(r["room_id"])
+                    totals = {
                         "diamonds": int(r["diamonds"] or 0),
-                        "matches": int(r["matches"] or 0),
-                        "likes": int(r["likes"] or 0),
+                        "matches":  int(r["matches"] or 0),
+                        "likes":    int(r["likes"] or 0),
                     }
+                    out[rid_int] = totals
+                    # Freeze the result for rooms that are NOT live.
+                    # Ended-or-stale rooms can't get new events, so
+                    # their totals are immutable for the lifetime of
+                    # this process. Subsequent calls for the same
+                    # (room_id, since, until) tuple short-circuit to
+                    # the cache lookup at the top of this method.
+                    if rid_int not in live_now:
+                        self._room_totals_frozen_cache[
+                            (rid_int, since_iso, until_iso)
+                        ] = dict(totals)
                 return out
 
             # SQLite fallback: three small Python passes.
@@ -677,6 +772,15 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                 out.setdefault(rid, {"diamonds": 0, "matches": 0, "likes": 0})
                 out[rid]["matches"] += 1
             return out
+
+    # Cache for `host_calendar` — bucket counts for past days never
+    # change, only today's row can grow. Short TTL on calls whose
+    # `until` is in the live window (default page-mount uses
+    # `now`); permanent freeze on calls whose `until` is already in
+    # the past (the day-picker / archive views). Cleared on process
+    # restart.
+    _host_calendar_cache: dict[tuple[str, str, str, str], tuple[float, list[dict[str, Any]]]] = {}
+    _HOST_CALENDAR_TTL_S = 300.0  # 5 min on live-window requests
 
     def host_calendar(
         self,
@@ -716,127 +820,122 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
         #      fall back to UTC so the heatmap renders empty cells
         #      instead of 500'ing the page.
         zone = _canonicalize_tz((tz or "UTC").strip() or "UTC")
+        cache_now = time.time()
+        is_archived = until < datetime.now(timezone.utc) - timedelta(days=1)
         with self._get_session() as s:
+            # Resolve zone BEFORE building the cache key. The
+            # `_is_pg_known_tz` fallback to "UTC" must not happen
+            # behind the cache's back — otherwise an unrecognised
+            # tz would compute UTC-bucketed data and stash it under
+            # the original tz key, serving the wrong answer for the
+            # life of the process. Cache lookup is intentionally
+            # inside the session block because the canonical key
+            # depends on the validated zone.
             if self._is_postgres() and not self._is_pg_known_tz(s, zone):
                 zone = "UTC"
+            cache_key = (
+                host_unique_id, since.isoformat(), until.isoformat(), zone,
+            )
+            hit = self._host_calendar_cache.get(cache_key)
+            if hit is not None:
+                ts_cached, val = hit
+                if is_archived or (cache_now - ts_cached) < self._HOST_CALENDAR_TTL_S:
+                    _perf_cache_hit("host_calendar.L1")
+                    return val
+            _perf_cache_miss("host_calendar.L1")
             if self._is_postgres():
-                # Raw SQL — every "what day is this in `:tz`?" bucket
-                # uses `date_trunc('day', col AT TIME ZONE :tz)`. The
-                # `room_days` CTE attributes a room to every day on
-                # which it had at least one event in zone, so a room
-                # that ran from 23:55 May 6 → 02:00 May 7 (zone) shows
-                # up in BOTH days' rows.
-                # Look up the host's TikTok user_id once — used by the
-                # `diamond_days` CTE to filter OUT gifts that landed in
-                # this host's room but were targeted at someone else
-                # (multi-host guest, PK opponent). Without this filter
-                # we credit @host with the rival anchor's diamonds when
-                # they share a room, inflating the daily total versus
-                # what TikTok's own per-host stat shows. NULL fallback:
-                # if we don't know the host's user_id (unprobed handle),
-                # count everything (legacy behaviour).
-                host_user_id_row = s.execute(text(
-                    "SELECT profile_user_id FROM tiktok_subscriptions "
-                    "WHERE unique_id = :host"
-                ), {"host": host_unique_id}).first()
-                host_user_id = (
-                    host_user_id_row.profile_user_id if host_user_id_row else None
+                # Two-tier caching:
+                #   L1 — in-memory exact-window dict (`_host_calendar_cache`)
+                #         keyed by (host, since, until, zone). Already
+                #         checked above; we get here only on L1 miss.
+                #   L2 — `tiktok_host_calendar_cache` table. Per-(host,
+                #         tz, day) row with `computed_at`. The CLI
+                #         warmer + the API both write here. We read
+                #         rows for the requested window, recompute
+                #         missing or stale days, UPSERT back, return.
+                days_in_window = self._host_calendar_days_in_zone(
+                    since, until, zone,
                 )
-                rows = s.execute(text("""
-                    WITH host_rooms AS (
-                      SELECT room_id, first_seen_at, last_seen_at
-                      FROM tiktok_rooms
-                      WHERE host_unique_id = :host
-                        AND first_seen_at <= :until
-                        AND COALESCE(last_seen_at, first_seen_at) >= :since
-                    ),
-                    room_days AS (
-                      SELECT DISTINCT
-                             e.room_id,
-                             date_trunc('day', e.ts AT TIME ZONE :tz) AS day
-                      FROM tiktok_events e
-                      WHERE e.room_id IN (SELECT room_id FROM host_rooms)
-                        AND e.ts >= :since AND e.ts <= :until
-                    ),
-                    diamond_days AS (
-                      SELECT date_trunc('day', e.ts AT TIME ZONE :tz) AS day,
-                             SUM(
-                               COALESCE(NULLIF(e.payload->>'diamond_count','')::int, 0)
-                               * COALESCE(NULLIF(e.payload->>'repeat_count','')::int, 1)
-                             ) AS diamonds
-                      FROM tiktok_events e
-                      WHERE e.type = 'gift'
-                        AND e.room_id IN (SELECT room_id FROM host_rooms)
-                        AND e.ts >= :since AND e.ts <= :until
-                        AND (
-                          -- Legacy fall-through: host_user_id NULL =
-                          -- unprobed handle, sum every gift (old behaviour).
-                          CAST(:host_user_id AS TEXT) IS NULL
-                          -- Match TikTok's per-host accounting:
-                          --   gift to host themselves OR
-                          --   gift with no specific recipient (popular
-                          --   vote / unattributed = goes to host).
-                          OR COALESCE(e.payload->'to_user'->>'user_id', '0')
-                             IN ('0', CAST(:host_user_id AS TEXT))
-                        )
-                      GROUP BY day
-                    ),
-                    match_days AS (
-                      SELECT date_trunc('day', m.started_at AT TIME ZONE :tz) AS day,
-                             COUNT(*) AS matches
-                      FROM tiktok_matches m
-                      WHERE m.room_id IN (SELECT room_id FROM host_rooms)
-                        AND m.started_at >= :since AND m.started_at <= :until
-                      GROUP BY day
-                    ),
-                    duration_days AS (
-                      -- Attribute the broadcast's wall-clock duration
-                      -- to the day it STARTED (in zone). Splitting at
-                      -- midnight is only worth the SQL when we expose
-                      -- per-day duration on cross-midnight rooms — the
-                      -- heatmap shows it as a single tooltip number,
-                      -- so this approximation is good enough.
-                      SELECT date_trunc('day', first_seen_at AT TIME ZONE :tz) AS day,
-                             SUM(GREATEST(0,
-                                EXTRACT(EPOCH FROM
-                                  (COALESCE(last_seen_at, first_seen_at) - first_seen_at)
-                                )
-                             )) AS duration_seconds
-                      FROM host_rooms
-                      GROUP BY day
+                cached = self._read_host_calendar_cache_rows(
+                    s, host_unique_id, zone, days_in_window,
+                )
+                today_in_zone = self._today_date_in_zone(zone)
+                stale_thresh = datetime.now(timezone.utc) - timedelta(
+                    seconds=self._HOST_CALENDAR_TTL_S,
+                )
+                # Decide which days need (re)computation. Past days
+                # are frozen — once cached they never recompute. Today
+                # has a 5-min TTL.
+                days_to_compute: list = []
+                l2_hits = 0
+                for day in days_in_window:
+                    row = cached.get(day)
+                    if row is None:
+                        days_to_compute.append(day)
+                    elif day >= today_in_zone and row["computed_at"] < stale_thresh:
+                        days_to_compute.append(day)
+                    else:
+                        l2_hits += 1
+                if l2_hits:
+                    _perf_cache_hit("host_calendar.L2", n=l2_hits)
+                if days_to_compute:
+                    _perf_cache_miss(
+                        "host_calendar.L2", n=len(days_to_compute),
                     )
-                    SELECT rd.day                          AS day,
-                           COUNT(DISTINCT rd.room_id)      AS rooms,
-                           COALESCE(MAX(dd.duration_seconds), 0) AS duration_seconds,
-                           COALESCE(MAX(d.diamonds), 0)     AS diamonds,
-                           COALESCE(MAX(mc.matches), 0)     AS matches
-                    FROM room_days rd
-                    LEFT JOIN diamond_days  d  ON d.day  = rd.day
-                    LEFT JOIN match_days    mc ON mc.day = rd.day
-                    LEFT JOIN duration_days dd ON dd.day = rd.day
-                    GROUP BY rd.day
-                    ORDER BY rd.day ASC
-                """), {
-                    "host": host_unique_id,
-                    "since": since,
-                    "until": until,
-                    "tz": zone,
-                    "host_user_id": str(host_user_id) if host_user_id else None,
-                }).mappings().all()
+
+                if days_to_compute:
+                    min_d = min(days_to_compute)
+                    max_d = max(days_to_compute)
+                    compute_since = self._zone_day_start_utc(min_d, zone)
+                    compute_until = self._zone_day_end_utc(max_d, zone)
+                    fresh = self._compute_host_calendar_window(
+                        s, host_unique_id, compute_since, compute_until, zone,
+                    )
+                    now_utc = datetime.now(timezone.utc)
+                    try:
+                        self._upsert_host_calendar_cache_rows(
+                            s, host_unique_id, zone,
+                            days_to_compute, fresh, now_utc,
+                        )
+                    except Exception:
+                        # Cache write is best-effort — never break the
+                        # read on a write failure. Log + carry on.
+                        logger.exception(
+                            "host_calendar: L2 UPSERT failed for host=%s",
+                            host_unique_id,
+                        )
+                    # Merge fresh into the working dict for response.
+                    for day in days_to_compute:
+                        p = fresh.get(day) or {
+                            "rooms": 0, "duration_seconds": 0,
+                            "diamonds": 0, "matches": 0,
+                        }
+                        cached[day] = {
+                            "rooms": int(p.get("rooms") or 0),
+                            "duration_seconds": int(p.get("duration_seconds") or 0),
+                            "diamonds": int(p.get("diamonds") or 0),
+                            "matches": int(p.get("matches") or 0),
+                            "computed_at": now_utc,
+                        }
+
+                # Build the response — only active days surface in the
+                # heatmap; quiet days are stored in the cache but
+                # filtered out of the API payload (existing contract).
                 out: list[dict[str, Any]] = []
-                for r in rows:
-                    d = r["day"]
-                    if d is None:
+                for day in days_in_window:
+                    row = cached.get(day)
+                    if not row or int(row.get("rooms") or 0) == 0:
                         continue
-                    if d.tzinfo is None:
-                        d = d.replace(tzinfo=timezone.utc)
                     out.append({
-                        "date": d.date().isoformat(),
-                        "rooms": int(r["rooms"] or 0),
-                        "duration_minutes": int((r["duration_seconds"] or 0) / 60),
-                        "diamonds": int(r["diamonds"] or 0),
-                        "matches": int(r["matches"] or 0),
+                        "date": day.isoformat(),
+                        "rooms": int(row["rooms"] or 0),
+                        "duration_minutes": int(
+                            (row.get("duration_seconds") or 0) / 60
+                        ),
+                        "diamonds": int(row.get("diamonds") or 0),
+                        "matches": int(row.get("matches") or 0),
                     })
+                self._host_calendar_cache[cache_key] = (cache_now, out)
                 return out
 
             # SQLite fallback: bucket in Python with a few smaller queries.
@@ -904,6 +1003,396 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                 bucket["matches"] += matches_per_room.get(int(r.room_id), 0)
             return [{"date": k, **v} for k, v in sorted(buckets.items())]
 
+    # ── host_calendar — L2 cache helpers ─────────────────────────────
+    #
+    # The DB-backed cache (`tiktok_host_calendar_cache`) stores one
+    # row per (host_unique_id, tz, day). Past days are frozen for the
+    # life of the install; today's row carries a 5-min TTL. The CLI
+    # `system tiktok warm-caches` populates rows proactively; the API
+    # populates lazily on cache miss. Both write via UPSERT, so
+    # `computed_at` is the freshness signal each side reads to decide
+    # if work is needed.
+
+    def _host_calendar_days_in_zone(
+        self,
+        since: datetime,
+        until: datetime,
+        zone: str,
+    ) -> list:
+        """Enumerate the calendar days that fall between `since` and
+        `until` once we project both bounds into `zone`. Returns a
+        list of `date` objects (in zone), ordered ascending."""
+        from datetime import date as _date
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+        try:
+            tzinfo = ZoneInfo(zone)
+        except ZoneInfoNotFoundError:
+            tzinfo = timezone.utc
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=timezone.utc)
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=timezone.utc)
+        start: _date = since.astimezone(tzinfo).date()
+        end: _date = until.astimezone(tzinfo).date()
+        if end < start:
+            return []
+        out: list = []
+        d = start
+        while d <= end:
+            out.append(d)
+            d = d + timedelta(days=1)
+        return out
+
+    def _today_date_in_zone(self, zone: str):
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+        try:
+            tzinfo = ZoneInfo(zone)
+        except ZoneInfoNotFoundError:
+            tzinfo = timezone.utc
+        return datetime.now(tzinfo).date()
+
+    def _zone_day_start_utc(self, day, zone: str) -> datetime:
+        """UTC instant of `day 00:00:00` interpreted in `zone`."""
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+        try:
+            tzinfo = ZoneInfo(zone)
+        except ZoneInfoNotFoundError:
+            tzinfo = timezone.utc
+        dt = datetime(day.year, day.month, day.day, 0, 0, 0, tzinfo=tzinfo)
+        return dt.astimezone(timezone.utc)
+
+    def _zone_day_end_utc(self, day, zone: str) -> datetime:
+        """UTC instant of `day 23:59:59.999999` interpreted in `zone`.
+        Used as the inclusive upper bound when computing a day's
+        events — matches the existing CTE's `<= :until` predicate."""
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+        try:
+            tzinfo = ZoneInfo(zone)
+        except ZoneInfoNotFoundError:
+            tzinfo = timezone.utc
+        dt = datetime(
+            day.year, day.month, day.day, 23, 59, 59, 999999, tzinfo=tzinfo,
+        )
+        return dt.astimezone(timezone.utc)
+
+    def _read_host_calendar_cache_rows(
+        self,
+        s,
+        host_unique_id: str,
+        zone: str,
+        days: list,
+    ) -> dict:
+        """SELECT cached rows for the (host, zone, day in days) set.
+        Returns a dict keyed by `date` with `{rooms, duration_seconds,
+        diamonds, matches, computed_at}` payloads. Empty dict when the
+        window has no cached coverage yet."""
+        if not days:
+            return {}
+        rows = s.execute(text("""
+            SELECT day, rooms, duration_seconds, diamonds, matches, computed_at
+            FROM tiktok_host_calendar_cache
+            WHERE host_unique_id = :host
+              AND tz = :tz
+              AND day = ANY(:days)
+        """), {
+            "host": host_unique_id,
+            "tz": zone,
+            "days": list(days),
+        }).mappings().all()
+        out: dict = {}
+        for r in rows:
+            ca = r["computed_at"]
+            if ca is not None and ca.tzinfo is None:
+                ca = ca.replace(tzinfo=timezone.utc)
+            out[r["day"]] = {
+                "rooms": int(r["rooms"] or 0),
+                "duration_seconds": int(r["duration_seconds"] or 0),
+                "diamonds": int(r["diamonds"] or 0),
+                "matches": int(r["matches"] or 0),
+                "computed_at": ca,
+            }
+        return out
+
+    def _upsert_host_calendar_cache_rows(
+        self,
+        s,
+        host_unique_id: str,
+        zone: str,
+        days: list,
+        computed: dict,
+        now_utc: datetime,
+    ) -> None:
+        """Bulk INSERT...ON CONFLICT DO UPDATE for the given days.
+        Days that appear in `days` but not in `computed` get zero
+        rows — important so frozen quiet days don't re-compute on
+        every miss."""
+        if not days:
+            return
+        params = []
+        for day in days:
+            p = computed.get(day) or {}
+            params.append({
+                "host": host_unique_id,
+                "tz": zone,
+                "day": day,
+                "rooms": int(p.get("rooms") or 0),
+                "duration_seconds": int(p.get("duration_seconds") or 0),
+                "diamonds": int(p.get("diamonds") or 0),
+                "matches": int(p.get("matches") or 0),
+                "computed_at": now_utc,
+            })
+        s.execute(text("""
+            INSERT INTO tiktok_host_calendar_cache
+              (host_unique_id, tz, day, rooms, duration_seconds,
+               diamonds, matches, computed_at)
+            VALUES
+              (:host, :tz, :day, :rooms, :duration_seconds,
+               :diamonds, :matches, :computed_at)
+            ON CONFLICT (host_unique_id, tz, day) DO UPDATE SET
+              rooms            = EXCLUDED.rooms,
+              duration_seconds = EXCLUDED.duration_seconds,
+              diamonds         = EXCLUDED.diamonds,
+              matches          = EXCLUDED.matches,
+              computed_at      = EXCLUDED.computed_at
+        """), params)
+        s.commit()
+
+    def _compute_host_calendar_window(
+        self,
+        s,
+        host_unique_id: str,
+        since: datetime,
+        until: datetime,
+        zone: str,
+    ) -> dict:
+        """Run the per-day aggregation SQL for the given window and
+        return a dict keyed by `date` (in zone). The caller is
+        responsible for further filtering / UPSERT. This is the
+        block that used to live inline in `host_calendar()`.
+
+        Looks up `host_user_id` once and threads it into the
+        `diamond_days` predicate so cross-host gifts (PK rivals,
+        multi-host guests) don't inflate the @host total."""
+        host_user_id_row = s.execute(text(
+            "SELECT profile_user_id FROM tiktok_subscriptions "
+            "WHERE unique_id = :host"
+        ), {"host": host_unique_id}).first()
+        host_user_id = (
+            host_user_id_row.profile_user_id if host_user_id_row else None
+        )
+        rows = s.execute(text("""
+            WITH host_rooms AS (
+              SELECT room_id, first_seen_at, last_seen_at
+              FROM tiktok_rooms
+              WHERE host_unique_id = :host
+                AND first_seen_at <= :until
+                AND COALESCE(last_seen_at, first_seen_at) >= :since
+            ),
+            room_days AS (
+              SELECT DISTINCT
+                     e.room_id,
+                     date_trunc('day', e.ts AT TIME ZONE :tz) AS day
+              FROM tiktok_events e
+              WHERE e.room_id IN (SELECT room_id FROM host_rooms)
+                AND e.ts >= :since AND e.ts <= :until
+            ),
+            diamond_days AS (
+              SELECT date_trunc('day', e.ts AT TIME ZONE :tz) AS day,
+                     SUM(
+                       COALESCE(NULLIF(e.payload->>'diamond_count','')::int, 0)
+                       * COALESCE(NULLIF(e.payload->>'repeat_count','')::int, 1)
+                     ) AS diamonds
+              FROM tiktok_events e
+              WHERE e.type = 'gift'
+                AND e.room_id IN (SELECT room_id FROM host_rooms)
+                AND e.ts >= :since AND e.ts <= :until
+                AND (
+                  CAST(:host_user_id AS TEXT) IS NULL
+                  OR COALESCE(e.payload->'to_user'->>'user_id', '0')
+                     IN ('0', CAST(:host_user_id AS TEXT))
+                )
+              GROUP BY day
+            ),
+            match_days AS (
+              SELECT date_trunc('day', m.started_at AT TIME ZONE :tz) AS day,
+                     COUNT(*) AS matches
+              FROM tiktok_matches m
+              WHERE m.room_id IN (SELECT room_id FROM host_rooms)
+                AND m.started_at >= :since AND m.started_at <= :until
+              GROUP BY day
+            ),
+            duration_days AS (
+              SELECT date_trunc('day', first_seen_at AT TIME ZONE :tz) AS day,
+                     SUM(GREATEST(0,
+                        EXTRACT(EPOCH FROM
+                          (COALESCE(last_seen_at, first_seen_at) - first_seen_at)
+                        )
+                     )) AS duration_seconds
+              FROM host_rooms
+              GROUP BY day
+            )
+            SELECT rd.day                          AS day,
+                   COUNT(DISTINCT rd.room_id)      AS rooms,
+                   COALESCE(MAX(dd.duration_seconds), 0) AS duration_seconds,
+                   COALESCE(MAX(d.diamonds), 0)     AS diamonds,
+                   COALESCE(MAX(mc.matches), 0)     AS matches
+            FROM room_days rd
+            LEFT JOIN diamond_days  d  ON d.day  = rd.day
+            LEFT JOIN match_days    mc ON mc.day = rd.day
+            LEFT JOIN duration_days dd ON dd.day = rd.day
+            GROUP BY rd.day
+            ORDER BY rd.day ASC
+        """), {
+            "host": host_unique_id,
+            "since": since,
+            "until": until,
+            "tz": zone,
+            "host_user_id": str(host_user_id) if host_user_id else None,
+        }).mappings().all()
+        out: dict = {}
+        for r in rows:
+            d = r["day"]
+            if d is None:
+                continue
+            # `date_trunc('day', AT TIME ZONE :tz)` returns a naive
+            # timestamp whose Y-M-D is the day in zone — `.date()`
+            # gives us the bucket key directly.
+            day_key = d.date() if hasattr(d, "date") else d
+            out[day_key] = {
+                "rooms": int(r["rooms"] or 0),
+                "duration_seconds": int(r["duration_seconds"] or 0),
+                "diamonds": int(r["diamonds"] or 0),
+                "matches": int(r["matches"] or 0),
+            }
+        return out
+
+    def warm_host_calendar(
+        self,
+        host_unique_id: str,
+        *,
+        since: datetime,
+        until: datetime,
+        tz: str = "UTC",
+        force: bool = False,
+    ) -> dict:
+        """CLI entry: ensure the L2 cache covers (host, tz, [since,
+        until]). Returns a stats dict the caller can log.
+
+        - `force=False`: skip rows whose `computed_at` is fresher than
+          the TTL (today) or any past-day row that's already present.
+        - `force=True`: recompute every day in the window regardless.
+
+        Postgres-only — SQLite dev never opts into the L2 path.
+        """
+        if not self._is_postgres():
+            return {"skipped_dialect": True, "computed": 0, "skipped": 0}
+        zone = _canonicalize_tz((tz or "UTC").strip() or "UTC")
+        t0 = time.perf_counter()
+        with self._get_session() as s:
+            if not self._is_pg_known_tz(s, zone):
+                zone = "UTC"
+            days_in_window = self._host_calendar_days_in_zone(
+                since, until, zone,
+            )
+            if not days_in_window:
+                return {"computed": 0, "skipped": 0, "took_ms": 0}
+            cached = (
+                {} if force
+                else self._read_host_calendar_cache_rows(
+                    s, host_unique_id, zone, days_in_window,
+                )
+            )
+            today_in_zone = self._today_date_in_zone(zone)
+            stale_thresh = datetime.now(timezone.utc) - timedelta(
+                seconds=self._HOST_CALENDAR_TTL_S,
+            )
+            days_to_compute: list = []
+            for day in days_in_window:
+                if force:
+                    days_to_compute.append(day)
+                    continue
+                row = cached.get(day)
+                if row is None:
+                    days_to_compute.append(day)
+                elif day >= today_in_zone and row["computed_at"] < stale_thresh:
+                    days_to_compute.append(day)
+            if not days_to_compute:
+                return {
+                    "computed": 0,
+                    "skipped": len(days_in_window),
+                    "took_ms": int((time.perf_counter() - t0) * 1000),
+                }
+            min_d = min(days_to_compute)
+            max_d = max(days_to_compute)
+            compute_since = self._zone_day_start_utc(min_d, zone)
+            compute_until = self._zone_day_end_utc(max_d, zone)
+            fresh = self._compute_host_calendar_window(
+                s, host_unique_id, compute_since, compute_until, zone,
+            )
+            now_utc = datetime.now(timezone.utc)
+            self._upsert_host_calendar_cache_rows(
+                s, host_unique_id, zone,
+                days_to_compute, fresh, now_utc,
+            )
+            return {
+                "computed": len(days_to_compute),
+                "skipped": len(days_in_window) - len(days_to_compute),
+                "took_ms": int((time.perf_counter() - t0) * 1000),
+            }
+
+    # ── get_room_stats — L2 cache helpers ────────────────────────────
+    #
+    # JSONB payload + (room_id, params_key) PK. The service layer
+    # composes `params_key` from the canonicalised request shape so a
+    # signature change there doesn't break the schema. L2 writes only
+    # happen for immutable windows (`until < now - 1 min`); active
+    # rooms stay in service-level L1 only.
+
+    def read_room_stats_cache(self, room_id: int, params_key: str) -> Optional[dict]:
+        """Return the cached payload for the (room_id, params_key)
+        slot, or None on miss. Postgres-only — SQLite dev runs L1 only."""
+        if not self._is_postgres():
+            return None
+        with self._get_session() as s:
+            row = s.execute(text(
+                "SELECT payload FROM tiktok_room_stats_cache "
+                "WHERE room_id = :rid AND params_key = :k"
+            ), {"rid": room_id, "k": params_key}).first()
+        if not row:
+            return None
+        payload = row.payload
+        # `payload` arrives already deserialised on Postgres JSONB; on
+        # SQLite (kept for parity) it's a string we'd need to decode.
+        if isinstance(payload, str):
+            try:
+                return json.loads(payload)
+            except json.JSONDecodeError:
+                return None
+        return payload
+
+    def write_room_stats_cache(
+        self,
+        room_id: int,
+        params_key: str,
+        payload: dict,
+    ) -> None:
+        """UPSERT the payload. Idempotent. Safe to call from concurrent
+        requests — last-writer-wins, and the answer is identical so
+        the race is benign."""
+        if not self._is_postgres():
+            return
+        with self._get_session() as s:
+            s.execute(text("""
+                INSERT INTO tiktok_room_stats_cache
+                  (room_id, params_key, payload, computed_at)
+                VALUES
+                  (:rid, :k, CAST(:p AS JSONB), NOW())
+                ON CONFLICT (room_id, params_key) DO UPDATE SET
+                  payload     = EXCLUDED.payload,
+                  computed_at = EXCLUDED.computed_at
+            """), {"rid": room_id, "k": params_key, "p": json.dumps(payload)})
+            s.commit()
+
     # ── Viewers ──────────────────────────────────────────────────────
 
     def get_viewer_by_unique_id(self, unique_id: str) -> Optional[TikTokViewer]:
@@ -957,6 +1446,23 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
     def _upsert_viewer_in_session(
         self, s, viewer: TikTokViewer, *, push_seen: bool
     ) -> None:
+        # Enigma-mode handling: when the incoming nickname is a
+        # placeholder like "Enigma 9213", we (1) flip the sticky
+        # `is_enigma` flag for this user_id, and (2) DON'T overwrite
+        # any real nickname / avatar we previously captured (e.g.
+        # from a profile fetch). On the first-ever sighting of a
+        # user via Enigma, the placeholder gets stored (better than
+        # nothing); a later profile fetch will overwrite with real
+        # values and the sticky flag stays TRUE.
+        # Require BOTH the payload nickname AND unique_id to match
+        # the Enigma placeholder pattern — TikTok masks both fields
+        # identically when the user is anonymous. A user who merely
+        # chose "Enigma NNN" as their display name has a normal
+        # `@handle` as their unique_id, and must NOT be flagged.
+        is_enigma_event = _is_enigma_event(viewer.nickname, viewer.unique_id)
+        # Seed the alias list with the current placeholder on the
+        # insert path; on the update path we concatenate with dedup.
+        enigma_seed = [viewer.nickname] if is_enigma_event else []
         if self._is_postgres():
             now = _utcnow()
             stmt = pg_insert(TikTokViewerModel).values(
@@ -964,18 +1470,42 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                 unique_id=viewer.unique_id,
                 nickname=viewer.nickname,
                 avatar_url=viewer.avatar_url,
+                is_enigma=is_enigma_event,
+                enigma_aliases=enigma_seed,
             )
             update_clause: dict[str, Any] = {}
             # For viewers, prefer the freshest non-null name/avatar over the
-            # cached one (people change handles + avatars).
-            if viewer.unique_id:
+            # cached one (people change handles + avatars) — EXCEPT when
+            # the current event is an Enigma placeholder, in which case
+            # we keep whatever real data we already have. The same gate
+            # applies to `unique_id`: TikTok sends `"unique_id":"Enigma
+            # NNN"` in the placeholder payload (NOT a real handle), so
+            # propagating it would wipe the real @handle we resolved
+            # from a prior non-Enigma event.
+            if viewer.unique_id and not is_enigma_event:
                 update_clause["unique_id"] = stmt.excluded.unique_id
-            if viewer.nickname:
+            if viewer.nickname and not is_enigma_event:
                 update_clause["nickname"] = stmt.excluded.nickname
-            if viewer.avatar_url:
+            if viewer.avatar_url and not is_enigma_event:
                 update_clause["avatar_url"] = stmt.excluded.avatar_url
             if push_seen:
                 update_clause["last_seen_at"] = now
+            # Sticky: once an Enigma event lands for this user_id, the
+            # flag stays TRUE forever. We OR the existing column with
+            # the incoming event so a later non-Enigma event can't reset.
+            if is_enigma_event:
+                update_clause["is_enigma"] = True
+                # Append the new alias if not already present. JSONB
+                # `@>` is the contains-op; the CASE keeps the column
+                # unchanged on duplicate appends so the array stays
+                # set-shaped without a separate dedup pass.
+                from sqlalchemy import case as _case
+                excl_aliases = stmt.excluded.enigma_aliases
+                cur_aliases = TikTokViewerModel.enigma_aliases
+                update_clause["enigma_aliases"] = _case(
+                    (cur_aliases.op("@>")(excl_aliases), cur_aliases),
+                    else_=cur_aliases.op("||")(excl_aliases),
+                )
             if update_clause:
                 stmt = stmt.on_conflict_do_update(
                     index_elements=["user_id"], set_=update_clause
@@ -992,15 +1522,34 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                         unique_id=viewer.unique_id,
                         nickname=viewer.nickname,
                         avatar_url=viewer.avatar_url,
+                        is_enigma=is_enigma_event,
+                        enigma_aliases=enigma_seed,
                     )
                 )
             else:
-                if viewer.unique_id and viewer.unique_id != existing.unique_id:
+                if viewer.unique_id and not is_enigma_event and viewer.unique_id != existing.unique_id:
                     existing.unique_id = viewer.unique_id
-                if viewer.nickname and viewer.nickname != existing.nickname:
+                if viewer.nickname and not is_enigma_event and viewer.nickname != existing.nickname:
                     existing.nickname = viewer.nickname
-                if viewer.avatar_url and viewer.avatar_url != existing.avatar_url:
+                if viewer.avatar_url and not is_enigma_event and viewer.avatar_url != existing.avatar_url:
                     existing.avatar_url = viewer.avatar_url
+                if is_enigma_event and not existing.is_enigma:
+                    existing.is_enigma = True
+                # Append the new Enigma alias if not already present.
+                # SQLite stores `enigma_aliases` as a TEXT-encoded
+                # JSON array — we deserialise / serialise locally.
+                if is_enigma_event and viewer.nickname:
+                    aliases = existing.enigma_aliases
+                    if isinstance(aliases, str):
+                        try:
+                            aliases = json.loads(aliases)
+                        except Exception:
+                            aliases = []
+                    if not isinstance(aliases, list):
+                        aliases = []
+                    if viewer.nickname not in aliases:
+                        aliases.append(viewer.nickname)
+                        existing.enigma_aliases = aliases
                 if push_seen:
                     existing.last_seen_at = _utcnow()
 
@@ -1555,6 +2104,42 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                 diamond = 0
             totals[mid] = totals.get(mid, 0) + diamond
         return totals
+
+    def get_ended_match_ids(self, match_ids: list[int]) -> set[int]:
+        """Filter `match_ids` to the subset whose `ended_at IS NOT NULL`.
+        Used by the service layer to decide which match-derived
+        responses can be cached forever (frozen) vs need a short TTL
+        (active match, data still arriving).
+
+        Known limitation: this predicate does NOT distinguish matches
+        that ended naturally (TikTok flagged `end_battle`) from ones
+        the orphan-sweeper closed because the worker dropped without
+        seeing the end event (see `close_orphan_matches`). For the
+        latter, late-arriving gift events that landed during the lost
+        window are missing from the diamond total. Caching such a
+        match's totals as "frozen forever" locks in the
+        under-counted value. If a future column distinguishes the
+        two (e.g. `ended_reason TEXT`), the freeze decision should
+        consult it and refuse to freeze orphan-closed matches. For
+        now this is an accepted known-incompleteness."""
+        if not match_ids:
+            return set()
+        ids = [int(m) for m in match_ids if m is not None]
+        if not ids:
+            return set()
+        with self._get_session() as s:
+            if self._is_postgres():
+                rows = s.execute(text(
+                    "SELECT id FROM tiktok_matches "
+                    "WHERE id = ANY(:ids) AND ended_at IS NOT NULL"
+                ), {"ids": ids}).all()
+            else:
+                # SQLite — use ORM for portable IN-list expansion.
+                rows = s.query(TikTokMatchModel.id).filter(
+                    TikTokMatchModel.id.in_(ids),
+                    TikTokMatchModel.ended_at.isnot(None),
+                ).all()
+        return {int(r[0]) for r in rows}
 
     def get_match_by_id(self, match_id: int) -> Match | None:
         with self._get_session() as s:
@@ -3259,6 +3844,7 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                         TikTokViewerModel.unique_id,
                         TikTokViewerModel.nickname,
                         TikTokViewerModel.avatar_url,
+                        TikTokViewerModel.is_enigma,
                     )
                     .outerjoin(
                         TikTokViewerModel,
@@ -3298,6 +3884,45 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                     comment_q = comment_q.filter(TikTokEventModel.ts < until)
                 comment_q = comment_q.group_by(TikTokEventModel.user_id)
                 comment_map = {int(r.user_id): int(r.comments) for r in comment_q.all()}
+
+                # Per-user, per-room Enigma placeholder badges. Set of
+                # distinct masked nicknames this user gifted under IN
+                # THIS ROOM (and window). Bounded by the page-of-N
+                # uids so the EXISTS+aggregate stays cheap. The
+                # frontend renders each as a small purple pill on the
+                # gifter row so the operator can see "this gift was
+                # sent anonymously as Enigma 97945".
+                enigma_q = text("""
+                    SELECT
+                      user_id,
+                      ARRAY_AGG(DISTINCT payload->'user'->>'nickname') AS aliases
+                    FROM tiktok_events
+                    WHERE room_id = ANY(:rids)
+                      AND type = 'gift'
+                      AND user_id = ANY(:uids)
+                      AND payload->'user'->>'nickname'  ~* '^Enigma\\s+\\d+$'
+                      AND payload->'user'->>'unique_id' ~* '^Enigma\\s+\\d+$'
+                      AND (:since_iso IS NULL OR ts >= :since_ts)
+                      AND (:until_iso IS NULL OR ts <  :until_ts)
+                    GROUP BY user_id
+                """)
+                enigma_params: dict[str, Any] = {
+                    "rids": room_id_list,
+                    "uids": uids,
+                    "since_iso": since.isoformat() if since else None,
+                    "since_ts":  since,
+                    "until_iso": until.isoformat() if until else None,
+                    "until_ts":  until,
+                }
+                room_enigma_map: dict[int, list[str]] = {}
+                for er in s.execute(enigma_q, enigma_params).mappings():
+                    aliases = er.get("aliases") or []
+                    # ARRAY_AGG can include NULLs if any extracted value
+                    # was missing — filter defensively and sort for
+                    # stable wire ordering.
+                    cleaned = sorted(a for a in aliases if a)
+                    if cleaned:
+                        room_enigma_map[int(er["user_id"])] = cleaned
 
                 # Per-gifter identity snapshot. Identity flags (is_moderator
                 # / is_subscribe / is_top_gifter / fans_club / member_level
@@ -3352,6 +3977,17 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                         # directly — it already contains member_level,
                         # gifter_level, fans_club, etc.).
                         "identity": identity if isinstance(identity, dict) else None,
+                        # Sticky Enigma flag. TRUE = this user_id has been
+                        # seen gifting under TikTok's anonymous mode at
+                        # least once; the frontend renders an "ENIGMA"
+                        # badge next to the profile name.
+                        "is_enigma": bool(r.is_enigma),
+                        # Per-room Enigma placeholders this user actually
+                        # gifted under IN THIS ROOM / WINDOW. Empty when
+                        # all their gifts were sent un-masked. Frontend
+                        # renders each as a small "Enigma NNN" pill on
+                        # the gifter row.
+                        "room_enigma_aliases": room_enigma_map.get(uid, []),
                     })
                 return out
 
@@ -3385,6 +4021,10 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                     "diamonds": 0,
                     "gifts": 0,
                     "comments": 0,
+                    # SQLite dev path doesn't JOIN viewers — leave the
+                    # flag FALSE here. Production runs on Postgres
+                    # where the PG branch sets it from the table.
+                    "is_enigma": False,
                 },
             )
             if row.type == "gift":
@@ -3488,6 +4128,7 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                         ).label("unique_id"),
                         gift_subq.c.diamonds,
                         gift_subq.c.gifts,
+                        TikTokViewerModel.is_enigma,
                     )
                     .outerjoin(
                         TikTokViewerModel,
@@ -3504,6 +4145,7 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                         "nickname": r.nickname,
                         "diamonds": int(r.diamonds or 0),
                         "gifts": int(r.gifts or 0),
+                        "is_enigma": bool(r.is_enigma),
                     }
                     for r in rows
                 ]
@@ -3679,7 +4321,8 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                     pu.gifts,
                     v.unique_id,
                     v.nickname,
-                    v.avatar_url
+                    v.avatar_url,
+                    COALESCE(v.is_enigma, false) AS is_enigma
                 FROM per_user pu
                 LEFT JOIN tiktok_viewers v ON v.user_id = pu.user_id
                 WHERE :q_is_null OR
@@ -3728,6 +4371,7 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                     "diamonds": int(r["diamonds"] or 0),
                     "gifts": int(r["gifts"] or 0),
                     "hosts": host_map.get(uid, []),
+                    "is_enigma": bool(r["is_enigma"]),
                 })
             return out
 
@@ -3824,7 +4468,8 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                     pu.gifts_total,
                     v.unique_id,
                     v.nickname,
-                    v.avatar_url
+                    v.avatar_url,
+                    COALESCE(v.is_enigma, false) AS is_enigma
                 FROM per_user pu
                 LEFT JOIN tiktok_viewers v ON v.user_id = pu.user_id
                 WHERE :q_is_null OR
@@ -3884,6 +4529,7 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                     "diamonds_elsewhere": d_other,
                     "gifts_elsewhere": g_other,
                     "other_hosts": others,
+                    "is_enigma": bool(r["is_enigma"]),
                 })
             return out
 
@@ -4969,6 +5615,11 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                 "nickname": viewer.nickname if viewer else None,
                 "avatar_url": viewer.avatar_url if viewer else None,
                 "identity": identity if isinstance(identity, dict) else None,
+                "is_enigma": bool(viewer.is_enigma) if viewer else False,
+                # Every Enigma placeholder we've ever seen this user
+                # render under. Surfaced in the modal as small badges
+                # so the operator can match real → mask history.
+                "enigma_aliases": list(viewer.enigma_aliases or []) if viewer else [],
                 "totals": {
                     "diamonds": totals_diamonds,
                     "gifts": totals_gifts,
@@ -7504,6 +8155,219 @@ class TikTokPersistenceAdapter(BasePersistenceAdapter, TikTokPersistencePort):
                 synchronize_session=False,
             )
             s.commit()
+
+    # ── perf-trace persistence ──────────────────────────────────────
+
+    def insert_perf_trace(self, row: dict[str, Any]) -> None:
+        """Write one trace row from the `PerfTracerMiddleware`. Best-
+        effort: silently swallows failures (the middleware also wraps
+        this in a try/except) so a flaky DB never breaks the user's
+        actual request.
+
+        `row` shape: see `TikTokPerfTraceModel` columns. `spans` /
+        `meta` are JSON-serialisable dicts/lists; SQLAlchemy's JSONB
+        column handles the encoding on Postgres."""
+        from database.tiktok.models import TikTokPerfTraceModel
+        try:
+            with self._get_session() as s:
+                s.add(TikTokPerfTraceModel(
+                    trace_id=row.get("trace_id") or "",
+                    endpoint=row.get("endpoint") or "",
+                    method=(row.get("method") or "GET")[:8],
+                    status=row.get("status"),
+                    total_ms=int(row.get("total_ms") or 0),
+                    query_count=row.get("query_count"),
+                    handle=(row.get("handle") or None),
+                    spans=row.get("spans") or [],
+                    meta=row.get("meta") or {},
+                ))
+                s.commit()
+        except Exception:
+            logger.exception("insert_perf_trace failed")
+
+    # ── Enigma viewers (anonymous-gifter ledger) ───────────────────
+
+    def list_enigma_viewers(
+        self,
+        *,
+        q: str | None = None,
+        status: str = "all",  # 'all' | 'discovered' | 'not_captured'
+        sort: str = "last_seen",  # 'last_seen' | 'first_seen' | 'aliases'
+        limit: int = 25,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """List all viewers flagged `is_enigma=TRUE` with optional
+        filters. Returns `(items, total)` so the frontend can paginate.
+
+        Filters:
+          - `q`        — substring match on nickname / unique_id / any
+                         entry of `enigma_aliases`.
+          - `status`   — `discovered` keeps only users whose stored
+                         nickname is a REAL identity (i.e. not the
+                         Enigma placeholder). `not_captured` keeps
+                         only users whose stored nickname is still the
+                         placeholder. `all` (default) shows both.
+          - `sort`     — `last_seen` (default), `first_seen`, or
+                         `aliases` (most masks first).
+
+        Each row carries `user_id`, `unique_id`, `nickname`,
+        `avatar_url`, `enigma_aliases`, `first_seen_at`,
+        `last_seen_at`, and a `discovered` boolean for the UI.
+        """
+        # Use a clamped limit so a misbehaving caller can't request
+        # a 100k-row dump.
+        lim = max(1, min(int(limit), 200))
+        off = max(0, int(offset))
+
+        # SQL filter fragments — composed into one query so total +
+        # page share the same WHERE clause.
+        ENIGMA_RE = r'^Enigma\s+\d+$'
+        where_clauses = ["is_enigma = TRUE"]
+        params: dict[str, Any] = {}
+        if status == "discovered":
+            where_clauses.append("nickname !~* :enigma_re")
+            params["enigma_re"] = ENIGMA_RE
+        elif status == "not_captured":
+            where_clauses.append("nickname ~* :enigma_re")
+            params["enigma_re"] = ENIGMA_RE
+        if q and q.strip():
+            params["needle"] = f"%{q.strip()}%"
+            where_clauses.append(
+                "(nickname ILIKE :needle OR unique_id ILIKE :needle "
+                "  OR EXISTS ("
+                "      SELECT 1 FROM jsonb_array_elements_text(enigma_aliases) AS a "
+                "      WHERE a ILIKE :needle"
+                "  ))"
+            )
+        where_sql = " AND ".join(where_clauses)
+
+        sort_sql = {
+            "last_seen":   "last_seen_at DESC NULLS LAST",
+            "first_seen":  "first_seen_at DESC NULLS LAST",
+            "aliases":     "jsonb_array_length(enigma_aliases) DESC, last_seen_at DESC NULLS LAST",
+        }.get(sort, "last_seen_at DESC NULLS LAST")
+
+        with self._get_session() as s:
+            total = s.execute(text(
+                f"SELECT COUNT(*) FROM tiktok_viewers WHERE {where_sql}"
+            ), params).scalar() or 0
+
+            rows = s.execute(text(f"""
+                SELECT user_id, unique_id, nickname, avatar_url,
+                       enigma_aliases, first_seen_at, last_seen_at
+                FROM tiktok_viewers
+                WHERE {where_sql}
+                ORDER BY {sort_sql}
+                LIMIT :lim OFFSET :off
+            """), {**params, "lim": lim, "off": off}).mappings().all()
+
+            import re as _re
+            placeholder = _re.compile(ENIGMA_RE, _re.IGNORECASE)
+            items = [
+                {
+                    "user_id":        str(r["user_id"]),
+                    "unique_id":      r["unique_id"],
+                    "nickname":       r["nickname"],
+                    "avatar_url":     r["avatar_url"],
+                    "enigma_aliases": list(r["enigma_aliases"] or []),
+                    "first_seen_at":  r["first_seen_at"].isoformat() if r["first_seen_at"] else None,
+                    "last_seen_at":   r["last_seen_at"].isoformat() if r["last_seen_at"] else None,
+                    # `discovered=True` ⇔ stored nickname is a REAL
+                    # identity (the resolver found a non-Enigma event
+                    # OR the user was originally captured under their
+                    # real name). UI uses this to swap to "Not
+                    # captured yet" for the placeholder cohort.
+                    "discovered": bool(
+                        r["nickname"]
+                        and not placeholder.match(r["nickname"].strip())
+                    ),
+                }
+                for r in rows
+            ]
+            return items, int(total)
+
+    def list_perf_traces(
+        self,
+        *,
+        endpoint: str | None = None,
+        handle: str | None = None,
+        min_total_ms: int = 0,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Read recent traces, newest-first, with optional filters.
+        Returns plain dicts so the read endpoint doesn't need to
+        depend on the SQLAlchemy model.
+
+        Surfaces the host handle for room-scoped routes by joining
+        the trace's `meta.room_id` (set by the middleware on
+        `/admin/tiktok/rooms/{room_id}/...` paths) to
+        `tiktok_rooms.host_unique_id`. The wire-level `handle`
+        field is always populated when ANY signal is available —
+        either from the URL itself (`/admin/tiktok/{handle}/...`)
+        or from the room→host resolve."""
+        from database.tiktok.models import TikTokPerfTraceModel
+        with self._get_session() as s:
+            q = s.query(TikTokPerfTraceModel)
+            if endpoint:
+                q = q.filter(TikTokPerfTraceModel.endpoint == endpoint)
+            if handle:
+                q = q.filter(TikTokPerfTraceModel.handle == handle)
+            if min_total_ms > 0:
+                q = q.filter(TikTokPerfTraceModel.total_ms >= min_total_ms)
+            q = q.order_by(TikTokPerfTraceModel.ts.desc()).limit(max(1, min(limit, 500)))
+            rows = q.all()
+
+            # Resolve room_id → host_unique_id for the page in one
+            # batched query. Skips rows that already have a handle
+            # (or no room_id in meta).
+            room_ids: set[int] = set()
+            for r in rows:
+                if not r.handle and isinstance(r.meta, dict):
+                    rid = r.meta.get("room_id")
+                    try:
+                        if rid is not None:
+                            room_ids.add(int(rid))
+                    except (TypeError, ValueError):
+                        pass
+            room_to_host: dict[int, str] = {}
+            if room_ids and self._is_postgres():
+                lookup_rows = s.execute(text(
+                    "SELECT room_id, host_unique_id "
+                    "FROM tiktok_rooms "
+                    "WHERE room_id = ANY(:rids)"
+                ), {"rids": list(room_ids)}).all()
+                for lr in lookup_rows:
+                    if lr.host_unique_id:
+                        room_to_host[int(lr.room_id)] = lr.host_unique_id
+
+            def _resolved_handle(r) -> str | None:
+                if r.handle:
+                    return r.handle
+                if isinstance(r.meta, dict):
+                    rid = r.meta.get("room_id")
+                    try:
+                        if rid is not None:
+                            return room_to_host.get(int(rid))
+                    except (TypeError, ValueError):
+                        return None
+                return None
+
+            return [
+                {
+                    "id":          r.id,
+                    "trace_id":    r.trace_id,
+                    "ts":          r.ts.isoformat() if r.ts else None,
+                    "endpoint":    r.endpoint,
+                    "method":      r.method,
+                    "status":      r.status,
+                    "total_ms":    r.total_ms,
+                    "query_count": r.query_count,
+                    "handle":      _resolved_handle(r),
+                    "spans":       r.spans or [],
+                    "meta":        r.meta or {},
+                }
+                for r in rows
+            ]
 
 
 def _worker_to_dataclass(m: WorkerModel) -> TikTokWorker:

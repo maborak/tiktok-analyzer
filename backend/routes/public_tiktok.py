@@ -70,7 +70,7 @@ def _require_service():
     return tiktok_service
 
 
-def _resolve_public_host(handle: str):
+async def _resolve_public_host(handle: str):
     """Resolve `@handle` → Subscription, refuse with 404 unless public.
 
     Returns the `Subscription` dataclass on success so callers can
@@ -78,37 +78,41 @@ def _resolve_public_host(handle: str):
     401/403) on every refusal path: missing handle, unknown handle,
     or `is_public=False`. This prevents the API from leaking whether
     a non-public subscription even exists.
+
+    `async def` + `to_thread` so a cold-cache miss (~5 ms SQL) does
+    not block the event loop. The cache-hit case is ~1 µs dict
+    lookup; the to_thread overhead is acceptable to keep the
+    cold-path safe.
     """
     svc = _require_service()
     handle = (handle or "").lstrip("@").strip()
     if not handle:
         raise HTTPException(status_code=404, detail="not found")
-    sub = svc._persistence.get_subscription(handle)
+    sub = await asyncio.to_thread(svc.get_public_subscription, handle)
     if sub is None or not bool(getattr(sub, "is_public", False)):
         raise HTTPException(status_code=404, detail="not found")
     return sub
 
 
-def _resolve_public_room(room_id: int):
+async def _resolve_public_room(room_id: int):
     """Resolve `room_id` → host_unique_id → Subscription. 404 unless
     the host is opted public.
 
     Returns the `Subscription` dataclass so the caller can reuse the
-    identity. Note: we look up the host via `get_room_host_handle`
-    (single-column query) rather than loading the full room row.
+    identity.
     """
     svc = _require_service()
     try:
         rid = int(room_id)
     except (TypeError, ValueError):
         raise HTTPException(status_code=404, detail="not found")
-    host = svc._persistence.get_room_host_handle(rid)
+    host = await asyncio.to_thread(svc.get_public_room_host, rid)
     if not host:
         raise HTTPException(status_code=404, detail="not found")
-    return _resolve_public_host(host)
+    return await _resolve_public_host(host)
 
 
-def _resolve_public_match(match_id: int):
+async def _resolve_public_match(match_id: int):
     """Resolve `match_id` → room → host → Subscription. 404 unless
     the host is opted public.
 
@@ -122,17 +126,19 @@ def _resolve_public_match(match_id: int):
         mid = int(match_id)
     except (TypeError, ValueError):
         raise HTTPException(status_code=404, detail="not found")
-    match = svc._persistence.get_match_by_id(mid)
+    match = await asyncio.to_thread(svc._persistence.get_match_by_id, mid)
     if match is None or match.room_id is None:
         raise HTTPException(status_code=404, detail="not found")
-    host = svc._persistence.get_room_host_handle(int(match.room_id))
+    host = await asyncio.to_thread(
+        svc.get_public_room_host, int(match.room_id),
+    )
     if not host:
         raise HTTPException(status_code=404, detail="not found")
-    sub = _resolve_public_host(host)
+    sub = await _resolve_public_host(host)
     return match, sub
 
 
-def _resolve_public_room_set(room_ids: Iterable[int]) -> list[int]:
+async def _resolve_public_room_set(room_ids: Iterable[int]) -> list[int]:
     """Validate every id in `room_ids` maps to a public host.
 
     Refuses with 404 if ANY id fails the public-host check — partial
@@ -159,11 +165,13 @@ def _resolve_public_room_set(room_ids: Iterable[int]) -> list[int]:
     # (≤ ~30 ids for a day-aggregate), this is cheaper than building
     # a JOIN-against-subs query and avoids opening up a public bulk
     # endpoint that could be abused to brute-force the public set.
+    # Each lookup goes through to_thread so cold-cache misses don't
+    # block the event loop across the loop body.
     for rid in ordered:
-        host = svc._persistence.get_room_host_handle(rid)
+        host = await asyncio.to_thread(svc.get_public_room_host, rid)
         if not host:
             raise HTTPException(status_code=404, detail="not found")
-        sub = svc._persistence.get_subscription(host)
+        sub = await asyncio.to_thread(svc.get_public_subscription, host)
         if sub is None or not bool(getattr(sub, "is_public", False)):
             raise HTTPException(status_code=404, detail="not found")
     return ordered
@@ -360,15 +368,18 @@ async def public_lives(
 
 
 @router.get("/tiktok/lives/{handle}")
-def public_live_detail(handle: str, response: Response):
+async def public_live_detail(handle: str, response: Response):
     """Public detail payload for a single handle.
 
     Returns the same `{subscription, summary}` pair shape as a single
     item of `/public/tiktok/lives`, so the frontend can reuse the
     same card renderer for the detail page header.
+
+    `async def` + `to_thread` so concurrent viewers don't serialize
+    behind each other on the threadpool.
     """
     svc = _require_service()
-    sub = _resolve_public_host(handle)
+    sub = await _resolve_public_host(handle)
     _set_cache_headers(response)
 
     # Fan out to the admin summary path for this one handle, then
@@ -376,7 +387,7 @@ def public_live_detail(handle: str, response: Response):
     # one-shot service method — re-uses the in-process summary cache
     # when admin + public both poll the same handle.
     h = sub.unique_id
-    summary = svc.get_lives_summary([h])
+    summary = await asyncio.to_thread(svc.get_lives_summary, [h])
     row = summary.get(h.lstrip("@").lower(), {}) or {}
     return {
         "subscription": svc._pick(sub, svc._PUBLIC_SUBSCRIPTION_FIELDS),
@@ -422,7 +433,7 @@ def _read_tiktok_runtime_config() -> dict[str, Any]:
 
 
 @router.get("/tiktok/runtime-config")
-def public_tiktok_runtime_config(response: Response):
+async def public_tiktok_runtime_config(response: Response):
     """Public, anonymous-readable slice of the TikTok runtime config.
     Returns ONLY the keys a public viewer needs to render `/lives/...`
     correctly: `poll_interval_ms` (REST poll cadence) and
@@ -690,7 +701,7 @@ async def public_ws_events(ws: WebSocket):
 
 
 @router.get("/tiktok/lives/{handle}/status")
-def public_live_status(handle: str, response: Response):
+async def public_live_status(handle: str, response: Response):
     """Three-state visibility probe for `/lives/{handle}` route guards.
 
     Returns one of:
@@ -719,7 +730,10 @@ def public_live_status(handle: str, response: Response):
     response.headers["Vary"] = "Accept-Encoding"
     if not cleaned:
         return {"status": "not_found", "handle": cleaned}
-    sub = svc._persistence.get_subscription(cleaned)
+    # Cached via service layer — every public route guard calls this
+    # on mount; without the cache the 30 s poll cadence × N viewers
+    # produces 10+ s p95 spikes when the threadpool saturates.
+    sub = svc.get_public_subscription(cleaned)
     if sub is None:
         return {"status": "not_found", "handle": cleaned}
     if not bool(getattr(sub, "is_public", False)):
@@ -728,7 +742,7 @@ def public_live_status(handle: str, response: Response):
 
 
 @router.get("/tiktok/lives/{handle}/calendar")
-def public_live_calendar(
+async def public_live_calendar(
     handle: str,
     response: Response,
     weeks: int = Query(26, ge=1, le=104),
@@ -740,15 +754,20 @@ def public_live_calendar(
     """Per-day broadcast counts for the heatmap on the public detail
     page. Same shape as the admin calendar endpoint — no operator-only
     fields exist in the row shape (date, rooms, duration_minutes,
-    diamonds, matches), so this is a sanitized pass-through."""
+    diamonds, matches), so this is a sanitized pass-through.
+
+    `async def` + `to_thread` mirrors the admin handler so concurrent
+    public viewers don't pile up on the threadpool."""
     svc = _require_service()
-    sub = _resolve_public_host(handle)
+    sub = await _resolve_public_host(handle)
     _set_cache_headers(response)
-    return svc.host_calendar(sub.unique_id, weeks=weeks, tz=tz)
+    return await asyncio.to_thread(
+        svc.host_calendar, sub.unique_id, weeks=weeks, tz=tz,
+    )
 
 
 @router.get("/tiktok/lives/{handle}/rooms")
-def public_live_rooms(
+async def public_live_rooms(
     handle: str,
     response: Response,
     limit: int = Query(50, ge=1, le=200),
@@ -756,11 +775,18 @@ def public_live_rooms(
     """Per-broadcast list for one public handle. Mirrors the admin
     `list_host_rooms` endpoint with the same `RoomResponse` shape +
     per-room rollups (diamonds / matches / likes) so the broadcast
-    selector can label each entry inline."""
+    selector can label each entry inline.
+
+    `async def` + `to_thread` so concurrent public viewers don't
+    serialize behind each other on the FastAPI threadpool (the prior
+    sync-def shape produced 44 s p95 spikes under load). The work
+    itself is cached at the service layer with a 30 s TTL — repeat
+    requests within that window skip the SQL entirely."""
     svc = _require_service()
-    sub = _resolve_public_host(handle)
-    rooms = svc.list_rooms_for_host(sub.unique_id, limit=limit)
-    totals = svc.room_totals([r.room_id for r in rooms]) if rooms else {}
+    sub = await _resolve_public_host(handle)
+    rooms, totals = await asyncio.to_thread(
+        svc.list_host_rooms_with_totals, sub.unique_id, limit=limit,
+    )
     _set_cache_headers(response)
     out: list[dict[str, Any]] = []
     for r in rooms:
@@ -781,7 +807,7 @@ def public_live_rooms(
 
 
 @router.get("/tiktok/lives/{handle}/cross-live-gifters")
-def public_cross_live_gifters_for_host(
+async def public_cross_live_gifters_for_host(
     handle: str,
     response: Response,
     min_other_hosts: int = Query(1, ge=1, le=20),
@@ -789,15 +815,12 @@ def public_cross_live_gifters_for_host(
     limit: int = Query(25, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ):
-    """Public mirror of the admin cross-live gifters endpoint. The
-    underlying data only exposes user/host edges that already exist in
-    the public summary surface (no operator-only counters), but we
-    still gate on `is_public` for the queried host so private lives
-    can't be probed for their cross-live audience overlap."""
+    """Public mirror of the admin cross-live gifters endpoint."""
     svc = _require_service()
-    sub = _resolve_public_host(handle)
+    sub = await _resolve_public_host(handle)
     _set_cache_headers(response)
-    return svc.get_cross_live_gifters_for_host(
+    return await asyncio.to_thread(
+        svc.get_cross_live_gifters_for_host,
         sub.unique_id,
         min_other_hosts=min_other_hosts,
         q=q,
@@ -807,7 +830,7 @@ def public_cross_live_gifters_for_host(
 
 
 @router.get("/tiktok/common-gifters/{user_id}/detail")
-def public_common_gifter_detail(user_id: int, response: Response):
+async def public_common_gifter_detail(user_id: int, response: Response):
     """Public mirror of `/admin/tiktok/common-gifters/{user_id}/detail`.
 
     Returns the same deep-analysis shape (identity, totals, hosts,
@@ -829,11 +852,13 @@ def public_common_gifter_detail(user_id: int, response: Response):
     """
     svc = _require_service()
     _set_cache_headers(response)
-    return svc.get_common_gifter_detail(int(user_id), public_only=True)
+    return await asyncio.to_thread(
+        svc.get_common_gifter_detail, int(user_id), public_only=True,
+    )
 
 
 @router.get("/tiktok/rooms/{room_id}/stats")
-def public_room_stats(
+async def public_room_stats(
     room_id: int,
     response: Response,
     window_minutes: int = Query(30, ge=1, le=10080),
@@ -850,8 +875,9 @@ def public_room_stats(
     public TikTok counters, or a server-derived bucket.
     """
     svc = _require_service()
-    _resolve_public_room(room_id)
-    data = svc.get_room_stats(
+    await _resolve_public_room(room_id)
+    data = await asyncio.to_thread(
+        svc.get_room_stats,
         room_id,
         window_minutes=window_minutes,
         bucket_seconds=bucket_seconds,
@@ -867,7 +893,7 @@ def public_room_stats(
 
 
 @router.get("/tiktok/rooms/{room_id}/gifters")
-def public_room_gifters(
+async def public_room_gifters(
     room_id: int,
     response: Response,
     since: Optional[datetime] = Query(None, description="Window start (inclusive)"),
@@ -887,25 +913,26 @@ def public_room_gifters(
     is public, so the row shape (user_id, unique_id, nickname,
     avatar_url, gifts, diamonds) has no operator-only fields."""
     svc = _require_service()
-    _resolve_public_room(room_id)
+    await _resolve_public_room(room_id)
     extras: list[int] = []
     if room_ids:
         parsed = [int(x.strip()) for x in room_ids.split(",") if x.strip().isdigit()]
         # Validate every additional id belongs to a public host.
         # Skip the path room_id (already checked above).
         if parsed:
-            _resolve_public_room_set(parsed)
+            await _resolve_public_room_set(parsed)
             extras = parsed
     target: int | list[int]
     target = list({int(room_id), *extras}) if extras else int(room_id)
     _set_cache_headers(response)
-    return svc.get_room_gifters(
+    return await asyncio.to_thread(
+        svc.get_room_gifters,
         target, since=since, until=until, q=q, limit=limit, offset=offset,
     )
 
 
 @router.get("/tiktok/rooms/{room_id}/recipients")
-def public_room_recipients(
+async def public_room_recipients(
     room_id: int,
     response: Response,
     since: Optional[datetime] = Query(None, description="Window start (inclusive)"),
@@ -915,13 +942,15 @@ def public_room_recipients(
     """Per-recipient diamond split. Row shape is the same as the
     admin endpoint — only public identity + gift counters."""
     svc = _require_service()
-    _resolve_public_room(room_id)
+    await _resolve_public_room(room_id)
     _set_cache_headers(response)
-    return svc.get_room_recipients(room_id, since=since, until=until, limit=limit)
+    return await asyncio.to_thread(
+        svc.get_room_recipients, room_id, since=since, until=until, limit=limit,
+    )
 
 
 @router.get("/tiktok/buckets/aggregated")
-def public_aggregated_buckets(
+async def public_aggregated_buckets(
     response: Response,
     room_ids: str = Query(
         ..., description="Comma-separated list of room ids to aggregate.",
@@ -945,15 +974,16 @@ def public_aggregated_buckets(
             continue
     if not ids:
         raise HTTPException(status_code=400, detail="room_ids must be a non-empty comma-separated list of integers")
-    _resolve_public_room_set(ids)
+    await _resolve_public_room_set(ids)
     _set_cache_headers(response)
-    return svc.get_aggregated_buckets(
+    return await asyncio.to_thread(
+        svc.get_aggregated_buckets,
         ids, since=since, until=until, bucket_seconds=bucket_seconds,
     )
 
 
 @router.get("/tiktok/matches")
-def public_matches(
+async def public_matches(
     response: Response,
     handle: str = Query(..., min_length=1, max_length=64),
     room_id: Optional[int] = None,
@@ -963,18 +993,22 @@ def public_matches(
     we can gate on `is_public`. If `room_id` is provided, validate
     it belongs to the same public host (defense in depth)."""
     svc = _require_service()
-    sub = _resolve_public_host(handle)
+    sub = await _resolve_public_host(handle)
     if room_id is not None:
-        room_sub = _resolve_public_room(room_id)
+        room_sub = await _resolve_public_room(room_id)
         if (room_sub.unique_id or "").lower() != (sub.unique_id or "").lower():
             # Caller passed a public room but for a different host.
             raise HTTPException(status_code=404, detail="not found")
-    matches = svc.list_matches(
+    matches = await asyncio.to_thread(
+        svc.list_matches,
         host_unique_id=sub.unique_id, room_id=room_id, limit=limit,
     )
     # Enrich with diamonds_total + derived result (same as admin path).
     from routes.admin.tiktok import _derive_match_result, _serialize_opponent
-    diamonds = svc.match_diamonds_totals([m.id for m in matches if m.id is not None])
+    diamonds = await asyncio.to_thread(
+        svc.match_diamonds_totals,
+        [m.id for m in matches if m.id is not None],
+    )
     _set_cache_headers(response)
     out: list[dict[str, Any]] = []
     for m in matches:
@@ -996,13 +1030,16 @@ def public_matches(
 
 
 @router.get("/tiktok/matches/{match_id}")
-def public_match_detail(match_id: int, response: Response):
+async def public_match_detail(match_id: int, response: Response):
     """Single match. Returns the same enriched `MatchResponse` shape
     as the admin counterpart."""
     svc = _require_service()
-    match, sub = _resolve_public_match(match_id)
+    match, sub = await _resolve_public_match(match_id)
     from routes.admin.tiktok import _derive_match_result, _serialize_opponent
-    diamonds = svc.match_diamonds_totals([match.id]) if match.id else {}
+    diamonds = (
+        await asyncio.to_thread(svc.match_diamonds_totals, [match.id])
+        if match.id else {}
+    )
     _set_cache_headers(response)
     return _sanitize_match({
         "id": match.id or 0,
@@ -1021,18 +1058,18 @@ def public_match_detail(match_id: int, response: Response):
 
 
 @router.get("/tiktok/matches/{match_id}/score_timeline")
-def public_match_score_timeline(match_id: int, response: Response):
+async def public_match_score_timeline(match_id: int, response: Response):
     """Per-second decoded score frames for a match. Each row is
     `{ts, scores: {key: int}}` — no operator-only fields, pure
     public PK scoreboard data."""
     svc = _require_service()
-    _resolve_public_match(match_id)
+    await _resolve_public_match(match_id)
     _set_cache_headers(response)
-    return svc.get_match_score_timeline(match_id)
+    return await asyncio.to_thread(svc.get_match_score_timeline, match_id)
 
 
 @router.get("/tiktok/matches/{match_id}/gifters_by_side")
-def public_match_gifters_by_side(match_id: int, response: Response):
+async def public_match_gifters_by_side(match_id: int, response: Response):
     """Side-balance + per-side gifter rows. Each gifter row is
     public identity + gift counters.
 
@@ -1046,13 +1083,15 @@ def public_match_gifters_by_side(match_id: int, response: Response):
     callers.
     """
     svc = _require_service()
-    _resolve_public_match(match_id)
+    await _resolve_public_match(match_id)
     _set_cache_headers(response)
-    return svc.get_match_gifters_by_side(match_id, public_only=True)
+    return await asyncio.to_thread(
+        svc.get_match_gifters_by_side, match_id, public_only=True,
+    )
 
 
 @router.get("/tiktok/matches/{match_id}/head_to_head")
-def public_match_head_to_head(
+async def public_match_head_to_head(
     match_id: int,
     response: Response,
     limit: int = Query(50, ge=1, le=200),
@@ -1062,13 +1101,15 @@ def public_match_head_to_head(
     winner, host_score/opp_score/margin/outcome/decisive_pct/
     duration_seconds, diamonds_total) is all public-PK derivable."""
     svc = _require_service()
-    _resolve_public_match(match_id)
+    await _resolve_public_match(match_id)
     _set_cache_headers(response)
-    return svc.get_match_head_to_head(match_id, limit=limit)
+    return await asyncio.to_thread(
+        svc.get_match_head_to_head, match_id, limit=limit,
+    )
 
 
 @router.get("/tiktok/matches/{match_id}/h2h_common_gifters")
-def public_match_h2h_common_gifters(
+async def public_match_h2h_common_gifters(
     match_id: int,
     response: Response,
     min_battles: int = Query(2, ge=1, le=20),
@@ -1077,15 +1118,16 @@ def public_match_h2h_common_gifters(
     """Viewers who gifted in ≥`min_battles` of this match's H2H set.
     Row shape is public gifter identity + per-match counter list."""
     svc = _require_service()
-    _resolve_public_match(match_id)
+    await _resolve_public_match(match_id)
     _set_cache_headers(response)
-    return svc.get_h2h_common_gifters(
+    return await asyncio.to_thread(
+        svc.get_h2h_common_gifters,
         match_id, min_battles=min_battles, limit=limit,
     )
 
 
 @router.get("/tiktok/events/search")
-def public_events_search(
+async def public_events_search(
     response: Response,
     room_ids: str = Query(
         ...,
@@ -1122,7 +1164,7 @@ def public_events_search(
             continue
     if not parsed_ids:
         raise HTTPException(status_code=400, detail="room_ids must be a non-empty comma-separated list of integers")
-    _resolve_public_room_set(parsed_ids)
+    await _resolve_public_room_set(parsed_ids)
 
     parsed_user_id: Optional[int] = None
     if user_id is not None and user_id != "":
@@ -1139,11 +1181,14 @@ def public_events_search(
     if match_id is not None:
         # The match must belong to one of the validated rooms; gate
         # to avoid a sideways read of a private match via match_id.
-        match = svc._persistence.get_match_by_id(int(match_id))
+        match = await asyncio.to_thread(
+            svc._persistence.get_match_by_id, int(match_id),
+        )
         if match is None or int(match.room_id) not in set(parsed_ids):
             raise HTTPException(status_code=404, detail="not found")
 
-    rows = svc.search_events(
+    rows = await asyncio.to_thread(
+        svc.search_events,
         room_ids=parsed_ids,
         user_id=parsed_user_id,
         match_id=match_id,
@@ -1162,7 +1207,7 @@ def public_events_search(
 
 
 @router.get("/tiktok/events/count")
-def public_events_count(
+async def public_events_count(
     response: Response,
     room_ids: str = Query(
         ...,
@@ -1194,7 +1239,7 @@ def public_events_count(
             continue
     if not parsed_ids:
         raise HTTPException(status_code=400, detail="room_ids must be a non-empty comma-separated list of integers")
-    _resolve_public_room_set(parsed_ids)
+    await _resolve_public_room_set(parsed_ids)
 
     parsed_user_id: Optional[int] = None
     if user_id is not None and user_id != "":
@@ -1209,11 +1254,14 @@ def public_events_count(
         except ValueError:
             raise HTTPException(status_code=400, detail=f"Invalid to_user_id: {to_user_id!r}")
     if match_id is not None:
-        match = svc._persistence.get_match_by_id(int(match_id))
+        match = await asyncio.to_thread(
+            svc._persistence.get_match_by_id, int(match_id),
+        )
         if match is None or int(match.room_id) not in set(parsed_ids):
             raise HTTPException(status_code=404, detail="not found")
 
-    total = svc.count_events(
+    total = await asyncio.to_thread(
+        svc.count_events,
         room_ids=parsed_ids,
         user_id=parsed_user_id,
         match_id=match_id,
@@ -1229,7 +1277,7 @@ def public_events_count(
 
 
 @router.get("/tiktok/users/{user_id}/matches")
-def public_user_matches(
+async def public_user_matches(
     user_id: int,
     response: Response,
     room_ids: str = Query(
@@ -1263,9 +1311,10 @@ def public_user_matches(
             continue
     if not parsed_ids:
         raise HTTPException(status_code=400, detail="room_ids must be a non-empty comma-separated list of integers")
-    _resolve_public_room_set(parsed_ids)
+    await _resolve_public_room_set(parsed_ids)
     _set_cache_headers(response)
-    return svc.list_user_matches(
+    return await asyncio.to_thread(
+        svc.list_user_matches,
         user_id=int(user_id),
         room_ids=parsed_ids,
         since=since,
@@ -1276,7 +1325,7 @@ def public_user_matches(
 
 
 @router.get("/tiktok/users/{user_id}/host-daily-series")
-def public_user_host_daily_series(
+async def public_user_host_daily_series(
     user_id: int,
     response: Response,
     handle: str = Query(..., description="Host handle to scope to."),
@@ -1287,10 +1336,11 @@ def public_user_host_daily_series(
     The host must be `is_public=True`; resolved via `_resolve_public_host`
     so unknown / private handles 404 with no info leak.
     """
-    _resolve_public_host(handle)
+    await _resolve_public_host(handle)
     svc = _require_service()
     _set_cache_headers(response)
-    return svc.get_user_host_daily_series(
+    return await asyncio.to_thread(
+        svc.get_user_host_daily_series,
         user_id=int(user_id),
         host_unique_id=handle.lstrip("@"),
         days=int(days),

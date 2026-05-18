@@ -26,7 +26,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from ports.tiktok_state_cache import TikTokStateCachePort
 
@@ -45,18 +45,35 @@ _TICK_INTERVAL_S = 5.0
 _POLL_TTL_S = 60.0
 
 
+# Resolver type: takes a list of candidate host handles, returns the
+# subset whose SQL-side room is currently live. Same shape as
+# `TikTokPersistenceAdapter.get_hosts_with_active_room`.
+ActiveHostsResolver = Callable[[list[str]], set[str]]
+
+
 async def run_state_tick_loop(
     state_cache: TikTokStateCachePort,
     *,
     interval_s: float = _TICK_INTERVAL_S,
     poll_ttl_s: float = _POLL_TTL_S,
     stop_event: asyncio.Event | None = None,
+    active_hosts_resolver: ActiveHostsResolver | None = None,
 ) -> None:
     """Forever loop. Cancellable via `stop_event` (for clean shutdown
-    in deployments that own a stop signal) or via `task.cancel()`."""
+    in deployments that own a stop signal) or via `task.cancel()`.
+
+    `active_hosts_resolver` (optional) gates which cached hosts get an
+    age-patch published. When provided, a host whose cached state still
+    has `active_room_id` set but whose SQL-side room is over (clean
+    disconnect OR silent worker drop) is skipped — preventing the
+    tick loop from propagating phantom-live deltas every 5 s until the
+    5-min sweeper clears the cache. When omitted, every host with a
+    cached `active_room_id` gets a patch (legacy behavior, used by
+    tests that don't need the SQL gate).
+    """
     logger.info(
-        "state-cache tick task started (interval=%.1fs, poll_ttl=%.1fs)",
-        interval_s, poll_ttl_s,
+        "state-cache tick task started (interval=%.1fs, poll_ttl=%.1fs, gate=%s)",
+        interval_s, poll_ttl_s, "sql" if active_hosts_resolver else "off",
     )
     try:
         while True:
@@ -67,7 +84,9 @@ async def run_state_tick_loop(
                 # process adapter holds a threading.Lock briefly per
                 # host — keeping all that off the loop is the right
                 # call.
-                await asyncio.to_thread(_tick_once, state_cache, poll_ttl_s)
+                await asyncio.to_thread(
+                    _tick_once, state_cache, poll_ttl_s, active_hosts_resolver,
+                )
             except Exception:
                 logger.exception("state tick failed (continuing)")
 
@@ -88,14 +107,24 @@ async def run_state_tick_loop(
         raise
 
 
-def _tick_once(state_cache: TikTokStateCachePort, poll_ttl_s: float) -> None:
+def _tick_once(
+    state_cache: TikTokStateCachePort,
+    poll_ttl_s: float,
+    active_hosts_resolver: ActiveHostsResolver | None = None,
+) -> None:
     """One sweep. Reads `list_versions()` to find known hosts,
     inspects each for activeness, and publishes age updates.
 
     Implemented as a plain sync function so the test suite can drive
-    it directly without a running event loop."""
+    it directly without a running event loop.
+
+    When `active_hosts_resolver` is provided, a single batched call
+    resolves which candidates have a live room in SQL — non-live ones
+    are skipped (their cached `active_room_id` is phantom)."""
     now = datetime.now(timezone.utc)
     versions = state_cache.list_versions()
+    # First pass: collect candidates whose cached state claims live.
+    candidates: list[tuple[str, dict[str, Any]]] = []
     for host in versions:
         cached = state_cache.get(host)
         if not cached:
@@ -103,6 +132,26 @@ def _tick_once(state_cache: TikTokStateCachePort, poll_ttl_s: float) -> None:
         _, state = cached
         if not state.get("active_room_id"):
             continue  # idle host — no publish
+        candidates.append((host, state))
+    if not candidates:
+        return
+    # SQL-authority gate. Hosts not in the active set are phantom-live
+    # (worker died, never wrote a live_end event); skipping them stops
+    # the 5-s tick loop from broadcasting age deltas for a stuck cache.
+    # The 5-min sweeper still owns clearing the cache itself; this
+    # gate only prevents fresh deltas in the interim.
+    active_set: set[str] | None = None
+    if active_hosts_resolver is not None:
+        try:
+            active_set = active_hosts_resolver([h for h, _ in candidates])
+        except Exception:
+            logger.exception(
+                "state tick: active_hosts_resolver failed — falling through to legacy behavior"
+            )
+            active_set = None  # fall through to "publish every candidate"
+    for host, state in candidates:
+        if active_set is not None and host not in active_set:
+            continue  # phantom-live — drop the age patch
         patch = _build_age_patch(state, now, poll_ttl_s)
         if patch:
             state_cache.apply_patch(host, patch)

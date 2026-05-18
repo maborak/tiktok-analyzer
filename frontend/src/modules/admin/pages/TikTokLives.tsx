@@ -30,6 +30,7 @@ const TikTokGifterDetailModal = lazy(() =>
 import { TikTokCommonGiftersTable } from '@admin/components/TikTokCommonGiftersTable';
 import { TikTokFavoriteGiftersTable } from '@admin/components/TikTokFavoriteGiftersTable';
 import { TikTokRealtimeIndicator } from '@admin/components/TikTokRealtimeIndicator';
+import { SafeAvatar } from '@admin/components/SafeAvatar';
 import { TikTokTimezonePill } from '@admin/components/TikTokTimezonePill';
 import {
   TikTokTimezoneProvider,
@@ -545,7 +546,7 @@ function TikTokLivesBody() {
           bar so it's visible on every tab. Useful even when the admin
           is on Common Gifters / Worker / etc. (Settings is a separate
           sidebar page — not a tab here.) */}
-      <div className="flex flex-wrap items-center gap-2">
+      <div className="relative flex flex-wrap items-center gap-2" data-debug>
         <Input
           placeholder="@username — add a new TikTok creator"
           value={newHandle}
@@ -568,7 +569,7 @@ function TikTokLivesBody() {
 
       {/* Tab strip. Settings is intentionally absent — it has its own
           sidebar entry + route at /admin/tiktok/settings. */}
-      <div className="flex items-center gap-1 border-b border-gray-200 -mb-px overflow-x-auto">
+      <div className="relative flex items-center gap-1 border-b border-gray-200 -mb-px overflow-x-auto" data-debug>
         <PageTabButton active={tab === 'lives'} onClick={() => setTab('lives')}>
           <Radio className="w-3.5 h-3.5" />
           Lives
@@ -610,8 +611,8 @@ function TikTokLivesBody() {
       {/* Lives search + status filter — same row on md+, stacked on
           mobile. The Add subscription field lives OUTSIDE the tabs
           (page-level), so this row is search + filter only. */}
-      <div className="flex flex-col md:flex-row md:items-center gap-2">
-        <div className="relative flex-1 focus-within:ring-2 focus-within:ring-primary-500/30 focus-within:border-primary-500 rounded-md border-2 border-gray-200 bg-white dark:bg-gray-100/5 transition-colors">
+      <div className="relative flex flex-col md:flex-row md:items-center gap-2" data-debug>
+        <div className="relative flex-1 focus-within:ring-2 focus-within:ring-primary-500/30 focus-within:border-primary-500 rounded-md border-2 border-gray-200 bg-white dark:bg-gray-100/5 transition-colors" data-debug>
           <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-500 pointer-events-none" />
           <input
             type="search"
@@ -685,7 +686,7 @@ function TikTokLivesBody() {
       {filteredSubs.length > 0 && (
         <>
           {/* Sort selector — purely client-side over the loaded list. */}
-          <div className="flex items-center gap-2 text-[11px] font-mono text-gray-500 flex-wrap">
+          <div className="relative flex items-center gap-2 text-[11px] font-mono text-gray-500 flex-wrap" data-debug>
             <span className="hidden sm:inline">Sort:</span>
             {([
               { id: 'live',             label: 'Live first' },
@@ -715,7 +716,7 @@ function TikTokLivesBody() {
               forces wrap-heavy layouts that look like soup. Wider
               gap-4 vs gap-3 so the live-card rose accent doesn't
               touch its neighbour. */}
-          <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+          <div className="relative grid grid-cols-1 xl:grid-cols-2 gap-4" data-debug>
             {filteredSubs.map((s) => (
               <SubscriptionCard
                 key={s.unique_id}
@@ -877,7 +878,8 @@ function SubscriptionCardImpl({ sub, electron, summary, readOnly, onToggle, onDe
 
   return (
     <div
-      className={`rounded-lg border border-gray-200 ${cardAccent} bg-white dark:bg-white/5 p-3 flex flex-col gap-3 transition-shadow hover:shadow-sm`}
+      className={`relative rounded-lg border border-gray-200 ${cardAccent} bg-white dark:bg-white/5 p-3 flex flex-col gap-3 transition-shadow hover:shadow-sm`}
+      data-debug
     >
       {/* Top row: avatar + identity + state pill.
           In readOnly (public) mode, the click target drills into the
@@ -886,7 +888,7 @@ function SubscriptionCardImpl({ sub, electron, summary, readOnly, onToggle, onDe
           namespace + every admin-write affordance hidden. The previous
           behaviour was an external link to tiktok.com itself, but the
           user expects the click to OPEN the deep-dive view we serve. */}
-      <div className="flex items-start gap-3">
+      <div className="relative flex items-start gap-3" data-debug>
         {readOnly ? (
           <Link
             to="/lives/$handle"
@@ -895,19 +897,17 @@ function SubscriptionCardImpl({ sub, electron, summary, readOnly, onToggle, onDe
             className="flex items-start gap-3 flex-1 min-w-0 group"
           >
             <div className="relative shrink-0">
-              {sub.avatar_url ? (
-                <img
-                  src={sub.avatar_url}
-                  alt=""
-                  className="w-14 h-14 rounded-full object-cover ring-2 ring-gray-100 dark:ring-white/10 group-hover:ring-primary-200 transition-shadow"
-                  referrerPolicy="no-referrer"
-                  loading="lazy"
-                />
-              ) : (
-                <div className="w-14 h-14 rounded-full bg-gray-100 text-gray-400 flex items-center justify-center text-lg font-bold">
-                  {(sub.unique_id[0] || '?').toUpperCase()}
-                </div>
-              )}
+              <SafeAvatar
+                src={sub.avatar_url}
+                alt=""
+                size={56}
+                className="ring-2 ring-gray-100 dark:ring-white/10 group-hover:ring-primary-200 transition-shadow"
+                fallback={
+                  <span className="text-lg font-bold">
+                    {(sub.unique_id[0] || '?').toUpperCase()}
+                  </span>
+                }
+              />
               {isLive && (
                 <span
                   className="absolute -bottom-1 left-1/2 -translate-x-1/2 inline-flex items-center gap-1 rounded-full bg-emerald-600 text-white text-[9px] font-bold tracking-wider px-1.5 py-0.5 ring-2 ring-white dark:ring-gray-900 shadow-sm"
@@ -978,19 +978,17 @@ function SubscriptionCardImpl({ sub, electron, summary, readOnly, onToggle, onDe
           className="flex items-start gap-3 flex-1 min-w-0 group"
         >
           <div className="relative shrink-0">
-            {sub.avatar_url ? (
-              <img
-                src={sub.avatar_url}
-                alt=""
-                className="w-14 h-14 rounded-full object-cover ring-2 ring-gray-100 dark:ring-white/10 group-hover:ring-primary-200 transition-shadow"
-                referrerPolicy="no-referrer"
-                loading="lazy"
-              />
-            ) : (
-              <div className="w-14 h-14 rounded-full bg-gray-100 text-gray-400 flex items-center justify-center text-lg font-bold">
-                {(sub.unique_id[0] || '?').toUpperCase()}
-              </div>
-            )}
+            <SafeAvatar
+              src={sub.avatar_url}
+              alt=""
+              size={56}
+              className="ring-2 ring-gray-100 dark:ring-white/10 group-hover:ring-primary-200 transition-shadow"
+              fallback={
+                <span className="text-lg font-bold">
+                  {(sub.unique_id[0] || '?').toUpperCase()}
+                </span>
+              }
+            />
             {isLive && (
               <span
                 className="absolute -bottom-1 left-1/2 -translate-x-1/2 inline-flex items-center gap-1 rounded-full bg-emerald-600 text-white text-[9px] font-bold tracking-wider px-1.5 py-0.5 ring-2 ring-white dark:ring-gray-900 shadow-sm"
@@ -1081,7 +1079,7 @@ function SubscriptionCardImpl({ sub, electron, summary, readOnly, onToggle, onDe
           via the wrapper sizes for touch (audit fix).
           Entire row suppressed in read-only mode. */}
       {!readOnly && (
-      <div className="flex flex-wrap items-center gap-2 border-t border-gray-200 dark:border-white/10 pt-2">
+      <div className="relative flex flex-wrap items-center gap-2 border-t border-gray-200 dark:border-white/10 pt-2" data-debug>
         <Link
           to="/admin/tiktok/$handle"
           params={{ handle: sub.unique_id }}
@@ -1207,7 +1205,7 @@ export const SubscriptionCard = memo(SubscriptionCardImpl);
 
 function LivesTotalsStrip({ totals }: { totals: TikTokLivesTotals }) {
   return (
-    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+    <div className="relative grid grid-cols-2 sm:grid-cols-4 gap-2" data-debug>
       <TotalCell
         label="Live now"
         value={`${totals.n_live} / ${totals.n_total}`}
@@ -1252,8 +1250,9 @@ function TotalCell({
   }[tone];
   return (
     <div
-      className="rounded-md border border-gray-200 bg-white dark:bg-white/5 px-3 py-2"
+      className="relative rounded-md border border-gray-200 bg-white dark:bg-white/5 px-3 py-2"
       title={hint}
+      data-debug
     >
       <div className="text-[10px] uppercase tracking-wider text-gray-500 font-mono">
         {label}
@@ -1364,19 +1363,21 @@ function ActivityStrip({
           line below. Cell values default to "—" so the grid stays
           structurally stable while the first poll comes in. */}
       {isLive && (
-        <ScoreboardGrid
-          diamonds={diamonds}
-          viewers={viewers}
-          viewerHistory={summary?.viewer_history}
-          stats={stats}
-          uniqueGifters={nUnique}
-          firstTimeGifters={nFirstTime}
-          durationMin={durationMin}
-          nPauses={summary?.n_pauses ?? 0}
-          lastPauseAgeS={summary?.last_pause_age_s ?? null}
-          nEnvelopes={summary?.n_envelopes_session ?? 0}
-          envelopeDiamonds={summary?.envelope_diamonds_session ?? 0}
-        />
+        <div className="relative" data-debug>
+          <ScoreboardGrid
+            diamonds={diamonds}
+            viewers={viewers}
+            viewerHistory={summary?.viewer_history}
+            stats={stats}
+            uniqueGifters={nUnique}
+            firstTimeGifters={nFirstTime}
+            durationMin={durationMin}
+            nPauses={summary?.n_pauses ?? 0}
+            lastPauseAgeS={summary?.last_pause_age_s ?? null}
+            nEnvelopes={summary?.n_envelopes_session ?? 0}
+            envelopeDiamonds={summary?.envelope_diamonds_session ?? 0}
+          />
+        </div>
       )}
 
       {/* Optional context chips ABOVE the scoreboard — the
@@ -1487,15 +1488,15 @@ function ActivityStrip({
           </span>
           {favs.slice(0, 3).map((f) => (
             <span key={f.user_id || f.unique_id || ''} className="inline-flex items-center gap-1 text-gray-600">
-              {f.avatar_url ? (
-                <img
+              {f.avatar_url && (
+                <SafeAvatar
                   src={f.avatar_url}
                   alt=""
-                  className="w-4 h-4 rounded-full ring-1 ring-white dark:ring-white/10"
-                  referrerPolicy="no-referrer"
-                  loading="lazy"
+                  size={16}
+                  className="ring-1 ring-white dark:ring-white/10"
+                  fallback={<></>}
                 />
-              ) : null}
+              )}
               @{f.unique_id || '—'}
             </span>
           ))}
@@ -1509,7 +1510,7 @@ function ActivityStrip({
           podium). Falls back to a static chip when no
           `onSelectGifter` handler was passed in. */}
       {topGifters.length > 0 && topGifters[0]?.diamonds > 0 && (
-        <div className="flex items-center gap-1.5 flex-wrap text-[10px] font-mono">
+        <div className="relative flex items-center gap-1.5 flex-wrap text-[10px] font-mono" data-debug>
           <span className="text-gray-500 shrink-0">👑 Top:</span>
           {topGifters.slice(0, 3).map((g, i) => {
             const handleClick = () => {
@@ -1535,15 +1536,15 @@ function ActivityStrip({
                 className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-gray-50 dark:bg-white/5 text-gray-700 hover:bg-gray-100 dark:hover:bg-white/10 transition-colors cursor-pointer disabled:cursor-default"
                 title={`${g.nickname || g.unique_id || ''} — open full history`}
               >
-                {g.avatar_url ? (
-                  <img
+                {g.avatar_url && (
+                  <SafeAvatar
                     src={g.avatar_url}
                     alt=""
-                    className="w-4 h-4 rounded-full ring-1 ring-white dark:ring-white/10"
-                    referrerPolicy="no-referrer"
-                    loading="lazy"
+                    size={16}
+                    className="ring-1 ring-white dark:ring-white/10"
+                    fallback={<></>}
                   />
-                ) : null}
+                )}
                 <span className="truncate max-w-[6rem]">@{g.unique_id ?? '—'}</span>
                 <span className="text-amber-700 dark:text-amber-300 tabular-nums">
                   {compactCount(g.diamonds)}💎
@@ -1557,20 +1558,22 @@ function ActivityStrip({
       {/* Audience composition (gifters · new) is rendered inline
           inside the scoreboard grid above. */}
 
-      {/* Activity row — 60-min diamond sparkline + 7-day heatmap in
-          a 50/50 split. When one side has no data we still hold its
-          slot with a dashed "no activity" placeholder so the row
-          stays visually balanced. */}
+      {/* Activity row — 60-min diamond sparkline + 7-day heatmap.
+          Side-by-side at sm+ (≥640px); stacked full-width on narrower
+          viewports so the heatmap's fixed 7-cell strip doesn't crash
+          the sparkline into a 100px-wide slot. When one side has no
+          data we still hold its slot with a dashed placeholder so
+          the row stays visually balanced at the sm+ breakpoint. */}
       {(hourly.some((v) => v > 0) || (summary?.week_calendar?.some((d) => d.diamonds > 0 || d.rooms > 0))) && (
-        <div className="grid grid-cols-2 gap-3 items-center">
-          <div className="min-w-0">
+        <div className="relative grid grid-cols-1 sm:grid-cols-2 gap-3 items-center" data-debug>
+          <div className="relative min-w-0" data-debug>
             {hourly.some((v) => v > 0) ? (
               <Sparkline values={hourly} />
             ) : (
               <NoActivityLine label="60m" />
             )}
           </div>
-          <div className="min-w-0 flex justify-start">
+          <div className="relative min-w-0 flex justify-start" data-debug>
             {summary?.week_calendar && summary.week_calendar.some((d) => d.diamonds > 0 || d.rooms > 0) ? (
               <WeekHeatmap days={summary.week_calendar} />
             ) : (
@@ -1657,12 +1660,12 @@ function WeekHeatmap({ days }: { days: NonNullable<TikTokLiveSummary['week_calen
 
   return (
     <div
-      className="inline-block"
+      className="block w-full"
       title={`Last 7 days — ${total.toLocaleString()} 💎 total`}
     >
       <div
         className="grid gap-x-[2px] gap-y-[2px]"
-        style={{ gridTemplateColumns: 'repeat(7, 2.25rem)' }}
+        style={{ gridTemplateColumns: 'repeat(7, minmax(0, 1fr))' }}
       >
         {/* Header row — weekday letter for each day. */}
         {cells.map((c, i) => (

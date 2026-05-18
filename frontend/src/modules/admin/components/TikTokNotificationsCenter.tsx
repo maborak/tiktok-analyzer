@@ -50,6 +50,7 @@ import { useNotifications } from '@admin/hooks/useNotifications';
 import { fmtMonthDayTime, useTikTokTimezone } from '@admin/contexts/TikTokTimezoneContext';
 import { Button } from '@/components/ui/Button';
 import { Modal } from '@/components/ui/Modal';
+import { SafeAvatar } from '@admin/components/SafeAvatar';
 import {
   TikTokUserBadges,
   type IdentityBlock,
@@ -666,19 +667,16 @@ function NotificationItem({
       <div className="flex items-start gap-3">
         {/* Avatar + type-icon corner badge. */}
         <div className="relative shrink-0">
-          {avatarUrl ? (
-            <img
-              src={avatarUrl}
-              alt=""
-              className="w-10 h-10 rounded-full object-cover ring-1 ring-gray-200 dark:ring-white/10"
-              referrerPolicy="no-referrer"
-              loading="lazy"
-            />
-          ) : (
-            <div className="w-10 h-10 rounded-full bg-gray-100 dark:bg-white/10 text-gray-500 flex items-center justify-center text-xs font-bold">
-              {seed}
-            </div>
-          )}
+          <SafeAvatar
+            src={avatarUrl}
+            alt=""
+            size={40}
+            className="ring-1 ring-gray-200 dark:ring-white/10"
+            fallback={
+              <span className="text-xs font-bold text-gray-500">{seed}</span>
+            }
+          />
+
           <span
             className={`absolute -bottom-0.5 -right-0.5 inline-flex items-center justify-center w-4 h-4 rounded-full text-white ring-2 ring-white dark:ring-gray-900 ${typeBadgeBg}`}
             aria-hidden

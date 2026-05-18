@@ -5,6 +5,92 @@ Format: https://keepachangelog.com/en/1.0.0/
 
 ---
 
+## [Unreleased] — 2026-05-15
+
+> Commit: `260dbfb` — 23 files / +1,792 / −295. Lives-list cold-mount
+> overhaul, public-page realtime parity, cache observability.
+> **Cold mount `/admin/tiktok/lives/bundle`: 29,382 → 667 ms (44× faster, −97.7 %)**
+> on a 79-handle, 15.9M-event install. Warm p50: 36.7 → 32.1 ms.
+
+### Backend
+
+- **Phase 9.1 — pre-agg read switch**: `_week_calendar_cached.wk_diam` now
+  reads `tiktok_event_hour_counts.diamonds` (already write-bumped) instead
+  of scanning 8 days of raw gift events with JSONB heap fetches
+  (9.15 s → 2 ms). New `tiktok_event_type_hour_counts.diamonds` column +
+  idempotent backfill migration
+  (`backend/database/migrations/add_event_type_hour_counts_diamonds.py`).
+- **Phase 9.2 — `tiktok_room_stats` pre-agg table**: new write-time
+  per-room aggregates (diamonds / n_gifts / n_comments / peak_viewers)
+  bumped inline in `persist_event_full`. Replaces four JSONB heap-fetch
+  scans (`_lives_summary_last_broadcasts.stats`, `_lives_summary_session_diamonds`,
+  `_lives_summary_30d_averages.avg_diamonds`, `_lives_summary_median_diamonds`)
+  with PK lookups. Multi-host attribution baked in at write time —
+  session_diamonds picks up the attribution fix it was missing.
+  Migration: `backend/database/migrations/add_tiktok_room_stats.py`
+  (1045 rooms backfilled). `_bump_event_hour_count` now returns
+  `(diamonds_delta, gift_attributed)` so the inline path threads the
+  attribution decision without a second lookup
+  (`backend/adapters/persistence/tiktok_persistence.py`).
+- **Phase 9.3 — public route async + cache headers**: `/public/tiktok/lives`
+  is now `async def` + `asyncio.to_thread` for the SQL fan-out. New
+  per-tz singleflight (`_public_lives_summary_locks`). `_set_cache_headers`
+  emits `Cache-Control: public, max-age=15, s-maxage=15` (was `no-store`
+  contradicting its docstring), letting CDNs + browser caches collapse
+  concurrent-viewer fan-out on shared public URLs
+  (`backend/routes/public_tiktok.py`, `backend/domain/services/tiktok_service.py`).
+- **Phase 9.4 — cache observability**: `TikTokService.get_cache_stats()`
+  + `GET /admin/tiktok/cache/stats` expose hit/miss counters per cache
+  layer. Steady-state ratios: lives_summary 81 %, lives_totals 87 %
+  (`backend/domain/services/tiktok_service.py`, `backend/routes/admin/tiktok.py`).
+- **Profile-scraper refactor** (pre-existing on branch, folded in): SIGI
+  scrape is now PRIMARY liveness, Euler is fallback. Saves Euler quota
+  and survives Euler outages
+  (`backend/adapters/tiktok_profile_scraper.py`).
+- **`on_offline` callback** on `TikTokLiveSession`: listener notifies
+  supervisor when host goes offline, separate signal from `is_live=False`
+  (`backend/adapters/tiktok_live_client.py`, `backend/ports/tiktok_live.py`).
+
+### Frontend
+
+- **`seedVersions` on `useTikTokLivesSocket`**: admin Lives page and public
+  Lives page both seed the WS hook's per-host version cursor from the
+  polled bundle, so a reconnect requests snapshots for every host the
+  page already knows about. Previously, the version map was empty if
+  the WS dropped before the first delta arrived — cards stayed stale
+  until the next 5-minute reconcile
+  (`frontend/src/modules/admin/hooks/useTikTokLivesSocket.ts`,
+  `frontend/src/modules/admin/pages/TikTokLives.tsx`).
+- **Public page WS**: `PublicLives.tsx` now mounts
+  `useTikTokLivesSocket({audience: 'public'})` — sub-second deltas for
+  diamonds / viewer count / top gifters / active match. Infrastructure
+  was already shipped server-side; just wiring the consumer
+  (`frontend/src/modules/public/pages/PublicLives.tsx`).
+- **Worker telemetry**: new `ProfileScrapesCard` exposing SIGI scrape
+  volume + WAF pressure
+  (`frontend/src/modules/admin/components/TikTokWorkerTelemetry.tsx`).
+
+### Tooling / Docs
+
+- **Design doc** `docs/antigravity/db_perf_2026_05_15_phase9.md` — full
+  DBA-verifiable writeup: schema rationale, attribution semantics,
+  parity SQL operators can run, trade-offs, lessons, follow-up backlog.
+- **External AI audit responses** (`docs/antigravity/report.md`,
+  `applied_postgres_query_planner_optimizations.md`,
+  `applied_performance_report_2026_05_15.md`) — audit findings from a
+  remote AI plus our verdict matrix (0 actionable bugs from the
+  worker bug report; valid CTE blind spots flagged for follow-up).
+- **Perf snapshots**: `.claude/tracking/perf/phase-9-{baseline,1,2,4}.json`
+  capturing the before/after of each phase.
+
+> **Operator follow-up**: the standalone `run-listener` worker must be
+> restarted to pick up the new `_bump_room_stats` write call (uvicorn
+> `--reload` only catches API code changes). After restart, re-run
+> `add_tiktok_room_stats.py` — idempotent — to catch the gap between
+> migration and worker restart.
+
+---
+
 ## [Unreleased] — 2026-05-13
 
 > Commit: `ae13809` — 42 files / +3,321 / −820. Lives-list page perf

@@ -12,6 +12,7 @@ import { GoogleOAuthWrapper } from './components/GoogleOAuthWrapper';
 import { connectivityConfig } from './config/env';
 import { routeTree } from './routeTree.gen';
 import { LiveChatWidget } from '@livechat';
+import { DebugOverlay, DebugToggle } from '@admin/components/DebugLabel';
 
 const router = createRouter({ routeTree })
 
@@ -34,6 +35,13 @@ function App() {
                   <div className="App relative">
                     <RouterProvider router={router} />
                     <LiveChatWidget />
+                    {/* Admin-only debug labels: a top-center toggle
+                        pill + a DOM overlay that decorates every
+                        element carrying `data-debug` with a unique
+                        4-character code so the operator can refer to
+                        it by name. Toggle persists in localStorage. */}
+                    <DebugOverlay />
+                    <DebugToggle />
                     <Toaster
                       position="bottom-center"
                       containerClassName="toaster-container"

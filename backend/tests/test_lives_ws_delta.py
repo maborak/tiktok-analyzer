@@ -68,12 +68,27 @@ def _recv_with_timeout(ws, timeout: float = WS_RECV_TIMEOUT_S) -> str:
 
 
 class _FakePersistence:
-    """Minimal persistence stand-in. The WS endpoint only reads
-    `_state_cache` off persistence; it doesn't do DB I/O on the WS
-    path. Avoids spinning up the full adapter for unit testing."""
+    """Minimal persistence stand-in. The WS endpoint reads
+    `_state_cache` off persistence and (after the 2026-05-16 phantom-
+    live fix) calls `get_hosts_with_active_room` to gate snapshot
+    replies against SQL authority. The test default is "every queried
+    host is active" — tests that exercise the phantom-live path
+    override `_active_hosts` to drive specific scenarios."""
 
-    def __init__(self, state_cache: TikTokStateCacheInProc) -> None:
+    def __init__(
+        self,
+        state_cache: TikTokStateCacheInProc,
+        *,
+        active_hosts: set[str] | None = None,
+    ) -> None:
         self._state_cache = state_cache
+        # `None` means "everything passed in is active" — see method.
+        self._active_hosts = active_hosts
+
+    def get_hosts_with_active_room(self, handles: list[str]) -> set[str]:
+        if self._active_hosts is None:
+            return set(handles)
+        return {h for h in handles if h in self._active_hosts}
 
 
 class _FakeTikTokService:
@@ -98,6 +113,41 @@ class _FakeTikTokService:
         shape but with a tiny test allowlist."""
         allow = {"diamonds_session", "viewer_count", "top_gifters"}
         return {k: v for k, v in patch.items() if k in allow}
+
+    # Subset of `_CACHE_OVERLAY_FIELDS` from the real service. The
+    # fake doesn't need to enumerate every field — just enough to
+    # let tests assert that "host without active room gets these
+    # fields stripped" actually happens through the fake.
+    _SESSION_FIELDS: frozenset[str] = frozenset({
+        "diamonds_session",
+        "viewer_count",
+        "top_gifters",
+        "active_room_id",
+        "session_stats",
+    })
+
+    def sanitize_cached_snapshot(
+        self,
+        host: str,
+        data: dict[str, Any],
+        *,
+        active_hosts: set[str] | None = None,
+    ) -> dict[str, Any]:
+        """Mirror the real service's SQL-authority gate: if the host
+        is NOT in `active_hosts` (i.e. no SQL-confirmed live room),
+        strip session-scoped fields and any `_*` aux key. With the
+        pass-through original, no test could catch a regression where
+        the strip step was accidentally bypassed."""
+        norm = host.lstrip("@").strip().lower()
+        if active_hosts is None:
+            active_hosts = self._persistence.get_hosts_with_active_room([norm])
+        if norm in active_hosts:
+            return data
+        return {
+            k: v
+            for k, v in data.items()
+            if k not in self._SESSION_FIELDS and not k.startswith("_")
+        }
 
     # The admin event-pump helpers from `routes.admin.tiktok` get
     # called with this service — they expect `add_listener` /

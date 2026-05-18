@@ -332,6 +332,7 @@ export function TikTokCommonGiftersTable({ refreshKey = 0, mode = 'common' }: Pr
             nickname={selected.nickname ?? null}
             uniqueId={selected.unique_id ?? null}
             avatarUrl={selected.avatar_url ?? null}
+            isEnigma={selected.is_enigma}
             onClose={() => setSelected(null)}
             defaultTab="profile"
           />

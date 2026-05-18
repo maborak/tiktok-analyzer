@@ -26,6 +26,7 @@ interface Props {
     gifts: number;
     comments: number;
     tab: 'gifts' | 'comments';
+    isEnigma?: boolean;
   }) => void;
   /** Bubble the server-side total up to the parent — the live-detail
    *  page uses this to render `Top gifters (N)` on the tab label. */
@@ -191,6 +192,7 @@ function TikTokRoomGiftersTableImpl({
                       gifts: g.gifts,
                       comments: g.comments,
                       tab: 'gifts',
+                      isEnigma: g.is_enigma,
                     })
                   }
                   title="Click for full gift history"
@@ -214,6 +216,19 @@ function TikTokRoomGiftersTableImpl({
                         <div className="flex items-center gap-1.5 flex-wrap">
                           <span className="font-medium truncate">{g.nickname ?? '—'}</span>
                           <TikTokUserBadges identity={g.identity} />
+                          {/* Per-room Enigma badges — the placeholder
+                              names this user gifted under IN THIS
+                              room/window. Only renders when at least
+                              one gift was sent anonymously. */}
+                          {(g.room_enigma_aliases ?? []).map((alias) => (
+                            <span
+                              key={alias}
+                              title={`This user sent at least one gift here while masked as "${alias}"`}
+                              className="inline-flex items-center px-1.5 py-0.5 rounded-full font-mono text-[9px] bg-violet-50 text-violet-700 ring-1 ring-violet-200 dark:bg-violet-500/10 dark:text-violet-300 dark:ring-violet-500/30"
+                            >
+                              🎭 {alias}
+                            </span>
+                          ))}
                         </div>
                         {g.unique_id && (
                           <div className="text-[11px] text-gray-500 font-mono truncate">
@@ -325,6 +340,15 @@ function TikTokRoomGiftersTableImpl({
                     <div className="flex items-center gap-1.5 flex-wrap">
                       <span className="font-medium truncate text-sm">{g.nickname ?? '—'}</span>
                       <TikTokUserBadges identity={g.identity} />
+                      {(g.room_enigma_aliases ?? []).map((alias) => (
+                        <span
+                          key={alias}
+                          title={`Gifted here as "${alias}"`}
+                          className="inline-flex items-center px-1.5 py-0.5 rounded-full font-mono text-[9px] bg-violet-50 text-violet-700 ring-1 ring-violet-200 dark:bg-violet-500/10 dark:text-violet-300 dark:ring-violet-500/30"
+                        >
+                          🎭 {alias}
+                        </span>
+                      ))}
                     </div>
                     {g.unique_id && (
                       <div className="text-[11px] text-gray-500 font-mono truncate">

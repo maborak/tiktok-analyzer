@@ -4,6 +4,7 @@ import { Link } from '@tanstack/react-router';
 
 import { Button } from '@/components/ui/Button';
 import { Modal } from '@/components/ui/Modal';
+import { SafeAvatar } from '@admin/components/SafeAvatar';
 import { TikTokGifterModal } from '@admin/components/TikTokGifterModal';
 import { TikTokCommonGifterDetailModal } from '@admin/components/TikTokCommonGifterDetailModal';
 import { useTikTokApi } from '@admin/contexts/TikTokApiContext';
@@ -44,6 +45,10 @@ interface UnifiedProps {
   uniqueId?: string | null;
   nickname?: string | null;
   avatarUrl?: string | null;
+  /** Sticky Enigma flag — when TRUE, renders an ENIGMA badge next to
+   *  the profile name in the modal header. Passed through from the
+   *  calling table row. */
+  isEnigma?: boolean;
   /** Headline diamonds / gifts / comments from the leaderboard row
    *  the user just clicked. Threaded straight to the Current tab so
    *  its scope banner matches the table without an extra fetch. */
@@ -82,6 +87,7 @@ export function TikTokGifterDetailModal({
   uniqueId,
   nickname,
   avatarUrl,
+  isEnigma,
   diamondsTotal,
   giftsCount,
   commentsCount,
@@ -164,6 +170,35 @@ export function TikTokGifterDetailModal({
     return () => { cancelled = true; };
   }, [isOpen, uniqueId, isAdmin, tiktokApi]);
 
+  // Lightweight fetch of `enigma_aliases` for the modal header. The
+  // inner CommonGifterDetailModal already fetches the same endpoint
+  // for the Profile tab; both calls dedupe to one round-trip via
+  // `getCommonGifterDetail`'s cacheTtlMs + dedupe options.
+  // Falls back to the `isEnigma` prop value when the fetch hasn't
+  // resolved yet (or fails) so the badge appears immediately.
+  const [enigmaAliases, setEnigmaAliases] = useState<string[]>([]);
+  const [enigmaFromFetch, setEnigmaFromFetch] = useState<boolean | undefined>(undefined);
+  useEffect(() => {
+    if (!isOpen || !userId) {
+      setEnigmaAliases([]);
+      setEnigmaFromFetch(undefined);
+      return;
+    }
+    let cancelled = false;
+    tiktokApi
+      .getCommonGifterDetail(userId)
+      .then((d) => {
+        if (cancelled) return;
+        setEnigmaAliases(Array.isArray(d?.enigma_aliases) ? d.enigma_aliases : []);
+        setEnigmaFromFetch(!!d?.is_enigma);
+      })
+      .catch(() => {
+        // 404 → no event history for this user_id; treat as empty.
+      });
+    return () => { cancelled = true; };
+  }, [isOpen, userId, tiktokApi]);
+  const enigmaResolved = enigmaFromFetch ?? isEnigma;
+
   // The shared identity row at the top. Both inner modals suppress
   // their own identity headers in embedded mode, so this is the sole
   // place identity appears. We only show fields we have — no
@@ -186,17 +221,15 @@ export function TikTokGifterDetailModal({
   const header = (
     <div className="flex items-start justify-between gap-4 pb-3 mb-3 border-b border-gray-200">
       <div className="flex items-center gap-3 min-w-0">
-        {avatarUrl ? (
-          <img
-            src={avatarUrl}
-            alt=""
-            className="w-10 h-10 rounded-full object-cover flex-shrink-0"
-          />
-        ) : (
-          <div className="w-10 h-10 rounded-full bg-gray-100 dark:bg-gray-100/30 flex items-center justify-center text-sm font-bold text-gray-600 flex-shrink-0">
-            {avatarChar}
-          </div>
-        )}
+        <SafeAvatar
+          src={avatarUrl}
+          alt=""
+          size={40}
+          className="flex-shrink-0"
+          fallback={
+            <span className="text-sm font-bold text-gray-600">{avatarChar}</span>
+          }
+        />
         <div className="min-w-0">
           <div className="text-base font-bold truncate">{displayName}</div>
           {uniqueId && nickname && (
@@ -204,6 +237,33 @@ export function TikTokGifterDetailModal({
           )}
           {userId && (
             <div className="text-[10px] font-mono text-gray-400 truncate">ID: {userId}</div>
+          )}
+          {/* Enigma aliases — visible regardless of which tab is
+              active. Outer-header-only render (the inner
+              CommonGifterDetailModal previously had a duplicate
+              strip below the tabs; removed). Capped at 8 inline;
+              the rest collapse into a "+N more" pill with the full
+              list in the title. */}
+          {enigmaResolved && enigmaAliases.length > 0 && (
+            <div className="mt-1 flex flex-wrap items-center gap-1 text-[10px] font-mono">
+              <span className="text-gray-500">Seen as ({enigmaAliases.length}):</span>
+              {enigmaAliases.slice(0, 8).map((alias) => (
+                <span
+                  key={alias}
+                  className="inline-flex items-center px-1.5 py-0.5 rounded-full bg-violet-50 text-violet-700 ring-1 ring-violet-200 dark:bg-violet-500/10 dark:text-violet-300 dark:ring-violet-500/30"
+                >
+                  {alias}
+                </span>
+              ))}
+              {enigmaAliases.length > 8 && (
+                <span
+                  className="inline-flex items-center px-1.5 py-0.5 rounded-full bg-violet-100 text-violet-700 ring-1 ring-violet-300 dark:bg-violet-500/20 dark:text-violet-200 dark:ring-violet-500/40"
+                  title={enigmaAliases.slice(8).join(', ')}
+                >
+                  +{enigmaAliases.length - 8} more
+                </span>
+              )}
+            </div>
           )}
         </div>
       </div>

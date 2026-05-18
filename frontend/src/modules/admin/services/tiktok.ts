@@ -554,6 +554,15 @@ export interface TikTokGifter {
    *  is_moderator / is_subscribe / is_top_gifter / member_level /
    *  gifter_level / fans_club, etc. Consumed by `TikTokUserBadges`. */
   identity?: import('@admin/components/TikTokUserBadges').IdentityBlock | null;
+  /** Sticky flag — TRUE if this user has ever been seen gifting under
+   *  TikTok's Enigma anonymous mode. The frontend renders an ENIGMA
+   *  badge next to the profile name everywhere this user appears. */
+  is_enigma?: boolean;
+  /** Distinct Enigma placeholders this user gifted under IN THIS
+   *  ROOM / WINDOW (not their full alias history). Empty when every
+   *  gift here was sent un-masked. Rendered as small purple pills
+   *  on the row so the operator can see WHICH gift was anonymous. */
+  room_enigma_aliases?: string[];
 }
 
 export interface TikTokRoomGifters {
@@ -586,6 +595,8 @@ export interface TikTokCommonGifter {
   /** Total individual gifts (repeats × distinct gift events). */
   gifts: number;
   hosts: TikTokCommonGifterHostSlice[];
+  /** See `TikTokGifter.is_enigma`. */
+  is_enigma?: boolean;
 }
 
 export interface TikTokCommonGiftersPage {
@@ -614,6 +625,8 @@ export interface TikTokCrossLiveGifter {
   gifts_elsewhere: number;
   /** Other hosts (excludes the queried host), sorted by diamonds desc. */
   other_hosts: TikTokCommonGifterHostSlice[];
+  /** See `TikTokGifter.is_enigma`. */
+  is_enigma?: boolean;
 }
 
 export interface TikTokCrossLiveGiftersPage {
@@ -756,6 +769,12 @@ export interface TikTokCommonGifterDetail {
   nickname: string | null;
   avatar_url: string | null;
   identity?: import('@admin/components/TikTokUserBadges').IdentityBlock | null;
+  /** See `TikTokGifter.is_enigma`. */
+  is_enigma?: boolean;
+  /** Every distinct Enigma placeholder we've ever seen this
+   *  user_id render under (e.g. `["Enigma 24048", "Enigma 86789"]`).
+   *  Append-only — the runtime upsert path keeps it growing. */
+  enigma_aliases?: string[];
   totals: {
     diamonds: number;
     gifts: number;
@@ -1158,11 +1177,17 @@ export const tiktokApi = {
     });
   },
 
-  /** Deep-analysis payload for a single common gifter. */
+  /** Deep-analysis payload for a single common gifter. Dedupe +
+   *  short TTL cache so a click that opens both the outer
+   *  TikTokGifterDetailModal (header read) AND the inner
+   *  TikTokCommonGifterDetailModal (full body) collapses to one
+   *  network round-trip. */
   getCommonGifterDetail(userId: string): Promise<TikTokCommonGifterDetail> {
     return apiRequest({
       method: 'GET',
       url: `${BASE}/common-gifters/${encodeURIComponent(userId)}/detail`,
+      dedupe: true,
+      cacheTtlMs: 30_000,
     });
   },
 
@@ -1686,7 +1711,90 @@ export const tiktokApi = {
       params: opts,
     });
   },
+
+  // ─── Performance traces ────────────────────────────────────────────
+  /** Recent per-request performance traces written by
+   *  `PerfTracerMiddleware`. Each trace carries a span tree, total
+   *  duration, query count, and handle (when path-scoped). */
+  listPerfTraces(opts: {
+    endpoint?: string;
+    handle?: string;
+    min_total_ms?: number;
+    limit?: number;
+  } = {}): Promise<{ items: TikTokPerfTrace[]; filters: Record<string, unknown> }> {
+    return apiRequest({
+      method: 'GET',
+      url: `${BASE}/perf/traces`,
+      params: opts,
+    });
+  },
+
+  // ─── Enigma ledger ─────────────────────────────────────────────────
+  /** Paginated list of every viewer flagged `is_enigma=TRUE`. */
+  listEnigmas(opts: {
+    q?: string;
+    status?: 'all' | 'discovered' | 'not_captured';
+    sort?: 'last_seen' | 'first_seen' | 'aliases';
+    limit?: number;
+    offset?: number;
+  } = {}): Promise<{
+    items: TikTokEnigmaViewer[];
+    total: number;
+    limit: number;
+    offset: number;
+    filters: Record<string, unknown>;
+  }> {
+    return apiRequest({
+      method: 'GET',
+      url: `${BASE}/enigmas`,
+      params: opts,
+    });
+  },
 };
+
+export interface TikTokEnigmaViewer {
+  /** TikTok user_id as a string (BigInt-safe wire form). */
+  user_id: string;
+  /** Real handle when discovered, the `Enigma NNN` placeholder
+   *  otherwise. `discovered` distinguishes the two cases. */
+  unique_id: string | null;
+  /** Real display name when discovered, the `Enigma NNN` placeholder
+   *  otherwise. UI swaps in "Not captured yet" when `discovered=false`. */
+  nickname: string | null;
+  avatar_url: string | null;
+  /** Every distinct Enigma placeholder we've ever seen this user
+   *  render under. Empty array means the user's `is_enigma=TRUE`
+   *  flag is set but we never captured the placeholder text
+   *  (shouldn't happen in normal flow; defensive). */
+  enigma_aliases: string[];
+  first_seen_at: string | null;
+  last_seen_at: string | null;
+  /** True when the stored nickname is a REAL identity (the resolver
+   *  found a non-Enigma event). False when the row still carries
+   *  the Enigma placeholder — the UI labels these "Not captured yet". */
+  discovered: boolean;
+}
+
+export interface TikTokPerfSpan {
+  name: string;
+  start_ms: number;
+  dur_ms: number;
+  meta?: Record<string, unknown>;
+}
+
+export interface TikTokPerfTrace {
+  id: number;
+  trace_id: string;
+  ts: string;
+  endpoint: string;
+  method: string;
+  status: number | null;
+  total_ms: number;
+  query_count: number | null;
+  handle: string | null;
+  spans: TikTokPerfSpan[];
+  meta: Record<string, unknown>;
+}
 
 export type TikTokWorkerLogEntry = {
   id: number;

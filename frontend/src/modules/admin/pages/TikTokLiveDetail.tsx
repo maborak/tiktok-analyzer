@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useParams } from '@tanstack/react-router';
 import {
   ArrowLeft,
@@ -165,10 +165,13 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
   // as suppressing chart-stats refetches while a chart-brush range
   // is pinned. Reset only on a full page reload.
   const userPinnedRoomRef = useRef<boolean>(false);
-  const pinRoom = (rid: string | null) => {
+  // Stable identity → safe to pass to memoized children without
+  // defeating their React.memo. State setters (setRoomId) are already
+  // stable, and the ref write doesn't escape.
+  const pinRoom = useCallback((rid: string | null) => {
     userPinnedRoomRef.current = rid != null;
     setRoomId(rid);
-  };
+  }, []);
   // Custom range derived from a chart-brush selection. When set, it
   // overrides the default "entire broadcast" view. Cleared by clicking
   // the "Reset range" pill or by switching rooms.
@@ -233,6 +236,10 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
      *  RECEIVES gifts here; their gifter activity lives in OTHER
      *  monitored lives). */
     scope?: 'profile-only';
+    /** Sticky Enigma flag carried over from the table row, so the
+     *  modal header renders the ENIGMA badge next to the profile
+     *  name without having to refetch the viewer record. */
+    isEnigma?: boolean;
   } | null>(null);
   // Selected past match for the events-modal drill-in.
   const [selectedMatch, setSelectedMatch] = useState<TikTokMatch | null>(null);
@@ -476,8 +483,13 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
 
   /** Resolve a WindowOption to concrete since/until ISO strings.
    *  Centralized so the Top Gifters comments-tab and the stats fetcher
-   *  agree on what "the current window" means. */
-  const resolveRange = (
+   *  agree on what "the current window" means.
+   *
+   *  useCallback with empty deps — the function is pure over its args
+   *  (no closure over component state), so re-creating it per render
+   *  was needlessly defeating memoized children that consume the
+   *  derived range. */
+  const resolveRange = useCallback((
     w: WindowOption,
     room: TikTokRoom | null
   ): { since?: string; until?: string; window_minutes?: number } => {
@@ -492,7 +504,7 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
       return { since: w.since, until: w.until };
     }
     return {};
-  };
+  }, []);
 
   // Range + extra room ids passed to the Top Gifters / Comments tabs.
   // In day-aggregate mode WITHOUT a brushed range we span the union of
@@ -616,6 +628,123 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
     if (tabsScope === 'alltime') return {}; // unbounded
     return tabsRange;
   }, [tabsScope, tabsRange]);
+
+  // Memoized range for the Recipients card — the card is wrapped in
+  // React.memo; passing `resolveRange(...)` inline produced a fresh
+  // object every render and defeated the memo. Recomputes only when
+  // the window or selected room changes.
+  const recipientsRange = useMemo(
+    () => resolveRange(effectiveWindow, selectedRoom),
+    [resolveRange, effectiveWindow, selectedRoom],
+  );
+
+  // Stable callback for the Comments timeline's row-click handler.
+  // Same memo-defeat trap as `recipientsRange` above — an inline
+  // lambda would re-mount the child's effect deps every WS tick.
+  const handleCommentsSelectUser = useCallback(
+    (u: { userId: string | null; uniqueId: string | null; nickname: string | null; tab?: string }) => {
+      setSelectedGifter({
+        userId: u.userId,
+        uniqueId: u.uniqueId,
+        nickname: u.nickname,
+        // Counters left undefined — the comments timeline only knows
+        // the user's identity, not their lifetime gift / comment
+        // totals. Forcing 0 here made the tab badges render "(0)"
+        // instead of "(·)". The per-tab search's own countEvents
+        // call still populates the pagination total accurately.
+        diamonds: undefined,
+        gifts: undefined,
+        comments: undefined,
+        tab: u.tab ?? 'comments',
+      });
+    },
+    [],
+  );
+
+  // Stable callback for the Calendar's day-pick handler. Replaces an
+  // inline arrow that ran on every page render — re-creating it once
+  // per WS tick was bumping `TikTokLiveCalendar`'s memo even though
+  // its data inputs (handle, rooms) hadn't moved. Deps cover the
+  // closure: `tz`, `pinRoom` (now also stable), `tiktokApi`, `handle`.
+  // State setters (`setDayWindow`, `setCustomRange`, etc.) are stable
+  // by React contract, no need to list them.
+  const handleCalendarSelectDay = useCallback(
+    (dayRooms: TikTokRoom[], date: string) => {
+      if (dayRooms.length === 0) return;
+      // Resolve the day to UTC bounds in the user's zone now so the
+      // picker, the day-aggregate fetch, and the tabs all share the
+      // same `[since, until)` window — anything that overlaps it
+      // (including tails of cross-midnight broadcasts) is in scope.
+      const bounds = zoneDayBoundsUtc(date, tz);
+      if (dayRooms.length === 1) {
+        pinRoom(dayRooms[0].room_id);
+        setAggregatedRooms(null);
+        // Keep `dayWindow` set so `effectiveWindow` (and therefore
+        // chart + tabs) filter to the picked tz-day rather than the
+        // broadcast's full extent. `aggregatedRooms` stays null
+        // because there's only one broadcast — the day-aggregate
+        // banner above the chart is gated on
+        // `aggregatedRooms.length > 1` and won't render here.
+        setDayWindow({
+          dateYmd: date,
+          since: bounds.since,
+          until: bounds.until,
+        });
+        setCustomRange(null);
+        setBrushIndices(null);
+        return;
+      }
+      // Multiple broadcasts on this day → open the picker with
+      // everything selected by default. The user can narrow with
+      // checkboxes or use Select all / none.
+      setDayPickerBounds(bounds);
+      setDayPicker({
+        date,
+        rooms: dayRooms,
+        selected: new Set(dayRooms.map((r) => r.room_id)),
+      });
+      // Refetch with day bounds so the per-row chip totals (diamonds /
+      // matches / likes) reflect only the slice on the picked day —
+      // same window the chart will use after the user confirms. A
+      // broadcast spanning midnight typically shows >90% of its
+      // activity on one side, so the unclipped chip can be off by an
+      // order of magnitude. The legacy chips are kept until the
+      // refetch resolves so the modal renders immediately.
+      (async () => {
+        try {
+          const clipped = await tiktokApi.listHostRooms(
+            handle, 200,
+            { since: bounds.since, until: bounds.until },
+          );
+          const byId = new Map(clipped.map((r) => [r.room_id, r]));
+          setDayPicker((p) => {
+            if (!p) return p;
+            return {
+              ...p,
+              rooms: p.rooms.map((r) => {
+                const c = byId.get(r.room_id);
+                if (!c) return r;
+                // Replace only the rollup fields; keep the start / end
+                // timestamps from the original (full-broadcast) row so
+                // the time labels continue to show the broadcast's
+                // actual span, not the day-clipped one.
+                return {
+                  ...r,
+                  diamonds: c.diamonds ?? r.diamonds,
+                  matches: c.matches ?? r.matches,
+                  likes: c.likes ?? r.likes,
+                };
+              }),
+            };
+          });
+        } catch {
+          // Network blip → leave the unclipped chips up; the chart
+          // will still clip when the user confirms.
+        }
+      })();
+    },
+    [tz, pinRoom, tiktokApi, handle],
+  );
 
   const fetchStats = async (rid: string, w: WindowOption, room: TikTokRoom | null) => {
     try {
@@ -1422,85 +1551,7 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
             weeks={5}
             rooms={rooms}
             onSummary={setActivitySummary}
-            onSelectDay={(dayRooms, date) => {
-              if (dayRooms.length === 0) return;
-              // Resolve the day to UTC bounds in the user's zone now
-              // so the picker, the day-aggregate fetch, and the tabs
-              // all share the same `[since, until)` window — anything
-              // that overlaps it (including tails of cross-midnight
-              // broadcasts) is in scope.
-              const bounds = zoneDayBoundsUtc(date, tz);
-              if (dayRooms.length === 1) {
-                pinRoom(dayRooms[0].room_id);
-                setAggregatedRooms(null);
-                // Keep `dayWindow` set so `effectiveWindow` (and
-                // therefore chart + tabs) filter to the picked
-                // tz-day rather than the broadcast's full extent.
-                // `aggregatedRooms` stays null because there's only
-                // one broadcast — the day-aggregate banner above
-                // the chart is gated on `aggregatedRooms.length > 1`
-                // and won't render here.
-                setDayWindow({
-                  dateYmd: date,
-                  since: bounds.since,
-                  until: bounds.until,
-                });
-                setCustomRange(null);
-                setBrushIndices(null);
-                return;
-              }
-              // Multiple broadcasts on this day → open the picker
-              // with everything selected by default. The user can
-              // narrow with checkboxes or use Select all / none.
-              // Stash the bounds first so cancel cleanly drops them.
-              setDayPickerBounds(bounds);
-              setDayPicker({
-                date,
-                rooms: dayRooms,
-                selected: new Set(dayRooms.map((r) => r.room_id)),
-              });
-              // Refetch with day bounds so the per-row chip totals
-              // (diamonds / matches / likes) reflect only the slice
-              // on the picked day — same window the chart will use
-              // after the user confirms. A broadcast spanning
-              // midnight typically shows >90% of its activity on one
-              // side, so the unclipped chip can be off by an order
-              // of magnitude. The legacy chips are kept until the
-              // refetch resolves so the modal renders immediately.
-              (async () => {
-                try {
-                  const clipped = await tiktokApi.listHostRooms(
-                    handle, 200,
-                    { since: bounds.since, until: bounds.until },
-                  );
-                  const byId = new Map(clipped.map((r) => [r.room_id, r]));
-                  setDayPicker((p) => {
-                    if (!p) return p;
-                    return {
-                      ...p,
-                      rooms: p.rooms.map((r) => {
-                        const c = byId.get(r.room_id);
-                        if (!c) return r;
-                        // Replace only the rollup fields; keep the
-                        // start / end timestamps from the original
-                        // (full-broadcast) row so the time labels
-                        // continue to show the broadcast's actual
-                        // span, not the day-clipped one.
-                        return {
-                          ...r,
-                          diamonds: c.diamonds ?? r.diamonds,
-                          matches: c.matches ?? r.matches,
-                          likes: c.likes ?? r.likes,
-                        };
-                      }),
-                    };
-                  });
-                } catch {
-                  // Network blip → leave the unclipped chips up; the
-                  // chart will still clip when the user confirms.
-                }
-              })();
-            }}
+            onSelectDay={handleCalendarSelectDay}
           />
         </div>
       </div>
@@ -1813,7 +1864,7 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
           no `to_user` targeting was captured. */}
       <TikTokRoomRecipientsCard
         roomId={roomId}
-        range={resolveRange(effectiveWindow, selectedRoom)}
+        range={recipientsRange}
         refreshKey={eventsRefreshKey}
         onSelectUser={setSelectedGifter}
       />
@@ -1999,23 +2050,7 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
             range={effectiveRange}
             refreshKey={eventsRefreshKey}
             onTotalChange={setCommentsTotal}
-            onSelectUser={(u) =>
-              setSelectedGifter({
-                userId: u.userId,
-                uniqueId: u.uniqueId,
-                nickname: u.nickname,
-                // Counters left undefined — the comments timeline only
-                // knows the user's identity, not their lifetime gift /
-                // comment totals. Forcing 0 here made the tab badges
-                // render "(0)" instead of "(·)". The per-tab search's
-                // own countEvents call still populates the pagination
-                // total accurately once data loads.
-                diamonds: undefined,
-                gifts: undefined,
-                comments: undefined,
-                tab: u.tab ?? 'comments',
-              })
-            }
+            onSelectUser={handleCommentsSelectUser}
           />
         )}
 
@@ -2043,84 +2078,13 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
 
       </section>
 
-      {/* Recent activity tail — populated EXCLUSIVELY by the WebSocket
-          stream. The public page intentionally skips the WS (see the
-          `if (readOnly) return;` guard near the WS open call) because
-          the WS endpoint is admin-auth-only and would leak non-public
-          handles' real-time feed to anonymous viewers. With no other
-          data source the section would sit on "Waiting for events…"
-          forever, so we hide it entirely in readOnly mode. The other
-          panels (gifters, comments timeline, match list) already cover
-          "what's happening" via REST polling. */}
-      {!readOnly && (
-        <section className="card">
-          <h2 className="auth-mono-label mb-2">Recent activity</h2>
-          <ul className="space-y-1 text-xs font-mono max-h-72 overflow-auto">
-            {recent.length === 0 && (
-              <li className="text-gray-500">Waiting for events…</li>
-            )}
-            {recent.map((e, i) => {
-              // When the event carries an identifiable actor, surface
-              // a small profile button so the operator can drill into
-              // that viewer's gift/comment history without searching
-              // the gifters tab. We only have payload.user.nickname
-              // for display — user_id comes through on the WS envelope.
-              const u =
-                (e.payload?.user as
-                  | { unique_id?: string; nickname?: string }
-                  | undefined) || undefined;
-              const uniqueId = u?.unique_id ?? null;
-              const nickname = u?.nickname ?? null;
-              const userId = e.user_id;
-              const hasActor = !!(userId && (uniqueId || nickname));
-              return (
-                <li key={i} className="flex items-start gap-1.5 min-w-0">
-                  <span
-                    className="shrink-0"
-                    style={{ color: eventColor(e.type) }}
-                  >
-                    {e.type}
-                  </span>
-                  <span className="text-gray-700 min-w-0 flex-1 truncate">
-                    {summarizeEvent(e)}
-                  </span>
-                  {hasActor && (
-                    <button
-                      type="button"
-                      onClick={() =>
-                        setSelectedGifter({
-                          userId,
-                          uniqueId,
-                          nickname,
-                          // Lifetime counters aren't in the WS payload —
-                          // the modal renders "(·)" badges until its
-                          // own per-tab queries populate the totals.
-                          diamonds: undefined,
-                          gifts: undefined,
-                          comments: undefined,
-                          tab: e.type === 'comment' ? 'comments' : 'gifts',
-                        })
-                      }
-                      className="shrink-0 inline-flex items-center text-gray-500 hover:text-primary-600 transition-colors"
-                      title={`Open profile — ${nickname || `@${uniqueId}` || userId}`}
-                      aria-label="Open gifter profile"
-                    >
-                      <User className="w-3.5 h-3.5" />
-                    </button>
-                  )}
-                </li>
-              );
-            })}
-          </ul>
-        </section>
-      )}
-
       <TikTokGifterDetailModal
         isOpen={selectedGifter !== null}
         onClose={() => setSelectedGifter(null)}
         userId={selectedGifter?.userId ?? null}
         uniqueId={selectedGifter?.uniqueId ?? null}
         nickname={selectedGifter?.nickname ?? null}
+        isEnigma={selectedGifter?.isEnigma}
         // Don't default to 0 — for clicks from the comments timeline
         // we don't know the user's lifetime counters, and showing
         // "(0)" on the tab badges is misleading. Leaving these
@@ -3373,24 +3337,6 @@ function CardTabButton({
       {children}
     </button>
   );
-}
-
-function summarizeEvent(e: TikTokWsEvent): string {
-  const p = e.payload || {};
-  const u = (p.user as { nickname?: string } | undefined)?.nickname || 'someone';
-  if (e.type === 'comment') return `${u}: ${String(p.text ?? '').slice(0, 80)}`;
-  if (e.type === 'gift') {
-    const base = `${u} sent ${p.gift_name ?? 'gift'} ×${p.repeat_count ?? 1} (${p.diamond_count ?? 0}💎)`;
-    const to = p.to_user as { unique_id?: string; nickname?: string } | undefined;
-    const dest = to && (to.nickname || to.unique_id);
-    return dest ? `${base} → ${to.nickname || `@${to.unique_id}`}` : base;
-  }
-  if (e.type === 'like') return `${u} liked (${p.count ?? 1})`;
-  if (e.type === 'join') return `${u} joined`;
-  if (e.type === 'match_start') return 'PK battle started';
-  if (e.type === 'match_update') return 'battle scores updated';
-  if (e.type === 'match_end') return 'battle ended';
-  return JSON.stringify(p).slice(0, 120);
 }
 
 // ─── match helpers ─────────────────────────────────────────────────

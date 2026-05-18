@@ -180,9 +180,19 @@ have actually bit this codebase before:
 | Approximation/heuristic that breaks at scale | `avg.*\*.*N\|* 0\.\d` in chart-data prep code | Pie "Others" slice (2026-05-16: heuristic was wrong by 1000× → #1 rendered as 0%) |
 | Frontend page with high-frequency state churn but no `React.memo` on heavy children | `export function .*` in `components/` AND parent has `setState` in a WS / interval handler | `TikTokLiveDetailBody` 5046-line tree reconciled per WS event before 2026-05-16 |
 | Pre-existing modification swept into commit without scrutiny | Files in `git diff --stat HEAD` whose path doesn't match the commit's headline theme | `open_match` refactor bundled into Phase 9 perf commit (2026-05-15, FK flood) |
+| New hook (`useCallback` / `useMemo` / `useRef`) added to a component without updating the top-of-file React import | new `useCallback(...)`/`useMemo(...)` call in file's diff + grep file's `from 'react'` import for the symbol | `TikTokLiveDetail.tsx` `useCallback` (2026-05-16, runtime ReferenceError crashed `<TikTokLiveDetailBody>`) |
+| Verification step that ran but did nothing (no-op pass mistaken for clean) | `npx tsc --noEmit` against a references-only tsconfig (e.g. root has `"files": []`); use `tsc -b --noEmit` instead | TikTokLiveDetail.tsx useCallback miss (2026-05-16 — empty tsc output trusted as "clean" when it was scoped to zero files) |
 
 If any finding matches one of these landmines, mark it CRITICAL
 regardless of the agent's original severity.
+
+### Frontend verification commands (use these, not the no-ops)
+
+| Goal | Correct command | Wrong command (no-op) |
+|---|---|---|
+| Type-check the whole frontend | `cd frontend && npx tsc -b --noEmit` | `cd frontend && npx tsc --noEmit` (with references-only root tsconfig, this checks zero files) |
+| Verify runtime correctness | Start dev server, exercise the feature in a browser, watch the console | tsc passing alone |
+| Verify a memoization fix | React DevTools "Highlight updates" — confirm child doesn't re-render on parent state change | "looks right in the diff" |
 
 ---
 

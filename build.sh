@@ -114,6 +114,23 @@ cmd_worker() {
   ( cd "$ROOT/backend" && exec "$ROOT/backend/.venv/bin/python" cli.py system tiktok run-listener )
 }
 
+# ── cache-warmer (proactive populator for tiktok_host_calendar_cache) ─
+
+cmd_cache_warmer() {
+  command -v python3 >/dev/null || die "python3 required"
+  ensure_backend_venv
+  say "Starting TikTok cache-warmer (watch mode, 60s interval)"
+  # Override interval / tz via env so the deploy script can tune without
+  # editing this file. Defaults match the heatmap default (26 weeks).
+  local INTERVAL="${CACHE_WARMER_INTERVAL:-60}"
+  local TZ_ARGS=()
+  for tz in ${CACHE_WARMER_TZS:-UTC}; do
+    TZ_ARGS+=("--tz" "$tz")
+  done
+  ( cd "$ROOT/backend" && exec "$ROOT/backend/.venv/bin/python" \
+      cli.py system tiktok warm-caches --watch --interval "$INTERVAL" "${TZ_ARGS[@]}" )
+}
+
 # ── client (Electron app pointing at the running framework) ─────────
 
 cmd_client() {
@@ -153,6 +170,8 @@ Usage: ./build.sh <command>
   prod         Build framework frontend for production.
   client:dmg   Build distributable .dmg of the Electron client.
   worker       Run the TikTok listener pool as a standalone worker process.
+  cache-warmer Run the host-calendar cache warmer as a daemon
+               (env: CACHE_WARMER_INTERVAL=60 CACHE_WARMER_TZS="UTC America/Lima").
   status       Show env state.
   help         This message.
 EOF
@@ -165,6 +184,7 @@ case "$mode" in
   prod)        cmd_prod ;;
   client:dmg)  cmd_client_dmg ;;
   worker)      cmd_worker ;;
+  cache-warmer) cmd_cache_warmer ;;
   status)      cmd_status ;;
   help|-h|--help|"") usage ;;
   *) usage; exit 1 ;;

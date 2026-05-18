@@ -328,7 +328,9 @@ async def patch_live_public(
     svc = _require_service()
     handle = handle.lstrip("@")
     try:
-        svc.set_subscription_public(handle, bool(update.is_public))
+        await asyncio.to_thread(
+            svc.set_subscription_public, handle, bool(update.is_public),
+        )
     except LookupError:
         raise HTTPException(status_code=404, detail="subscription not found")
     # 204 — caller polls /admin/tiktok/lives if it needs the new row.
@@ -461,7 +463,8 @@ async def aggregated_buckets(
             continue
     if not ids:
         raise HTTPException(status_code=400, detail="room_ids must be a non-empty comma-separated list of integers")
-    return svc.get_aggregated_buckets(
+    return await asyncio.to_thread(
+        svc.get_aggregated_buckets,
         ids, since=since, until=until, bucket_seconds=bucket_seconds,
     )
 
@@ -478,7 +481,8 @@ async def euler_call_history(
     settings page to surface "what's burning my Euler quota?" with
     hard numbers (per endpoint, per API key, per N-minute bin)."""
     svc = _require_service()
-    return svc.get_euler_call_history(
+    return await asyncio.to_thread(
+        svc.get_euler_call_history,
         hours=hours, bucket_minutes=bucket_minutes,
     )
 
@@ -494,7 +498,7 @@ async def worker_telemetry(
     cadence. One round-trip so the dashboard mount cost is a single
     SELECT-fan-out, not four sequential."""
     svc = _require_service()
-    return svc.get_worker_telemetry(hours=hours)
+    return await asyncio.to_thread(svc.get_worker_telemetry, hours=hours)
 
 
 @router.get("/cache/stats")
@@ -511,7 +515,110 @@ async def cache_stats(
     per call, or a TZ flipping between callers).
     """
     svc = _require_service()
-    return svc.get_cache_stats()
+    return await asyncio.to_thread(svc.get_cache_stats)
+
+
+@router.get("/perf/traces")
+async def list_perf_traces(
+    endpoint: Optional[str] = Query(
+        None,
+        description=(
+            "Filter to a single route template, e.g. "
+            "`/admin/tiktok/lives/{handle}/rooms`."
+        ),
+    ),
+    handle: Optional[str] = Query(
+        None,
+        description="Filter to a single TikTok handle (extracted from the path).",
+    ),
+    min_total_ms: int = Query(
+        0, ge=0, le=120000,
+        description="Only return traces with total duration ≥ this many ms.",
+    ),
+    limit: int = Query(50, ge=1, le=500),
+    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+):
+    """Recent per-request performance traces captured by
+    `PerfTracerMiddleware`. Each row carries the request's total
+    duration, span tree, query count, cache hit/miss stats, and
+    handle (when the path was scoped to one).
+
+    Drives a future `/admin/tiktok/perf` page; until then it's a
+    direct debugging tool — query for slow traces, inspect spans,
+    optimise."""
+    svc = _require_service()
+    pers = getattr(svc, "_persistence", None)
+    if pers is None or not hasattr(pers, "list_perf_traces"):
+        raise HTTPException(
+            status_code=503,
+            detail="perf tracer not available (persistence adapter missing)",
+        )
+    return {
+        "items": await asyncio.to_thread(
+            pers.list_perf_traces,
+            endpoint=endpoint, handle=handle,
+            min_total_ms=min_total_ms, limit=limit,
+        ),
+        "filters": {
+            "endpoint": endpoint,
+            "handle": handle,
+            "min_total_ms": min_total_ms,
+            "limit": limit,
+        },
+    }
+
+
+@router.get("/enigmas")
+async def list_enigmas(
+    q: Optional[str] = Query(
+        None,
+        description=(
+            "Substring match on stored nickname, unique_id, or any "
+            "Enigma alias the viewer has been seen under."
+        ),
+    ),
+    status: str = Query(
+        "all",
+        regex="^(all|discovered|not_captured)$",
+        description=(
+            "Filter cohort. `discovered` = stored nickname is the real "
+            "identity (we resolved them from a non-Enigma event). "
+            "`not_captured` = stored nickname is still the Enigma "
+            "placeholder (we've never seen the real name)."
+        ),
+    ),
+    sort: str = Query(
+        "last_seen",
+        regex="^(last_seen|first_seen|aliases)$",
+        description=(
+            "Ordering. `aliases` puts the highest-rotation users "
+            "(most distinct Enigma placeholders) at the top."
+        ),
+    ),
+    limit: int = Query(25, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+):
+    """Ledger of every viewer flagged `is_enigma=TRUE`. Drives the
+    `/admin/tiktok/enigmas` page — pagination + filter + click-to-
+    profile-modal."""
+    svc = _require_service()
+    if not hasattr(svc, "list_enigma_viewers"):
+        raise HTTPException(
+            status_code=503,
+            detail="Enigma ledger unavailable (service missing method)",
+        )
+    items, total = await asyncio.to_thread(
+        svc.list_enigma_viewers,
+        q=q, status=status, sort=sort, limit=limit, offset=offset,
+    )
+    return {
+        "items":  items,
+        "total":  total,
+        "limit":  limit,
+        "offset": offset,
+        "filters": {"q": q, "status": status, "sort": sort},
+    }
 
 
 @router.get("/lives/{handle}/calendar")
@@ -606,7 +713,7 @@ async def list_gifts(
     _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
 ):
     svc = _require_service()
-    gifts = svc.list_gifts(limit=limit)
+    gifts = await asyncio.to_thread(svc.list_gifts, limit=limit)
     return [
         GiftResponse(
             gift_id=str(g.gift_id),
@@ -750,10 +857,12 @@ async def listener_status(
         # Best-effort stale-reaper at read time so the UI never shows a
         # ghost worker for more than 30s after its heartbeat dies.
         try:
-            svc._persistence.reap_stale_workers(stale_after_seconds=30)
+            await asyncio.to_thread(
+                svc._persistence.reap_stale_workers, stale_after_seconds=30,
+            )
         except Exception:
             logger.debug("reap_stale_workers in status endpoint failed", exc_info=True)
-        rows = svc._persistence.list_workers()
+        rows = await asyncio.to_thread(svc._persistence.list_workers)
     except Exception:
         logger.exception("list_workers failed in listener_status")
         rows = []
@@ -918,7 +1027,8 @@ async def listener_pause(
     if mode != "worker":
         svc = _require_service()
         return await svc.pause_all()
-    return _set_listener_target(
+    return await asyncio.to_thread(
+        _set_listener_target,
         desired_status="paused", command=None, worker_id=worker_id,
     )
 
@@ -935,7 +1045,8 @@ async def listener_resume(
     if mode != "worker":
         svc = _require_service()
         return await svc.resume_all()
-    return _set_listener_target(
+    return await asyncio.to_thread(
+        _set_listener_target,
         desired_status="running", command=None, worker_id=worker_id,
     )
 
@@ -960,7 +1071,8 @@ async def listener_kill(
                 "(PHOVEU_BACKEND_TIKTOK_LISTENER_MODE=worker)."
             ),
         )
-    return _set_listener_target(
+    return await asyncio.to_thread(
+        _set_listener_target,
         desired_status="stopped", command="kill", worker_id=worker_id,
     )
 
@@ -976,7 +1088,7 @@ async def listener_release_handle(
     pass on any worker can re-claim. Doesn't touch `enabled`."""
     svc = _require_service()
     handle = handle.lstrip("@").strip()
-    ok = svc._persistence.release_subscription(handle)
+    ok = await asyncio.to_thread(svc._persistence.release_subscription, handle)
     if not ok:
         raise HTTPException(status_code=404, detail=f"@{handle} not found")
     return {"ok": True, "handle": handle}
@@ -994,7 +1106,8 @@ async def listener_log(
     `event_prefix` (matches the start of the event tag — useful for
     grouping e.g. 'profile_probe' which covers '_failed' + '_partial')."""
     svc = _require_service()
-    rows = svc._persistence.list_worker_log(
+    rows = await asyncio.to_thread(
+        svc._persistence.list_worker_log,
         worker_id=worker_id,
         handle=handle.lstrip("@") if handle else None,
         event_prefix=event_prefix,
@@ -1257,14 +1370,18 @@ async def list_matches(
 ):
     svc = _require_service()
     host = handle.lstrip("@") if handle else None
-    matches = svc.list_matches(
+    matches = await asyncio.to_thread(
+        svc.list_matches,
         host_unique_id=host,
         room_id=room_id,
         limit=limit,
     )
     # Enrich each match with total diamonds during the battle and a derived
     # host-result label.
-    diamonds = svc.match_diamonds_totals([m.id for m in matches if m.id is not None])
+    diamonds = await asyncio.to_thread(
+        svc.match_diamonds_totals,
+        [m.id for m in matches if m.id is not None],
+    )
     out: list[MatchResponse] = []
     for m in matches:
         result = _derive_match_result(m, host)
@@ -1297,11 +1414,17 @@ async def get_match_by_id(
     by ID" form so the operator can paste a match id and load the
     deep-detail modal directly without scrolling the host page."""
     svc = _require_service()
-    match = svc.get_match_by_id(match_id)
+    match = await asyncio.to_thread(svc.get_match_by_id, match_id)
     if match is None:
         raise HTTPException(status_code=404, detail=f"match {match_id} not found")
-    host = svc.get_room_host_handle(match.room_id) if match.room_id else None
-    diamonds = svc.match_diamonds_totals([match.id]) if match.id else {}
+    host = (
+        await asyncio.to_thread(svc.get_room_host_handle, match.room_id)
+        if match.room_id else None
+    )
+    diamonds = (
+        await asyncio.to_thread(svc.match_diamonds_totals, [match.id])
+        if match.id else {}
+    )
     return MatchResponse(
         id=match.id or 0,
         room_id=str(match.room_id),
@@ -1328,7 +1451,7 @@ async def get_match_score_timeline(
     order — drives the dual-line score chart on the match-detail
     Score Timeline tab."""
     svc = _require_service()
-    return svc.get_match_score_timeline(match_id)
+    return await asyncio.to_thread(svc.get_match_score_timeline, match_id)
 
 
 @router.get("/matches/{match_id}/gifters_by_side")
@@ -1340,7 +1463,7 @@ async def get_match_gifters_by_side(
     backed (host / opponent / unknown). Drives the side-split tables
     on the Gifters tab."""
     svc = _require_service()
-    return svc.get_match_gifters_by_side(match_id)
+    return await asyncio.to_thread(svc.get_match_gifters_by_side, match_id)
 
 
 @router.get("/matches/{match_id}/head_to_head")
@@ -1355,7 +1478,7 @@ async def get_match_head_to_head(
     decisive_pct / duration_seconds so the frontend doesn't need to
     re-derive on render."""
     svc = _require_service()
-    return svc.get_match_head_to_head(match_id, limit=limit)
+    return await asyncio.to_thread(svc.get_match_head_to_head, match_id, limit=limit)
 
 
 @router.get("/matches/{match_id}/h2h_common_gifters")
@@ -1368,7 +1491,9 @@ async def get_h2h_common_gifters(
     """Viewers who gifted in ≥`min_battles` of the head-to-head set
     for this match. Drives the H2H "regulars" bench."""
     svc = _require_service()
-    return svc.get_h2h_common_gifters(match_id, min_battles=min_battles, limit=limit)
+    return await asyncio.to_thread(
+        svc.get_h2h_common_gifters, match_id, min_battles=min_battles, limit=limit,
+    )
 
 
 @router.get("/users/{user_id}/matches")
@@ -1407,7 +1532,8 @@ async def list_user_matches(
                 continue
         if not rids:
             rids = None
-    return svc.list_user_matches(
+    return await asyncio.to_thread(
+        svc.list_user_matches,
         user_id=user_id,
         room_ids=rids,
         since=since,
@@ -1434,7 +1560,8 @@ async def user_host_daily_series(
     extras) so it's cheap to fetch every time the user opens the
     Timeline tab."""
     svc = _require_service()
-    return svc.get_user_host_daily_series(
+    return await asyncio.to_thread(
+        svc.get_user_host_daily_series,
         user_id=int(user_id), host_unique_id=handle.lstrip("@"), days=int(days),
     )
 
@@ -1635,7 +1762,8 @@ async def list_notifications(
     `include_cleared=true` (used to show the post-cleanup state for
     a brief undo window)."""
     svc = _require_service()
-    return svc.list_notifications(
+    return await asyncio.to_thread(
+        svc.list_notifications,
         since=since, until=until,
         type=type,
         host_unique_id=handle.lstrip("@") if handle else None,
@@ -1650,7 +1778,8 @@ async def unread_notifications(
     _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
 ):
     svc = _require_service()
-    return {"unread": int(svc.count_unread_notifications())}
+    unread = await asyncio.to_thread(svc.count_unread_notifications)
+    return {"unread": int(unread)}
 
 
 @router.post("/notifications", status_code=201)
@@ -1665,7 +1794,8 @@ async def create_notification(
             parsed_user_id = int(body.user_id)
         except ValueError:
             raise HTTPException(status_code=400, detail=f"Invalid user_id: {body.user_id!r}")
-    nid = svc.insert_notification(
+    nid = await asyncio.to_thread(
+        svc.insert_notification,
         type=body.type,
         title=body.title,
         body=body.body,
@@ -1684,7 +1814,7 @@ async def mark_read(
     _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
 ):
     svc = _require_service()
-    ok = svc.mark_notification_read(notification_id, read=read)
+    ok = await asyncio.to_thread(svc.mark_notification_read, notification_id, read=read)
     if not ok:
         raise HTTPException(status_code=404, detail="notification not found")
     return {"ok": True}
@@ -1695,7 +1825,7 @@ async def mark_all_read(
     _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
 ):
     svc = _require_service()
-    n = svc.mark_all_notifications_read()
+    n = await asyncio.to_thread(svc.mark_all_notifications_read)
     return {"updated": int(n)}
 
 
@@ -1705,7 +1835,7 @@ async def clear_notification(
     _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
 ):
     svc = _require_service()
-    ok = svc.clear_notification(notification_id)
+    ok = await asyncio.to_thread(svc.clear_notification, notification_id)
     if not ok:
         raise HTTPException(status_code=404, detail="notification not found")
     return {"ok": True}
@@ -1716,7 +1846,7 @@ async def clear_all_notifications(
     _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
 ):
     svc = _require_service()
-    n = svc.clear_all_notifications()
+    n = await asyncio.to_thread(svc.clear_all_notifications)
     return {"cleared": int(n)}
 
 
@@ -1734,7 +1864,9 @@ async def list_favorite_gifters(
     their cross-host totals so each row can render the same way as
     the Common Gifters list."""
     svc = _require_service()
-    return svc.list_favorite_gifters(limit=limit, offset=offset, q=q)
+    return await asyncio.to_thread(
+        svc.list_favorite_gifters, limit=limit, offset=offset, q=q,
+    )
 
 
 @router.get("/favorite-gifters/ids")
@@ -1744,7 +1876,8 @@ async def list_favorite_gifter_ids(
     """Bare id list — feeds the WS-driven alert filter on the frontend
     without round-tripping the full enriched payload."""
     svc = _require_service()
-    return {"ids": svc.list_favorite_gifter_ids()}
+    ids = await asyncio.to_thread(svc.list_favorite_gifter_ids)
+    return {"ids": ids}
 
 
 @router.get("/favorite-gifters/notify-config")
@@ -1755,7 +1888,8 @@ async def list_favorite_gifter_notify_config(
     trigger a toast for each starred user. Drives the page-level
     `<TikTokFavoritesWatcher />` filter."""
     svc = _require_service()
-    return {"items": svc.list_favorite_gifter_notify_config()}
+    items = await asyncio.to_thread(svc.list_favorite_gifter_notify_config)
+    return {"items": items}
 
 
 def _bool_or_none(v: Any) -> Optional[bool]:
@@ -1782,7 +1916,8 @@ async def add_favorite_gifter(
     svc = _require_service()
     body = body if isinstance(body, dict) else {}
     note = body.get("note") if isinstance(body.get("note"), str) else None
-    svc.add_favorite_gifter(
+    await asyncio.to_thread(
+        svc.add_favorite_gifter,
         user_id,
         note=note,
         notify_gift=_bool_or_none(body.get("notify_gift")),
@@ -1804,7 +1939,8 @@ async def update_favorite_gifter(
     POST converge to the same result."""
     svc = _require_service()
     body = body or {}
-    svc.add_favorite_gifter(
+    await asyncio.to_thread(
+        svc.add_favorite_gifter,
         user_id,
         note=body.get("note") if isinstance(body.get("note"), str) else None,
         notify_gift=_bool_or_none(body.get("notify_gift")),
@@ -1820,7 +1956,7 @@ async def remove_favorite_gifter(
     _user: AuthContext = Depends(rbac.require("admin:write")),
 ):
     svc = _require_service()
-    removed = svc.remove_favorite_gifter(user_id)
+    removed = await asyncio.to_thread(svc.remove_favorite_gifter, user_id)
     return {"ok": True, "is_favorite": False, "removed": removed}
 
 
@@ -1830,7 +1966,8 @@ async def is_favorite_gifter(
     _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
 ):
     svc = _require_service()
-    return {"user_id": str(user_id), "is_favorite": svc.is_favorite_gifter(user_id)}
+    is_fav = await asyncio.to_thread(svc.is_favorite_gifter, user_id)
+    return {"user_id": str(user_id), "is_favorite": is_fav}
 
 
 @router.get("/common-gifters/{user_id}/detail")
@@ -1843,7 +1980,7 @@ async def get_common_gifter_detail(
     comment count). Powers the modal opened from the Common Gifters
     table."""
     svc = _require_service()
-    return svc.get_common_gifter_detail(user_id)
+    return await asyncio.to_thread(svc.get_common_gifter_detail, user_id)
 
 
 @router.get("/common-gifters")
@@ -1860,7 +1997,8 @@ async def get_common_gifters(
     carries a per-host breakdown so the UI can render which hosts they
     bridged (with diamond and gift totals per host)."""
     svc = _require_service()
-    return svc.get_common_gifters(
+    return await asyncio.to_thread(
+        svc.get_common_gifters,
         min_hosts=min_hosts, q=q, limit=limit, offset=offset,
     )
 
@@ -1905,7 +2043,8 @@ async def get_cross_live_gifters_for_host(
     `elsewhere` totals so the UI can surface "spends X on this live,
     Y across N other lives" inline."""
     svc = _require_service()
-    return svc.get_cross_live_gifters_for_host(
+    return await asyncio.to_thread(
+        svc.get_cross_live_gifters_for_host,
         handle,
         min_other_hosts=min_other_hosts,
         q=q,
@@ -1929,7 +2068,8 @@ async def get_dashboard(
     _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
 ):
     svc = _require_service()
-    return svc.get_dashboard_stats(
+    return await asyncio.to_thread(
+        svc.get_dashboard_stats,
         since_hours=since_hours,
         bucket_seconds=bucket_seconds,
         tz=tz,
@@ -1990,7 +2130,8 @@ async def search_events(
             parsed_to_user_id = int(to_user_id)
         except ValueError:
             raise HTTPException(status_code=400, detail=f"Invalid to_user_id: {to_user_id!r}")
-    rows = svc.search_events(
+    rows = await asyncio.to_thread(
+        svc.search_events,
         host_unique_id=handle.lstrip("@") if handle else None,
         room_id=room_id,
         room_ids=parsed_ids,
@@ -2065,7 +2206,8 @@ async def count_events(
             parsed_to_user_id = int(to_user_id)
         except ValueError:
             raise HTTPException(status_code=400, detail=f"Invalid to_user_id: {to_user_id!r}")
-    total = svc.count_events(
+    total = await asyncio.to_thread(
+        svc.count_events,
         host_unique_id=handle.lstrip("@") if handle else None,
         room_id=room_id,
         room_ids=parsed_ids,

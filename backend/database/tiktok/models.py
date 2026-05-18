@@ -185,6 +185,22 @@ class TikTokViewerModel(Base):
         onupdate=func.current_timestamp(),
         nullable=False,
     )
+    # Sticky "we've seen this user gift under TikTok's Enigma anonymity
+    # mask" flag. TikTok sends gifts from anonymous users with a
+    # placeholder nickname like `Enigma 9213` while preserving the
+    # real `user_id`. Once we ever see this user_id paired with an
+    # Enigma-pattern nickname, we set this to TRUE and NEVER unset —
+    # the badge follows the real identity forever in the UI.
+    # See `_ENIGMA_NICK_RE` + `_maybe_mark_enigma` in tiktok_persistence.
+    is_enigma = Column(Boolean, nullable=False, server_default="false", default=False)
+    # Every distinct Enigma alias we've ever seen this user_id render
+    # under. Append-only. Surfaced as small badges next to the real
+    # name on the profile modal so the operator can recognise which
+    # placeholder identities map back to which real user.
+    enigma_aliases = Column(
+        JSONB().with_variant(Text(), "sqlite"),
+        nullable=False, server_default="[]", default=list,
+    )
 
 
 class TikTokGiftModel(Base):
@@ -294,6 +310,73 @@ class TikTokEventModel(Base):
             "room_id", "message_id",
             unique=True,
             postgresql_where=(message_id.isnot(None)),
+        ),
+    )
+
+
+class TikTokPerfTraceModel(Base):
+    """Per-request performance trace, written by `PerfTracerMiddleware`
+    at the tail of every (instrumented) request.
+
+    Fields:
+      - trace_id:   UUID-like hex string, also returned in the
+                    `X-Trace-Id` response header so the operator can
+                    correlate a browser-network-tab row to a DB row.
+      - ts:         when the request started (server clock).
+      - endpoint:   route template like `/admin/tiktok/lives/{handle}`
+                    when available, falling back to the raw path.
+      - method:     HTTP verb.
+      - status:     HTTP status code (200, 500, …). Nullable for
+                    websocket / streaming responses that don't have
+                    a single code.
+      - total_ms:   wall-clock duration of the request handler.
+      - query_count:running `+1` counter — bumped by the persistence
+                    adapter on each `_get_session()` open. Nullable
+                    because not every adapter is wired yet.
+      - handle:     when the request was scoped to a TikTok handle
+                    (`/admin/tiktok/{handle}/…`), captured here so
+                    SELECTs filtering by host are cheap.
+      - spans:      JSONB list of `{name, start_ms, dur_ms, meta?}`
+                    in chronological order. Captured by the tracer
+                    via `with tracer.span(...):` calls inside the
+                    service / persistence layers.
+      - meta:       JSONB extras — `cache_hits`, `cache_misses`,
+                    `user_id`, anything else the call path wants to
+                    log. Optional.
+
+    Index `(endpoint, ts DESC)` so the admin "recent slow traces"
+    view sorts cheaply per endpoint. Partial index on `total_ms`
+    not needed yet — the table is bounded by retention; we'll add
+    one if the table grows large enough for full scans to hurt.
+    """
+
+    __tablename__ = "tiktok_perf_traces"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    trace_id = Column(String(32), nullable=False, index=True)
+    ts = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    endpoint = Column(Text, nullable=False)
+    method = Column(String(8), nullable=False)
+    status = Column(Integer, nullable=True)
+    total_ms = Column(Integer, nullable=False)
+    query_count = Column(Integer, nullable=True)
+    handle = Column(String(64), nullable=True)
+    spans = Column(
+        JSONB().with_variant(Text(), "sqlite"),
+        nullable=False, server_default="[]",
+    )
+    meta = Column(
+        JSONB().with_variant(Text(), "sqlite"),
+        nullable=False, server_default="{}",
+    )
+
+    __table_args__ = (
+        Index("ix_tiktok_perf_traces_endpoint_ts", "endpoint", ts.desc()),
+        Index("ix_tiktok_perf_traces_ts_desc", ts.desc()),
+        Index(
+            "ix_tiktok_perf_traces_handle_ts",
+            "handle", ts.desc(),
+            postgresql_where=(handle.isnot(None)),
         ),
     )
 

@@ -688,8 +688,18 @@ async def lifespan(app: FastAPI):
         _state_cache = getattr(_tiktok_persistence, "_state_cache", None)
         if _state_cache is not None:
             from adapters.tiktok_state_ticker import run_state_tick_loop
+            # SQL-authority resolver: prevents the tick loop from
+            # re-publishing age deltas for hosts whose cached
+            # active_room_id is phantom (worker dropped silently).
+            _resolver = (
+                _tiktok_persistence.get_hosts_with_active_room
+                if _tiktok_persistence is not None
+                else None
+            )
             tick_task = asyncio.create_task(
-                run_state_tick_loop(_state_cache),
+                run_state_tick_loop(
+                    _state_cache, active_hosts_resolver=_resolver,
+                ),
                 name="tiktok-state-tick",
             )
             logger.info("✅ TikTok state-cache tick task started (in_process mode)")
@@ -823,13 +833,42 @@ app.add_middleware(LogContextMiddleware)
 from utils.middleware import (
     create_rate_limiting_middleware,
     create_security_headers_middleware,
-    CompressedRequestMiddleware
+    CompressedRequestMiddleware,
+    PerfTracerMiddleware,
 )
 
 # Decompress gzip/zstd-encoded request bodies (e.g. from Go worker submissions)
 from utils.middleware.gzip_request import HAS_ZSTD
 logger.info("🗜️  Zstd decompression support: %s", "ENABLED" if HAS_ZSTD else "DISABLED (zstandard not installed)")
 app.add_middleware(CompressedRequestMiddleware)
+
+# Perf tracer middleware — captures per-request span tree for
+# /admin/tiktok/* and /public/tiktok/* surfaces and writes one row per
+# request to `tiktok_perf_traces`. The persister is wired below once
+# the tiktok service is initialized; until then the middleware
+# captures spans but the persist step is a no-op.
+# Resolved-persister cache: `_services` is built once at startup and
+# never mutated afterward, but the middleware fires before / during
+# startup so the first few calls must do the lookup. Once we resolve
+# a non-None persistence adapter we stash it here; subsequent calls
+# skip the dict/getattr/hasattr walk.
+_resolved_perf_persister: list = [None]
+
+def _perf_persister(row):
+    pers = _resolved_perf_persister[0]
+    if pers is None:
+        svc = _services.get("tiktok_service") if _services else None
+        candidate = getattr(svc, "_persistence", None) if svc is not None else None
+        if candidate is None or not hasattr(candidate, "insert_perf_trace"):
+            return None
+        _resolved_perf_persister[0] = candidate
+        pers = candidate
+    # Run the sync DB write off the event loop so a slow persist
+    # never piles up on the asyncio.create_task queue.
+    import asyncio as _asyncio
+    return _asyncio.to_thread(pers.insert_perf_trace, row)
+
+app.add_middleware(PerfTracerMiddleware, persister=_perf_persister)
 
 # Register middleware (composition root - wires infrastructure together)
 security_headers_middleware = create_security_headers_middleware()

@@ -29,6 +29,9 @@ from domain.entities.tiktok_models import (
     TikTokWorker,
 )
 from ports.tiktok_persistence import TikTokPersistencePort
+from utils.perf_tracer import span as _perf_span
+from utils.perf_tracer import cache_hit as _perf_cache_hit
+from utils.perf_tracer import cache_miss as _perf_cache_miss
 from ports.tiktok_live import (
     TikTokLiveSessionFactoryPort,
     TikTokLiveSessionPort,
@@ -1659,6 +1662,13 @@ class TikTokService:
         # forwarding that host's events on the next received event,
         # not 30s later. Drop the cache; next event re-reads the set.
         self._public_handle_set_cache = None
+        # Invalidate the per-handle subscription cache too — without
+        # this, `_resolve_public_host(unique_id)` continues returning
+        # the pre-flip Subscription (with the old `is_public` flag)
+        # for up to _PUBLIC_LOOKUP_TTL_S (30 s). The "make private"
+        # action must be immediate across every public surface that
+        # routes through the resolver.
+        self._public_subscription_cache.pop(unique_id.lower(), None)
         return {
             "unique_id": sub.unique_id,
             "is_public": bool(sub.is_public),
@@ -1730,12 +1740,14 @@ class TikTokService:
         limit: int = 200,
         before_id: int | None = None,
     ):
-        return self._persistence.list_events(
-            room_id, type=type, limit=limit, before_id=before_id
-        )
+        with _perf_span("svc.list_events", room_id=room_id, limit=limit):
+            return self._persistence.list_events(
+                room_id, type=type, limit=limit, before_id=before_id
+            )
 
     def get_room(self, room_id: int):
-        return self._persistence.get_room(room_id)
+        with _perf_span("svc.get_room"):
+            return self._persistence.get_room(room_id)
 
     def host_calendar(
         self,
@@ -1759,9 +1771,10 @@ class TikTokService:
         offset_to_monday = start.weekday()  # Monday=0
         if offset_to_monday > 0:
             start = start - timedelta(days=offset_to_monday)
-        cells = self._persistence.host_calendar(
-            host_unique_id, since=start, until=end, tz=tz,
-        )
+        with _perf_span("svc.host_calendar", weeks=weeks, tz=tz):
+            cells = self._persistence.host_calendar(
+                host_unique_id, since=start, until=end, tz=tz,
+            )
         return {
             "host": host_unique_id,
             "start_date": start.date().isoformat(),
@@ -1785,12 +1798,113 @@ class TikTokService:
         totals to a calendar-day window so a broadcast that crossed
         midnight only contributes the slice that landed on the picked
         day."""
-        return self._persistence.room_totals(
-            room_ids, since=since, until=until,
+        with _perf_span("svc.room_totals", n=len(room_ids)):
+            return self._persistence.room_totals(
+                room_ids, since=since, until=until,
+            )
+
+    def get_public_subscription(self, handle: str):
+        """Cached `_persistence.get_subscription(handle)`. Returns the
+        Subscription dataclass (or None). Used by every public-route
+        resolver; the 30 s TTL is short enough that visibility flips
+        propagate quickly, long enough to collapse the resolver-call
+        volume."""
+        key = (handle or "").lstrip("@").strip().lower()
+        if not key:
+            return None
+        cache_now = time.time()
+        hit = self._public_subscription_cache.get(key)
+        if hit is not None:
+            ts_cached, val = hit
+            if (cache_now - ts_cached) < self._PUBLIC_LOOKUP_TTL_S:
+                _perf_cache_hit("public_subscription.L1")
+                return val
+        _perf_cache_miss("public_subscription.L1")
+        sub = self._persistence.get_subscription(key)
+        self._public_subscription_cache[key] = (cache_now, sub)
+        return sub
+
+    def get_public_room_host(self, room_id: int) -> Optional[str]:
+        """Cached `_persistence.get_room_host_handle(room_id)`. Each
+        public room-scoped route resolves through this to find the
+        owning host before applying the public-allowlist check."""
+        try:
+            rid = int(room_id)
+        except (TypeError, ValueError):
+            return None
+        cache_now = time.time()
+        hit = self._public_room_host_cache.get(rid)
+        if hit is not None:
+            ts_cached, val = hit
+            if (cache_now - ts_cached) < self._PUBLIC_LOOKUP_TTL_S:
+                _perf_cache_hit("public_room_host.L1")
+                return val
+        _perf_cache_miss("public_room_host.L1")
+        host = self._persistence.get_room_host_handle(rid)
+        self._public_room_host_cache[rid] = (cache_now, host)
+        return host
+
+    def list_host_rooms_with_totals(
+        self,
+        host_unique_id: str,
+        *,
+        limit: int = 50,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> tuple[list, dict]:
+        """Return the (rooms, totals) tuple both admin and public
+        room-list routes assemble. L1 cache 30 s TTL collapses the
+        public route's threadpool pile-up (the 44 s p95 spikes were
+        50 concurrent sync-def requests serializing through a handful
+        of threadpool workers, all running the same aggregation)."""
+        # `since`/`until` are mostly None in steady-state traffic;
+        # quantize to None vs iso so the cache key stays manageable.
+        key = (
+            host_unique_id,
+            int(limit),
+            since.isoformat() if since else None,
+            until.isoformat() if until else None,
         )
+        cache_now = time.time()
+        hit = self._list_host_rooms_with_totals_cache.get(key)
+        if hit is not None:
+            ts_cached, val = hit
+            if (cache_now - ts_cached) < self._LIST_HOST_ROOMS_WITH_TOTALS_TTL_S:
+                _perf_cache_hit("list_host_rooms_with_totals.L1")
+                return val
+        _perf_cache_miss("list_host_rooms_with_totals.L1")
+        rooms = self.list_rooms_for_host(host_unique_id, limit=limit)
+        totals = (
+            self._persistence.room_totals(
+                [r.room_id for r in rooms], since=since, until=until,
+            )
+            if rooms else {}
+        )
+        out = (rooms, totals)
+        self._list_host_rooms_with_totals_cache[key] = (cache_now, out)
+        return out
 
     def list_rooms_for_host(self, host_unique_id: str, *, limit: int = 50):
-        return self._persistence.list_rooms_for_host(host_unique_id, limit=limit)
+        # L1 cache with 20s TTL. The list of rooms-per-host doesn't
+        # change often (a new entry every time the creator goes live);
+        # 20 s is short enough that a new broadcast is visible within
+        # the next page-poll cycle, long enough to collapse the
+        # 2000+/day poll volume into a handful of cold computes.
+        key = (host_unique_id, int(limit))
+        cache_now = time.time()
+        hit = self._list_rooms_for_host_cache.get(key)
+        if hit is not None:
+            ts_cached, val = hit
+            if (cache_now - ts_cached) < self._LIST_ROOMS_FOR_HOST_TTL_S:
+                _perf_cache_hit("list_rooms_for_host.L1")
+                return val
+        _perf_cache_miss("list_rooms_for_host.L1")
+        with _perf_span("svc.list_rooms_for_host", limit=limit):
+            rooms = self._persistence.list_rooms_for_host(
+                host_unique_id, limit=limit,
+            )
+        self._list_rooms_for_host_cache[key] = (cache_now, rooms)
+        return rooms
 
     def get_worker_telemetry(
         self,
@@ -2288,20 +2402,134 @@ class TikTokService:
         host_unique_id: str | None = None,
         limit: int = 50,
     ):
-        return self._persistence.list_matches(
+        """L1 cache 15 s TTL. New matches start discretely; 15 s
+        latency on "the latest match" is invisible in the UI."""
+        key = (
+            int(room_id) if room_id is not None else None,
+            host_unique_id or "",
+            int(limit),
+        )
+        cache_now = time.time()
+        hit = self._list_matches_cache.get(key)
+        if hit is not None:
+            ts_cached, val = hit
+            if (cache_now - ts_cached) < self._LIST_MATCHES_TTL_S:
+                _perf_cache_hit("list_matches.L1")
+                return val
+        _perf_cache_miss("list_matches.L1")
+        val = self._persistence.list_matches(
             room_id=room_id,
             host_unique_id=host_unique_id,
             limit=limit,
         )
+        self._list_matches_cache[key] = (cache_now, val)
+        return val
 
     def get_active_match(self, room_id: int):
         return self._persistence.get_active_match(room_id)
 
     def match_diamonds_totals(self, match_ids: list[int]) -> dict[int, int]:
-        return self._persistence.match_diamonds_totals(match_ids)
+        """Per-match diamond totals. Cache per match_id with the
+        ended-frozen / active-15s-TTL pattern; assemble the response
+        from cache hits + an SQL call covering only the misses."""
+        if not match_ids:
+            return {}
+        # Dedupe — callers passing the same id twice would otherwise
+        # put it in `misses` twice and the SQL `IN`-list collapses
+        # it anyway. Cheap defensive dict()-of-set walk preserves
+        # first-seen order so the caller's expected key order in
+        # `out` matches the input.
+        seen: set[int] = set()
+        ids: list[int] = []
+        for m in match_ids:
+            if m is None:
+                continue
+            v = int(m)
+            if v in seen:
+                continue
+            seen.add(v)
+            ids.append(v)
+        cache_now = time.time()
+        out: dict[int, int] = {}
+        misses: list[int] = []
+        cache = self._match_diamonds_total_cache
+        for mid in ids:
+            hit = cache.get(mid)
+            if hit is not None:
+                ts_cached, frozen, val = hit
+                if frozen or (cache_now - ts_cached) < self._MATCH_CACHE_TTL_S:
+                    out[mid] = val
+                    continue
+            misses.append(mid)
+        if misses:
+            _perf_cache_miss("match_diamonds_totals.L1", n=len(misses))
+        hits = len(ids) - len(misses)
+        if hits:
+            _perf_cache_hit("match_diamonds_totals.L1", n=hits)
+        if not misses:
+            return out
+        # SQL covers only the cache misses.
+        fresh = self._persistence.match_diamonds_totals(misses)
+        # Look up which of the misses are for ENDED matches so we can
+        # freeze them in cache.
+        ended: set[int] = set()
+        try:
+            ended = self._persistence.get_ended_match_ids(misses)
+        except AttributeError:
+            # Fallback if persistence layer doesn't yet expose the
+            # helper — just don't freeze, fall through to TTL.
+            ended = set()
+        for mid in misses:
+            v = int(fresh.get(mid, 0))
+            cache[mid] = (cache_now, mid in ended, v)
+            out[mid] = v
+        # Frozen ended-match entries accumulate forever otherwise.
+        self._cap_cache(cache)
+        return out
 
     def close_orphan_matches(self) -> int:
         return self._persistence.close_orphan_matches()
+
+    @classmethod
+    def _acquire_singleflight_lock(
+        cls,
+        locks_dict: dict,
+        meta_lock: "threading.Lock",
+        key,
+    ) -> "threading.Lock":
+        """Get-or-create a per-key threading.Lock for singleflight.
+        The meta_lock guards creation so two concurrent first-callers
+        don't each instantiate a fresh per-key lock — exactly the
+        shape `_lives_summary_locks` uses. Returns the lock; caller
+        wraps the compute+cache-write in `with lock: ...` and does a
+        double-checked cache read inside."""
+        with meta_lock:
+            lock = locks_dict.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                locks_dict[key] = lock
+            return lock
+
+    @classmethod
+    def _cap_cache(cls, cache_dict: dict, max_size: int | None = None) -> None:
+        """Cap a class-level cache dict to `max_size` entries by
+        evicting the oldest-inserted keys. Python 3.7+ dicts preserve
+        insertion order, so `next(iter(d))` yields the oldest key.
+        Not a true LRU (no on-read touch), but adequate for caches
+        whose key set is bounded by request distribution rather than
+        access pattern. Called at every cache write on the
+        unbounded-cardinality caches; cheap no-op while under cap."""
+        cap = max_size if max_size is not None else cls._MAX_CAPPED_CACHE_SIZE
+        n = len(cache_dict)
+        if n <= cap:
+            return
+        drop = n - cap
+        for _ in range(drop):
+            try:
+                oldest = next(iter(cache_dict))
+            except StopIteration:
+                break
+            cache_dict.pop(oldest, None)
 
     def sweep_stale_state_cache(self) -> int:
         """Periodic sweeper that clears session-scoped fields from the
@@ -2402,7 +2630,27 @@ class TikTokService:
         limit: int = 25,
         offset: int = 0,
     ) -> dict[str, Any]:
-        return self._persistence.list_user_matches(
+        """L1 cache 30 s TTL. Modal-opens of a viewer's match history
+        repeat quickly when the operator clicks through profiles."""
+        ids_key = (
+            tuple(sorted(int(x) for x in room_ids)) if room_ids else None
+        )
+        key = (
+            int(user_id),
+            ids_key,
+            since.isoformat() if since else None,
+            until.isoformat() if until else None,
+            int(limit), int(offset),
+        )
+        cache_now = time.time()
+        hit = self._list_user_matches_cache.get(key)
+        if hit is not None:
+            ts_cached, val = hit
+            if (cache_now - ts_cached) < self._LIST_USER_MATCHES_TTL_S:
+                _perf_cache_hit("list_user_matches.L1")
+                return val
+        _perf_cache_miss("list_user_matches.L1")
+        val = self._persistence.list_user_matches(
             user_id=user_id,
             room_ids=room_ids,
             since=since,
@@ -2410,6 +2658,9 @@ class TikTokService:
             limit=limit,
             offset=offset,
         )
+        self._list_user_matches_cache[key] = (cache_now, val)
+        self._cap_cache(self._list_user_matches_cache)
+        return val
 
     # ── profile cache ────────────────────────────────────────────────
 
@@ -2952,12 +3203,37 @@ class TikTokService:
         return self._persistence.get_room_host_handle(int(room_id))
 
     def get_match_score_timeline(self, match_id: int) -> list[dict[str, Any]]:
-        return self._persistence.get_match_score_timeline(int(match_id))
+        """Per-second decoded score frames. Frozen once the match
+        ends (no new score frames can arrive); 15 s TTL while active."""
+        mid = int(match_id)
+        cache_now = time.time()
+        hit = self._match_score_timeline_cache.get(mid)
+        if hit is not None:
+            ts_cached, frozen, val = hit
+            if frozen or (cache_now - ts_cached) < self._MATCH_CACHE_TTL_S:
+                _perf_cache_hit("match_score_timeline.L1")
+                return val
+        _perf_cache_miss("match_score_timeline.L1")
+        val = self._persistence.get_match_score_timeline(mid)
+        match = self._persistence.get_match_by_id(mid)
+        frozen = bool(match and match.ended_at is not None)
+        self._match_score_timeline_cache[mid] = (cache_now, frozen, val)
+        return val
 
     def get_match_gifters_by_side(
         self, match_id: int, *, public_only: bool = False,
     ) -> dict[str, Any]:
-        match = self._persistence.get_match_by_id(int(match_id))
+        mid = int(match_id)
+        key = (mid, bool(public_only))
+        cache_now = time.time()
+        hit = self._match_gifters_by_side_cache.get(key)
+        if hit is not None:
+            ts_cached, frozen, val = hit
+            if frozen or (cache_now - ts_cached) < self._MATCH_CACHE_TTL_S:
+                _perf_cache_hit("match_gifters_by_side.L1")
+                return val
+        _perf_cache_miss("match_gifters_by_side.L1")
+        match = self._persistence.get_match_by_id(mid)
         if match is None:
             return {"host": [], "opponent": [], "unknown": [], "totals": {}}
         host = self._persistence.get_room_host_handle(match.room_id)
@@ -2996,21 +3272,39 @@ class TikTokService:
             for r in result.get(side, []):
                 if r.get("user_id") is not None:
                     r["user_id"] = str(r["user_id"])
+        frozen = match.ended_at is not None
+        self._match_gifters_by_side_cache[key] = (cache_now, frozen, result)
         return result
 
     def get_match_head_to_head(
         self, match_id: int, *, limit: int = 50,
     ) -> list[dict[str, Any]]:
-        match = self._persistence.get_match_by_id(int(match_id))
+        mid = int(match_id)
+        key = (mid, int(limit))
+        cache_now = time.time()
+        hit = self._match_head_to_head_cache.get(key)
+        if hit is not None:
+            ts_cached, frozen, val = hit
+            if frozen or (cache_now - ts_cached) < self._MATCH_CACHE_TTL_S:
+                _perf_cache_hit("match_head_to_head.L1")
+                return val
+        _perf_cache_miss("match_head_to_head.L1")
+        match = self._persistence.get_match_by_id(mid)
         if match is None:
             return []
         host = self._persistence.get_room_host_handle(match.room_id)
-        return self._persistence.get_match_head_to_head(
+        val = self._persistence.get_match_head_to_head(
             int(match_id),
             host_unique_id=host or "",
             opponents=match.opponents or [],
             limit=int(limit),
         )
+        # NOT frozen — even though the queried match has ended, new
+        # rivalry matches between the same opponents add rows to the
+        # H2H set over time. TTL-only so the list updates within
+        # `_MATCH_CACHE_TTL_S` of any new battle.
+        self._match_head_to_head_cache[key] = (cache_now, False, val)
+        return val
 
     def get_h2h_common_gifters(
         self, match_id: int, *, min_battles: int = 2, limit: int = 12,
@@ -3018,7 +3312,17 @@ class TikTokService:
         """Returns viewers who gifted in ≥`min_battles` of this
         match's head-to-head set — i.e. regulars who follow the
         rivalry. Resolves the H2H match set first, then aggregates."""
-        match = self._persistence.get_match_by_id(int(match_id))
+        mid = int(match_id)
+        key = (mid, int(min_battles), int(limit))
+        cache_now = time.time()
+        hit = self._h2h_common_gifters_cache.get(key)
+        if hit is not None:
+            ts_cached, frozen, val = hit
+            if frozen or (cache_now - ts_cached) < self._MATCH_CACHE_TTL_S:
+                _perf_cache_hit("h2h_common_gifters.L1")
+                return val
+        _perf_cache_miss("h2h_common_gifters.L1")
+        match = self._persistence.get_match_by_id(mid)
         if match is None:
             return []
         host = self._persistence.get_room_host_handle(match.room_id)
@@ -3034,9 +3338,16 @@ class TikTokService:
         ids.extend(int(r["id"]) for r in h2h if r.get("id"))
         if not ids:
             return []
-        return self._persistence.get_h2h_common_gifters(
+        val = self._persistence.get_h2h_common_gifters(
             ids, min_battles=int(min_battles), limit=int(limit),
         )
+        # NOT frozen — the underlying H2H set grows over time (see
+        # `get_match_head_to_head` rationale). Even after this match
+        # ended, a future rivalry battle introduces new common
+        # gifters; TTL-only keeps the cache fresh within
+        # `_MATCH_CACHE_TTL_S`.
+        self._h2h_common_gifters_cache[key] = (cache_now, False, val)
+        return val
 
     # ── stats / dashboard ────────────────────────────────────────────
 
@@ -3048,11 +3359,11 @@ class TikTokService:
         until: datetime,
         bucket_seconds: int | None = None,
     ) -> dict[str, Any]:
-        """Bucketed event series summed across multiple rooms in a
-        single SQL group-by. Replaces the previous "fan out N parallel
-        getRoomStats and sum on the client" path used by the calendar
-        day-view, cutting wall time from O(N × room_query_time) to
-        one round-trip."""
+        """Bucketed event series summed across multiple rooms.
+        Cacheable: same immutable-when-`until`-is-past pattern as
+        `get_room_stats`. Used by the calendar day-view, which always
+        passes an explicit past-day window — so the L1 cache here
+        typically lands on a frozen key."""
         def _ensure_aware_utc(d: datetime) -> datetime:
             if d.tzinfo is None:
                 return d.replace(tzinfo=timezone.utc)
@@ -3064,12 +3375,23 @@ class TikTokService:
             bucket_seconds = _auto_bucket_seconds(range_seconds)
         elif range_seconds // bucket_seconds > 600:
             bucket_seconds = _auto_bucket_seconds(range_seconds)
-        return self._persistence.room_event_buckets(
-            [int(x) for x in room_ids],
-            since=s,
-            until=u,
-            bucket_seconds=bucket_seconds,
+        ids = sorted(int(x) for x in room_ids)
+        key = (tuple(ids), s.isoformat(), u.isoformat(), int(bucket_seconds))
+        immutable = u < datetime.now(timezone.utc) - timedelta(minutes=1)
+        cache_now = time.time()
+        hit = self._aggregated_buckets_cache.get(key)
+        if hit is not None:
+            ts_cached, frozen, val = hit
+            if frozen or (cache_now - ts_cached) < self._AGGREGATED_BUCKETS_TTL_S:
+                _perf_cache_hit("aggregated_buckets.L1")
+                return val
+        _perf_cache_miss("aggregated_buckets.L1")
+        val = self._persistence.room_event_buckets(
+            ids, since=s, until=u, bucket_seconds=bucket_seconds,
         )
+        self._aggregated_buckets_cache[key] = (cache_now, immutable, val)
+        self._cap_cache(self._aggregated_buckets_cache)
+        return val
 
     def get_room_stats(
         self,
@@ -3122,32 +3444,125 @@ class TikTokService:
             # More than 600 buckets is a chart-too-dense problem; coerce up.
             bucket_seconds = _auto_bucket_seconds(range_seconds)
 
-        room = self._persistence.get_room(room_id)
-        counts_window = self._persistence.room_event_counts_by_type(
-            room_id, since=since, until=until
+        # ── Cache shell (L1 + L2 on immutable windows) ───────────────
+        # The cache key is the canonicalised request shape; the
+        # `params_key` string is the same shape the L2 row uses so
+        # the persistence layer doesn't need to know request fields.
+        params_key = (
+            f"{since.isoformat()}|{until.isoformat()}|"
+            f"{int(bucket_seconds)}|{int(gifters_limit)}"
         )
-        counts_total = self._persistence.room_event_counts_by_type(room_id)
-        # Top gifters honor the FULL window (since + until). For a past-match
-        # modal, the modal sends until=match.ended_at; without that bound we'd
-        # rank gifters from match start through "now", so every old match
-        # would surface the room's all-time top gifter.
-        top_gifters = self._persistence.room_top_gifters(
-            room_id, since=since, until=until, limit=gifters_limit
+        cache_key = (int(room_id), params_key)
+        immutable = until < now - timedelta(minutes=1)
+        cache_now = time.time()
+        hit = self._room_stats_cache.get(cache_key)
+        if hit is not None:
+            ts_cached, val = hit
+            if immutable or (cache_now - ts_cached) < self._ROOM_STATS_TTL_S:
+                _perf_cache_hit("get_room_stats.L1")
+                # Shallow-copy the top-level dict before returning so
+                # downstream mutations (e.g. public route's
+                # `data["active_match"] = _sanitize_match(am)`) can't
+                # poison the cached object for later admin readers.
+                # Then overlay a FRESH active_match — the cached
+                # `active_match` is intentionally stale-tolerated for
+                # the rest of the payload (counts, top_gifters,
+                # buckets) but the battle state changes mid-window
+                # and must reflect "right now" on every call.
+                out = dict(val)
+                out["active_match"] = self._compute_active_match(room_id)
+                return out
+        _perf_cache_miss("get_room_stats.L1")
+        # Singleflight: get-or-create per-key lock so N concurrent
+        # admin tabs hitting the same room on a cold key collapse to
+        # ONE compute. The double-checked L1 read inside the lock
+        # serves any caller that arrived after a peer wrote.
+        sf_lock = self._acquire_singleflight_lock(
+            self._room_stats_locks,
+            self._room_stats_meta_lock,
+            cache_key,
         )
+        sf_lock.acquire()
+        try:
+            # Double-checked L1 read — another caller may have
+            # populated the cache while we were waiting on the lock.
+            cache_now2 = time.time()
+            hit2 = self._room_stats_cache.get(cache_key)
+            if hit2 is not None:
+                ts_cached, val = hit2
+                if immutable or (cache_now2 - ts_cached) < self._ROOM_STATS_TTL_S:
+                    out = dict(val)
+                    out["active_match"] = self._compute_active_match(room_id)
+                    return out
+            # L2 only when the window is provably immutable — otherwise
+            # the table fills with rows that get rewritten every 15 s.
+            if immutable:
+                l2 = self._persistence.read_room_stats_cache(
+                    int(room_id), params_key,
+                )
+                if l2 is not None:
+                    _perf_cache_hit("get_room_stats.L2")
+                    self._room_stats_cache[cache_key] = (cache_now, l2)
+                    out = dict(l2)
+                    out["active_match"] = self._compute_active_match(room_id)
+                    return out
+                _perf_cache_miss("get_room_stats.L2")
 
-        # SQL-side bucketing — replaces the previous Python loop over
-        # list_events(limit=10000). The 10k cap silently truncated long
-        # broadcasts to roughly the latest 30 minutes of activity, so the
-        # headline diamonds_total + per-type series both understated heavy
-        # rooms (e.g. tonoabril__'s 40k-event broadcast: chart showed only
-        # the most recent slice while top-gifters aggregated everything,
-        # so the totals didn't match the leaderboard).
-        buckets = self._persistence.room_event_buckets(
-            room_id,
-            since=since,
-            until=until,
-            bucket_seconds=bucket_seconds,
-        )
+            return self._compute_room_stats_payload(
+                room_id=room_id,
+                window_minutes=window_minutes,
+                bucket_seconds=bucket_seconds,
+                since=since,
+                until=until,
+                gifters_limit=gifters_limit,
+                now=now,
+                cache_key=cache_key,
+                params_key=params_key,
+                immutable=immutable,
+                cache_now=cache_now,
+            )
+        finally:
+            sf_lock.release()
+
+    def _compute_room_stats_payload(
+        self, *, room_id, window_minutes, bucket_seconds, since, until,
+        gifters_limit, now, cache_key, params_key, immutable, cache_now,
+    ) -> dict[str, Any]:
+        """Heavy SQL fan-out for `get_room_stats`. Extracted so the
+        outer cache shell can wrap it in a singleflight lock without
+        ballooning the wrapper's indentation."""
+        with _perf_span("svc.get_room_stats", room_id=room_id, window_minutes=window_minutes):
+            with _perf_span("db.get_room"):
+                room = self._persistence.get_room(room_id)
+            with _perf_span("db.room_event_counts_by_type:window"):
+                counts_window = self._persistence.room_event_counts_by_type(
+                    room_id, since=since, until=until
+                )
+            with _perf_span("db.room_event_counts_by_type:total"):
+                counts_total = self._persistence.room_event_counts_by_type(room_id)
+            # Top gifters honor the FULL window (since + until). For a past-match
+            # modal, the modal sends until=match.ended_at; without that bound we'd
+            # rank gifters from match start through "now", so every old match
+            # would surface the room's all-time top gifter.
+            with _perf_span("db.room_top_gifters"):
+                top_gifters = self._persistence.room_top_gifters(
+                    room_id, since=since, until=until, limit=gifters_limit
+                )
+
+            # SQL-side bucketing — replaces the previous Python loop over
+            # list_events(limit=10000). The 10k cap silently truncated long
+            # broadcasts to roughly the latest 30 minutes of activity, so the
+            # headline diamonds_total + per-type series both understated heavy
+            # rooms (e.g. tonoabril__'s 40k-event broadcast: chart showed only
+            # the most recent slice while top-gifters aggregated everything,
+            # so the totals didn't match the leaderboard).
+            with _perf_span("db.room_event_buckets", bucket_seconds=bucket_seconds):
+                buckets = self._persistence.room_event_buckets(
+                    room_id,
+                    since=since,
+                    until=until,
+                    bucket_seconds=bucket_seconds,
+                )
         bucket_starts = buckets.get("starts", [])
         bucket_counts: dict[str, list[int]] = buckets.get("by_type", {})
         diamond_buckets: list[int] = buckets.get("diamonds", [])
@@ -3158,17 +3573,9 @@ class TikTokService:
             {**g, "user_id": str(g["user_id"]) if g.get("user_id") is not None else None}
             for g in top_gifters
         ]
-        active_match = self._persistence.get_active_match(room_id) if room else None
-        active_match_serialized = None
-        if active_match and active_match.id is not None:
-            self._enrich_match_opponents(active_match)
-            diamonds_for_match = self._persistence.match_diamonds_totals(
-                [active_match.id]
-            ).get(active_match.id, 0)
-            active_match_serialized = _match_to_dict(
-                active_match, diamonds_total=diamonds_for_match
-            )
-        return {
+        # Build the CACHEABLE payload — without `active_match`, which
+        # changes mid-window and gets overlaid fresh on every return.
+        cacheable = {
             "room": {
                 "room_id": str(room.room_id),
                 "host_unique_id": room.host_unique_id,
@@ -3188,13 +3595,58 @@ class TikTokService:
             "counts_total": counts_total,
             "top_gifters": gifters_serialized,
             "diamonds_total": diamonds_total,
-            "active_match": active_match_serialized,
+            # Cached `active_match` is intentionally None so a battle
+            # starting mid-window doesn't have to wait for the L1 TTL
+            # to surface on the next read. The active match is
+            # computed fresh on every return — see `_compute_active_match`.
+            "active_match": None,
             "buckets": {
                 "starts": bucket_starts,
                 "by_type": bucket_counts,
                 "diamonds": diamond_buckets,
             },
         }
+
+        # Write through both cache tiers. L2 only when the window is
+        # immutable so the table stays small; L1 always so repeat hits
+        # within `_ROOM_STATS_TTL_S` skip the aggregation entirely.
+        self._room_stats_cache[cache_key] = (cache_now, cacheable)
+        self._cap_cache(self._room_stats_cache)
+        if immutable:
+            try:
+                self._persistence.write_room_stats_cache(
+                    int(room_id), params_key, cacheable,
+                )
+            except Exception:
+                logger.exception(
+                    "write_room_stats_cache failed for room=%s", room_id,
+                )
+
+        # Build the RETURN payload — same cacheable shape with the
+        # fresh active_match overlaid. Shallow copy so a caller
+        # mutating `result["active_match"] = …` doesn't poison the
+        # cache (same defense as on the cache-hit path above).
+        result = dict(cacheable)
+        result["active_match"] = self._compute_active_match(room_id) if room else None
+        return result
+
+    def _compute_active_match(self, room_id: int) -> Optional[dict[str, Any]]:
+        """Resolve the current active match for `room_id` as a dict,
+        or None when no battle is in progress. Pulled OUT of the
+        `get_room_stats` cache because the battle starts/ends are
+        event-driven (sub-second), while the rest of the room-stats
+        payload is fine with a 15 s TTL.
+
+        Cheap path: one indexed `tiktok_matches` lookup + the
+        `_match_diamonds_total_cache` hit for the diamonds field."""
+        active_match = self._persistence.get_active_match(int(room_id))
+        if not active_match or active_match.id is None:
+            return None
+        self._enrich_match_opponents(active_match)
+        diamonds_for_match = self.match_diamonds_totals(
+            [active_match.id]
+        ).get(active_match.id, 0)
+        return _match_to_dict(active_match, diamonds_total=diamonds_for_match)
 
     def get_dashboard_stats(
         self,
@@ -3246,29 +3698,57 @@ class TikTokService:
     ) -> dict[str, Any]:
         """Per-recipient gift totals for a room. Answers "of all gifts in
         this broadcast, who got how much?" — meaningful in multi-guest
-        lives and PK battles. Pre-`to_user` rows return nothing."""
+        lives and PK battles. Pre-`to_user` rows return nothing.
+
+        L1 cache with frozen-when-past semantics (same as room_stats)."""
         def _ensure_aware_utc(d: datetime | None) -> datetime | None:
             if d is None:
                 return None
             if d.tzinfo is None:
                 return d.replace(tzinfo=timezone.utc)
             return d.astimezone(timezone.utc)
-        items = self._persistence.room_top_recipients(
-            room_id,
-            since=_ensure_aware_utc(since),
-            until=_ensure_aware_utc(until),
-            limit=limit,
+        since_ = _ensure_aware_utc(since)
+        until_ = _ensure_aware_utc(until)
+        key = (
+            int(room_id),
+            since_.isoformat() if since_ else None,
+            until_.isoformat() if until_ else None,
+            int(limit),
         )
+        # Immutable when the upper bound is fully past. Bare `until=None`
+        # implies "now" → not immutable.
+        immutable = (
+            until_ is not None
+            and until_ < datetime.now(timezone.utc) - timedelta(minutes=1)
+        )
+        cache_now = time.time()
+        hit = self._get_room_recipients_cache.get(key)
+        if hit is not None:
+            ts_cached, frozen, val = hit
+            if frozen or (cache_now - ts_cached) < self._GET_ROOM_RECIPIENTS_TTL_S:
+                _perf_cache_hit("get_room_recipients.L1")
+                return val
+        _perf_cache_miss("get_room_recipients.L1")
+        with _perf_span("svc.get_room_recipients", room_id=room_id):
+            items = self._persistence.room_top_recipients(
+                room_id,
+                since=since_,
+                until=until_,
+                limit=limit,
+            )
         items_serialized = [
             {**g, "user_id": str(g["user_id"]) if g.get("user_id") is not None else None}
             for g in items
         ]
         total_diamonds = sum(g["diamonds"] for g in items)
-        return {
+        result = {
             "items": items_serialized,
             "total_diamonds": int(total_diamonds),
             "limit": int(limit),
         }
+        self._get_room_recipients_cache[key] = (cache_now, immutable, result)
+        self._cap_cache(self._get_room_recipients_cache)
+        return result
 
     def get_room_gifters(
         self,
@@ -3293,48 +3773,153 @@ class TikTokService:
             return d.astimezone(timezone.utc)
         since_ = _ensure_aware_utc(since)
         until_ = _ensure_aware_utc(until)
-        items = self._persistence.room_top_gifters(
-            room_id,
-            since=since_,
-            until=until_,
-            limit=limit,
-            offset=offset,
-            q=q,
+        # Cache key. `room_id` may be a list (cross-room aggregation
+        # for the day-view modal) — normalise to a sorted tuple so
+        # the same set hits the same key regardless of order.
+        if isinstance(room_id, (list, tuple, set)):
+            rid_key = tuple(sorted(int(x) for x in room_id))
+        else:
+            rid_key = int(room_id)
+        key = (
+            rid_key,
+            since_.isoformat() if since_ else None,
+            until_.isoformat() if until_ else None,
+            q or "",
+            int(limit), int(offset),
         )
-        total = self._persistence.count_room_gifters(
-            room_id,
-            since=since_,
-            until=until_,
-            q=q,
+        immutable = (
+            until_ is not None
+            and until_ < datetime.now(timezone.utc) - timedelta(minutes=1)
         )
+        cache_now = time.time()
+        hit = self._get_room_gifters_cache.get(key)
+        if hit is not None:
+            ts_cached, frozen, val = hit
+            if frozen or (cache_now - ts_cached) < self._GET_ROOM_GIFTERS_TTL_S:
+                _perf_cache_hit("get_room_gifters.L1")
+                return val
+        _perf_cache_miss("get_room_gifters.L1")
+        with _perf_span("svc.get_room_gifters", room_id=room_id, q=bool(q)):
+            with _perf_span("db.room_top_gifters"):
+                items = self._persistence.room_top_gifters(
+                    room_id,
+                    since=since_,
+                    until=until_,
+                    limit=limit,
+                    offset=offset,
+                    q=q,
+                )
+            with _perf_span("db.count_room_gifters"):
+                total = self._persistence.count_room_gifters(
+                    room_id,
+                    since=since_,
+                    until=until_,
+                    q=q,
+                )
         # BigInt user_ids → strings on the wire.
         items_serialized = [
             {**g, "user_id": str(g["user_id"]) if g.get("user_id") is not None else None}
             for g in items
         ]
-        return {
+        result = {
             "items": items_serialized,
             "total": int(total),
             "limit": int(limit),
             "offset": int(offset),
         }
+        self._get_room_gifters_cache[key] = (cache_now, immutable, result)
+        self._cap_cache(self._get_room_gifters_cache)
+        return result
+
+    def list_enigma_viewers(
+        self,
+        *,
+        q: Optional[str] = None,
+        status: str = "all",
+        sort: str = "last_seen",
+        limit: int = 25,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Ledger of `is_enigma=TRUE` viewers — drives the
+        `/admin/tiktok/enigmas` page. L1 60 s TTL keyed by the full
+        filter shape. The underlying query is a JSONB regex scan and
+        was ~750 ms p95; pagination + filter changes still pay the
+        cold compute but identical re-fetches collapse to ~0 ms."""
+        key = (q or "", status, sort, int(limit), int(offset))
+        cache_now = time.time()
+        hit = self._list_enigma_viewers_cache.get(key)
+        if hit is not None:
+            ts_cached, val = hit
+            if (cache_now - ts_cached) < self._LIST_ENIGMA_VIEWERS_TTL_S:
+                _perf_cache_hit("list_enigma_viewers.L1")
+                return val
+        _perf_cache_miss("list_enigma_viewers.L1")
+        # Singleflight — JSONB regex scan is ~750 ms; without this,
+        # concurrent first-callers fire parallel queries.
+        sf_lock = self._acquire_singleflight_lock(
+            self._list_enigma_viewers_locks,
+            self._list_enigma_viewers_meta_lock,
+            key,
+        )
+        with sf_lock:
+            cache_now2 = time.time()
+            hit2 = self._list_enigma_viewers_cache.get(key)
+            if hit2 is not None and (cache_now2 - hit2[0]) < self._LIST_ENIGMA_VIEWERS_TTL_S:
+                return hit2[1]
+            with _perf_span("svc.list_enigma_viewers"):
+                val = self._persistence.list_enigma_viewers(
+                    q=q, status=status, sort=sort, limit=limit, offset=offset,
+                )
+            self._list_enigma_viewers_cache[key] = (cache_now, val)
+        self._cap_cache(self._list_enigma_viewers_cache)
+        return val
 
     def get_common_gifter_detail(
         self, user_id: int, *, public_only: bool = False,
     ) -> dict[str, Any]:
-        return self._persistence.common_gifter_detail(
-            int(user_id), public_only=public_only,
-        )
+        # L1 cache with 60 s TTL. Gifter-detail payloads can be heavy
+        # (joins against viewers + their full event history); a minute
+        # of staleness is invisible in the UI and collapses repeated
+        # modal-opens / page-navigations into one compute.
+        key = (int(user_id), bool(public_only))
+        cache_now = time.time()
+        hit = self._common_gifter_detail_cache.get(key)
+        if hit is not None:
+            ts_cached, val = hit
+            if (cache_now - ts_cached) < self._COMMON_GIFTER_DETAIL_TTL_S:
+                _perf_cache_hit("common_gifter_detail.L1")
+                return val
+        _perf_cache_miss("common_gifter_detail.L1")
+        with _perf_span("svc.common_gifter_detail", user_id=user_id):
+            val = self._persistence.common_gifter_detail(
+                int(user_id), public_only=public_only,
+            )
+        self._common_gifter_detail_cache[key] = (cache_now, val)
+        return val
 
     def get_user_host_daily_series(
         self, user_id: int, *, host_unique_id: str, days: int = 30,
     ) -> list[dict[str, Any]]:
         """Per-day diamond + gift totals for a single (user, host)
         pair. Powers the gifter modal's Timeline tab — a lighter
-        query than the full cross-host detail."""
-        return self._persistence.get_user_host_daily_series(
+        query than the full cross-host detail.
+
+        L1 cache 60 s TTL — most of the response is past-day data
+        (immutable); only today's bucket changes."""
+        key = (int(user_id), host_unique_id, int(days))
+        cache_now = time.time()
+        hit = self._user_host_daily_series_cache.get(key)
+        if hit is not None:
+            ts_cached, val = hit
+            if (cache_now - ts_cached) < self._USER_HOST_DAILY_SERIES_TTL_S:
+                _perf_cache_hit("user_host_daily_series.L1")
+                return val
+        _perf_cache_miss("user_host_daily_series.L1")
+        val = self._persistence.get_user_host_daily_series(
             int(user_id), host_unique_id=host_unique_id, days=int(days),
         )
+        self._user_host_daily_series_cache[key] = (cache_now, val)
+        return val
 
     # ── Notifications history ────────────────────────────────────────
 
@@ -3366,7 +3951,174 @@ class TikTokService:
     # the rare ≥60 s page idle. Trade-off: data staleness window
     # widens by ~25 s, which is acceptable for the rollup-style
     # numbers on the card (per-event freshness comes from the WS feed).
-    _LIVES_SUMMARY_TTL_S = 60.0
+    # ── get_room_stats cache ─────────────────────────────────────────
+    #
+    # Two-tier like `host_calendar`:
+    #   L1 — in-memory dict keyed by `(room_id, params_key)`. TTL of
+    #        15 s for windows that include "now" (active rooms or
+    #        sliding windows). Permanent freeze for windows whose
+    #        `until` is at least 1 min in the past (no new events
+    #        can land in them).
+    #   L2 — `tiktok_room_stats_cache` table, written only for the
+    #        immutable case so the table stays small and meaningful.
+    # Hard ceiling for caches that take user-controlled inputs in the
+    # key (datetimes, search strings, pagination). Without this they
+    # grow unbounded — e.g., `_aggregated_buckets_cache` includes
+    # `since.isoformat()` + `until.isoformat()` and any caller
+    # supplying microsecond-precision values generates a distinct
+    # key on every call. 5000 is generous for the operator's working
+    # set; the FIFO eviction drops the oldest entries on overflow.
+    _MAX_CAPPED_CACHE_SIZE = 5000
+
+    _ROOM_STATS_TTL_S = 15.0
+    _room_stats_cache: dict[
+        tuple[int, str], tuple[float, dict[str, Any]],
+    ] = {}
+    # Singleflight: ~50–80 ms cold compute × N concurrent admin tabs
+    # (or admin+public hitting the same room key) would otherwise
+    # stampede the SQL aggregation. Per-key lock collapses them to
+    # one cold compute that the rest of the callers wait on.
+    _room_stats_locks: dict[tuple[int, str], threading.Lock] = {}
+    _room_stats_meta_lock = threading.Lock()
+
+    # ── list_rooms_for_host cache ────────────────────────────────────
+    # L1 only — the list grows discretely when the host starts a new
+    # broadcast, so a short TTL is enough to absorb the heavy poll
+    # cadence (~2000 calls / day) without making new broadcasts wait.
+    _LIST_ROOMS_FOR_HOST_TTL_S = 20.0
+    _list_rooms_for_host_cache: dict[
+        tuple[str, int], tuple[float, Any],
+    ] = {}
+
+    # ── common_gifter_detail cache ───────────────────────────────────
+    # L1 only — per-(user_id, ...) payload. 15 s TTL: the Enigma
+    # resolver runs in a SEPARATE process (CLI / worker) so the API's
+    # in-memory cache can't be invalidated push-style when a viewer's
+    # real identity is captured. A short TTL keeps the staleness
+    # window for deanonymisation bounded; without it, a deanon would
+    # take up to a minute to surface in the gifter modal. 15 s also
+    # bounds new-gift staleness on the modal — gift volumes can be
+    # high enough that minute-old totals look wrong.
+    _COMMON_GIFTER_DETAIL_TTL_S = 15.0
+    _common_gifter_detail_cache: dict[
+        tuple, tuple[float, dict[str, Any]],
+    ] = {}
+
+    # ── list_enigma_viewers cache ────────────────────────────────────
+    # L1 only — JSONB-regex scan, ~750 ms p95. Pagination keys vary
+    # per page, but each page is heavily refreshed (operator scrolls
+    # filters / sort options). 60 s TTL is comfortable.
+    _LIST_ENIGMA_VIEWERS_TTL_S = 60.0
+    _list_enigma_viewers_cache: dict[
+        tuple, tuple[float, tuple[list[dict[str, Any]], int]],
+    ] = {}
+    # Singleflight: JSONB regex scan is ~750 ms cold; without locking,
+    # 10 admin tabs opening the page simultaneously fire 10 parallel
+    # SQL queries.
+    _list_enigma_viewers_locks: dict[tuple, threading.Lock] = {}
+    _list_enigma_viewers_meta_lock = threading.Lock()
+
+    # ── list_common_gifters cache ────────────────────────────────────
+    # L1 only — cross-room gifter aggregate.
+    _LIST_COMMON_GIFTERS_TTL_S = 30.0
+    _list_common_gifters_cache: dict[
+        tuple, tuple[float, dict[str, Any]],
+    ] = {}
+    # Singleflight: ~470 ms cold; multi-tab open stampede prevention.
+    _list_common_gifters_locks: dict[tuple, threading.Lock] = {}
+    _list_common_gifters_meta_lock = threading.Lock()
+
+    # ── list_host_rooms_with_totals cache ────────────────────────────
+    # L1 only — assembled (rooms, totals) tuple. 30 s TTL because new
+    # broadcasts appear as discrete entries, not within-the-second
+    # updates. Shared by admin + public room-list routes.
+    _LIST_HOST_ROOMS_WITH_TOTALS_TTL_S = 30.0
+    _list_host_rooms_with_totals_cache: dict[
+        tuple, tuple[float, tuple[list, dict]],
+    ] = {}
+
+    # ── match-related caches ─────────────────────────────────────────
+    # Matches are uniquely cacheable: once `ended_at IS NOT NULL`, the
+    # match's score timeline, gifter rosters, head-to-head set, and
+    # diamond totals are all immutable. We freeze ended matches
+    # forever in L1 and apply a short TTL to active matches so the UI
+    # still gets ~live updates.
+    _MATCH_CACHE_TTL_S = 15.0
+    _match_score_timeline_cache: dict[
+        int, tuple[float, bool, list[dict[str, Any]]],
+    ] = {}
+    _match_gifters_by_side_cache: dict[
+        tuple[int, bool], tuple[float, bool, dict[str, Any]],
+    ] = {}
+    _match_head_to_head_cache: dict[
+        tuple[int, int], tuple[float, bool, list[dict[str, Any]]],
+    ] = {}
+    _h2h_common_gifters_cache: dict[
+        tuple[int, int, int], tuple[float, bool, list[dict[str, Any]]],
+    ] = {}
+    # `match_diamonds_totals(ids)` is unusual: caller passes a LIST.
+    # We cache the per-match diamond count, keyed by match_id, and
+    # assemble the response from cache hits + an SQL call for misses.
+    _match_diamonds_total_cache: dict[
+        int, tuple[float, bool, int],
+    ] = {}
+
+    # ── miscellaneous service-level caches ───────────────────────────
+    # Each follows the same shape as the match caches: short TTL when
+    # the window touches "now"; frozen when it's fully in the past.
+    _AGGREGATED_BUCKETS_TTL_S = 15.0
+    _aggregated_buckets_cache: dict[
+        tuple, tuple[float, bool, dict[str, Any]],
+    ] = {}
+    _GET_ROOM_GIFTERS_TTL_S = 15.0
+    _get_room_gifters_cache: dict[
+        tuple, tuple[float, bool, dict[str, Any]],
+    ] = {}
+    _GET_ROOM_RECIPIENTS_TTL_S = 15.0
+    _get_room_recipients_cache: dict[
+        tuple, tuple[float, bool, dict[str, Any]],
+    ] = {}
+    _USER_HOST_DAILY_SERIES_TTL_S = 60.0
+    _user_host_daily_series_cache: dict[
+        tuple, tuple[float, list[dict[str, Any]]],
+    ] = {}
+    _LIST_MATCHES_TTL_S = 15.0
+    _list_matches_cache: dict[
+        tuple, tuple[float, list],
+    ] = {}
+    _LIST_USER_MATCHES_TTL_S = 30.0
+    _list_user_matches_cache: dict[
+        tuple, tuple[float, dict[str, Any]],
+    ] = {}
+    _CROSS_LIVE_GIFTERS_TTL_S = 30.0
+    _cross_live_gifters_cache: dict[
+        tuple, tuple[float, dict[str, Any]],
+    ] = {}
+    _cross_live_gifters_locks: dict[tuple, threading.Lock] = {}
+    _cross_live_gifters_meta_lock = threading.Lock()
+
+    # ── public subscription / room-host lookups ──────────────────────
+    # The public-mirror resolvers (`_resolve_public_host`,
+    # `_resolve_public_room`) hit `_persistence.get_subscription` /
+    # `get_room_host_handle` on EVERY request — under load this
+    # serialises through the threadpool and produced 10+ s p95 spikes
+    # on `/public/.../status`. Caching the two lookups at the service
+    # layer with a 30 s TTL collapses the repeat-hit pattern to one
+    # SQL per (handle, room) per cache window.
+    _PUBLIC_LOOKUP_TTL_S = 30.0
+    _public_subscription_cache: dict[
+        str, tuple[float, Any],
+    ] = {}
+    _public_room_host_cache: dict[
+        int, tuple[float, Optional[str]],
+    ] = {}
+
+    # Bumped 60→120s on 2026-05-18: frontend polls /lives/bundle every
+    # 30s with a 60s TTL, so pattern was miss→hit→miss→hit (50% cold
+    # misses). 120s TTL gives miss→hit→hit→hit (~25%). Operator-side
+    # staleness extra widens by ~25s, which is acceptable for the
+    # rollup-style numbers on the card.
+    _LIVES_SUMMARY_TTL_S = 120.0
     # Key shape: `(tz, sorted_handles_tuple)`. tz is part of the key
     # because `week_calendar` buckets vary per TZ; the rest of the
     # summary is TZ-agnostic, but caching two slightly-different
@@ -3523,9 +4275,11 @@ class TikTokService:
         hit = self._lives_summary_cache.get(key)
         if hit and (now - hit[0]) < self._LIVES_SUMMARY_TTL_S:
             self._record_cache("lives_summary", hit=True)
+            _perf_cache_hit("lives_summary.L1")
             sql_result = hit[1]
         else:
             self._record_cache("lives_summary", hit=False)
+            _perf_cache_miss("lives_summary.L1")
             # Cold miss — singleflight. Get or create the per-key lock.
             with self._lives_summary_meta_lock:
                 lock = self._lives_summary_locks.get(key)
@@ -3870,8 +4624,10 @@ class TikTokService:
         now = time.monotonic()
         if cached_for_tz is not None and (now - cached_for_tz[0]) < self._PUBLIC_LIVES_SUMMARY_TTL_S:
             self._record_cache("public_summary", hit=True)
+            _perf_cache_hit("public_lives_summary.L1")
             return cached_for_tz[1]
         self._record_cache("public_summary", hit=False)
+        _perf_cache_miss("public_lives_summary.L1")
 
         with self._public_lives_summary_meta_lock:
             lock = self._public_lives_summary_locks.get(tz)
@@ -3945,7 +4701,7 @@ class TikTokService:
     # to one DB round-trip per 15 s instead of one per tab per 30 s).
     # Same rationale as `_LIVES_SUMMARY_TTL_S` — 35 s buffer over the
     # 30 s frontend poll so steady-state polling always hits warm cache.
-    _LIVES_TOTALS_TTL_S = 60.0  # see `_LIVES_SUMMARY_TTL_S` rationale
+    _LIVES_TOTALS_TTL_S = 120.0  # see `_LIVES_SUMMARY_TTL_S` rationale
     _lives_totals_cache: tuple[float, dict[str, Any]] | None = None
     # Singleflight on cold miss — same rationale as `_lives_summary_cache`.
     # The cache has one slot (no per-key dimension), so one lock is enough.
@@ -3956,8 +4712,10 @@ class TikTokService:
         cached = self._lives_totals_cache
         if cached is not None and (now - cached[0]) < self._LIVES_TOTALS_TTL_S:
             self._record_cache("lives_totals", hit=True)
+            _perf_cache_hit("lives_totals.L1")
             return cached[1]
         self._record_cache("lives_totals", hit=False)
+        _perf_cache_miss("lives_totals.L1")
 
         with self._lives_totals_lock:
             now2 = time.monotonic()
@@ -4220,25 +4978,51 @@ class TikTokService:
         offset: int = 0,
         q: str | None = None,
     ) -> dict[str, Any]:
-        """Cross-creator gifter leaderboard. See persistence docstring."""
-        items = self._persistence.common_gifters(
-            min_hosts=min_hosts, limit=limit, offset=offset, q=q,
+        """Cross-creator gifter leaderboard. See persistence docstring.
+
+        L1 cache 30 s TTL — the cross-room aggregate is heavy
+        (~470 ms p95) and the underlying data (gifts arriving across
+        all tracked rooms) only meaningfully changes over minutes."""
+        key = (int(min_hosts), int(limit), int(offset), q or "")
+        cache_now = time.time()
+        hit = self._list_common_gifters_cache.get(key)
+        if hit is not None:
+            ts_cached, val = hit
+            if (cache_now - ts_cached) < self._LIST_COMMON_GIFTERS_TTL_S:
+                _perf_cache_hit("common_gifters.L1")
+                return val
+        _perf_cache_miss("common_gifters.L1")
+        # Singleflight — cross-room aggregate is ~470 ms cold.
+        sf_lock = self._acquire_singleflight_lock(
+            self._list_common_gifters_locks,
+            self._list_common_gifters_meta_lock,
+            key,
         )
-        total = self._persistence.count_common_gifters(
-            min_hosts=min_hosts, q=q,
-        )
-        # JS BigInt safety on the wire.
-        items_serialized = [
-            {**g, "user_id": str(g["user_id"]) if g.get("user_id") is not None else None}
-            for g in items
-        ]
-        return {
-            "items": items_serialized,
-            "total": int(total),
-            "limit": int(limit),
-            "offset": int(offset),
-            "min_hosts": int(min_hosts),
-        }
+        with sf_lock:
+            cache_now2 = time.time()
+            hit2 = self._list_common_gifters_cache.get(key)
+            if hit2 is not None and (cache_now2 - hit2[0]) < self._LIST_COMMON_GIFTERS_TTL_S:
+                return hit2[1]
+            items = self._persistence.common_gifters(
+                min_hosts=min_hosts, limit=limit, offset=offset, q=q,
+            )
+            total = self._persistence.count_common_gifters(
+                min_hosts=min_hosts, q=q,
+            )
+            # JS BigInt safety on the wire.
+            items_serialized = [
+                {**g, "user_id": str(g["user_id"]) if g.get("user_id") is not None else None}
+                for g in items
+            ]
+            result = {
+                "items": items_serialized,
+                "total": int(total),
+                "limit": int(limit),
+                "offset": int(offset),
+                "min_hosts": int(min_hosts),
+            }
+            self._list_common_gifters_cache[key] = (cache_now, result)
+            return result
 
     def get_cross_live_gifters_for_host(
         self,
@@ -4252,31 +5036,59 @@ class TikTokService:
         """Host-scoped variant of `get_common_gifters`: only viewers
         who gifted to this host AND to >= `min_other_hosts` other
         hosts. Same shape as `common_gifters` with extra here/elsewhere
-        split. See persistence docstring."""
-        items = self._persistence.cross_live_gifters_for_host(
-            host_unique_id,
-            min_other_hosts=min_other_hosts,
-            limit=limit,
-            offset=offset,
-            q=q,
+        split. See persistence docstring.
+
+        L1 cache 30 s TTL."""
+        key = (
+            host_unique_id, int(min_other_hosts),
+            int(limit), int(offset), q or "",
         )
-        total = self._persistence.count_cross_live_gifters_for_host(
-            host_unique_id,
-            min_other_hosts=min_other_hosts,
-            q=q,
+        cache_now = time.time()
+        hit = self._cross_live_gifters_cache.get(key)
+        if hit is not None:
+            ts_cached, val = hit
+            if (cache_now - ts_cached) < self._CROSS_LIVE_GIFTERS_TTL_S:
+                _perf_cache_hit("cross_live_gifters.L1")
+                return val
+        _perf_cache_miss("cross_live_gifters.L1")
+        # Singleflight — same scale as common_gifters.
+        sf_lock = self._acquire_singleflight_lock(
+            self._cross_live_gifters_locks,
+            self._cross_live_gifters_meta_lock,
+            key,
         )
-        items_serialized = [
-            {**g, "user_id": str(g["user_id"]) if g.get("user_id") is not None else None}
-            for g in items
-        ]
-        return {
-            "items": items_serialized,
-            "total": int(total),
-            "limit": int(limit),
-            "offset": int(offset),
-            "min_other_hosts": int(min_other_hosts),
-            "host": self._normalize(host_unique_id),
-        }
+        with sf_lock:
+            cache_now2 = time.time()
+            hit2 = self._cross_live_gifters_cache.get(key)
+            if hit2 is not None and (cache_now2 - hit2[0]) < self._CROSS_LIVE_GIFTERS_TTL_S:
+                return hit2[1]
+            items = self._persistence.cross_live_gifters_for_host(
+                host_unique_id,
+                min_other_hosts=min_other_hosts,
+                limit=limit,
+                offset=offset,
+                q=q,
+            )
+            total = self._persistence.count_cross_live_gifters_for_host(
+                host_unique_id,
+                min_other_hosts=min_other_hosts,
+                q=q,
+            )
+            items_serialized = [
+                {**g, "user_id": str(g["user_id"]) if g.get("user_id") is not None else None}
+                for g in items
+            ]
+            result = {
+                "items": items_serialized,
+                "total": int(total),
+                "limit": int(limit),
+                "offset": int(offset),
+                "min_other_hosts": int(min_other_hosts),
+                "host": self._normalize(host_unique_id),
+            }
+            self._cross_live_gifters_cache[key] = (cache_now, result)
+            self._cap_cache(self._cross_live_gifters_cache)
+            return result
 
     # ── internals ────────────────────────────────────────────────────
 

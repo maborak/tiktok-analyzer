@@ -1,0 +1,21 @@
+{
+  "label": "phase-9.6-post-stale-cache-fixes",
+  "timestamp": "2026-05-16T12:41:42.114859+00:00",
+  "base_url": "http://localhost:9020",
+  "warmup": 3,
+  "cold": {
+    "GET /admin/tiktok/lives/bundle": {
+      "ms": 82.44,
+      "status": 200,
+      "bytes": 215320
+    }
+  },
+  "warm": {
+    "total_p50_ms": 29.96,
+    "total_p95_ms": 35.36,
+    "total_min_ms": 27.92,
+    "total_max_ms": 35.42,
+    "total_mean_ms": 30.25,
+    "runs": 20
+  }
+}

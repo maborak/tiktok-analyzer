@@ -28,6 +28,8 @@ import logging
 import os
 import signal
 import sys
+import time
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import click
@@ -394,6 +396,126 @@ def refresh_profiles_cmd(handle: str | None, force_all: bool) -> None:
     asyncio.run(_refresh_profiles(handle=handle, force_all=force_all))
 
 
+@tiktok_group.command(name="resolve-enigmas")
+@click.option(
+    "--limit",
+    type=int,
+    default=200,
+    help="Max viewers to resolve in one run (default 200; budget guard).",
+)
+@click.option(
+    "--rate-ms",
+    type=int,
+    default=900,
+    help="Sleep between profile fetches (default 900ms — gentle on Euler quota).",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="List candidates, don't fetch / write.",
+)
+def resolve_enigmas_cmd(limit: int, rate_ms: int, dry_run: bool) -> None:
+    """Deanonymise Enigma-flagged viewers using ONLY data already in
+    our DB — no TikTok API calls.
+
+    For each `tiktok_viewers` row with `is_enigma=TRUE` and nickname
+    still matching the `Enigma <NNN>` placeholder, the resolver
+    scans `tiktok_events.payload` for the SAME `user_id` carrying
+    any non-Enigma identity. The user_id is preserved by TikTok
+    across anonymous-vs-real gifts, so a real nickname captured in
+    ONE event (comment, gift in another room, room-enter) is the
+    user's real identity — even if their CURRENT viewer row only
+    holds the placeholder.
+
+    The `is_enigma` flag is kept TRUE forever (sticky), so the
+    badge keeps rendering next to the real name.
+
+    Use `--dry-run` to preview the resolution plan before writing.
+    """
+    asyncio.run(_resolve_enigmas(limit=limit, rate_ms=rate_ms, dry_run=dry_run))
+
+
+@tiktok_group.command(name="warm-caches")
+@click.option(
+    "--weeks",
+    type=int,
+    default=26,
+    help="Lookback window in weeks (default 26 — mirrors the heatmap default).",
+)
+@click.option(
+    "--host",
+    default=None,
+    help="Limit to one @handle. Default: warm every enabled subscription.",
+)
+@click.option(
+    "--tz",
+    "tzs",
+    multiple=True,
+    default=("UTC",),
+    help=(
+        "Timezone to bucket by. Pass multiple times to warm several "
+        "(e.g. --tz UTC --tz America/Lima). Default: UTC only."
+    ),
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Recompute every day in the window, ignoring `computed_at`.",
+)
+@click.option(
+    "--watch",
+    is_flag=True,
+    help="Loop forever, sleeping `--interval` between ticks (daemon mode).",
+)
+@click.option(
+    "--interval",
+    type=int,
+    default=60,
+    help="Seconds between ticks when --watch is set (default 60).",
+)
+def warm_caches_cmd(
+    weeks: int,
+    host: str | None,
+    tzs: tuple[str, ...],
+    force: bool,
+    watch: bool,
+    interval: int,
+) -> None:
+    """Proactively populate `tiktok_host_calendar_cache` so cold page-
+    loads serve from cache instead of the 2.7 s aggregation.
+
+    For every enabled subscription (or a single --host), this command:
+      1. Reads the existing cache rows for the [now - weeks, now] window.
+      2. Recomputes only days that are missing or whose `computed_at`
+         is older than the in-process TTL (5 min for today's row;
+         frozen forever for past days).
+      3. UPSERTs the result with a fresh `computed_at`.
+
+    Both the API and this CLI write the same table. `computed_at`
+    is the coordination point — neither does redundant work when the
+    other got there first. `--force` overrides that and recomputes
+    every day.
+
+    Run once:
+        python cli.py system tiktok warm-caches
+
+    Daemon:
+        python cli.py system tiktok warm-caches --watch --interval 60
+
+    Single host, single tz:
+        python cli.py system tiktok warm-caches --host luzy.pe --tz America/Lima
+    """
+    if watch:
+        _warm_caches_loop(
+            weeks=weeks, host=host, tzs=tuple(tzs),
+            force=force, interval_s=interval,
+        )
+    else:
+        _warm_caches_once(
+            weeks=weeks, host=host, tzs=tuple(tzs), force=force,
+        )
+
+
 # ── implementation ──────────────────────────────────────────────────
 
 
@@ -718,7 +840,11 @@ async def _main(*, reconcile_seconds: int) -> None:
     if state_cache is not None:
         from adapters.tiktok_state_ticker import run_state_tick_loop
         tick_task = asyncio.create_task(
-            run_state_tick_loop(state_cache, stop_event=stop),
+            run_state_tick_loop(
+                state_cache,
+                stop_event=stop,
+                active_hosts_resolver=persistence.get_hosts_with_active_room,
+            ),
             name="tiktok-state-tick",
         )
 
@@ -1575,6 +1701,474 @@ async def _refresh_profiles(*, handle: str | None, force_all: bool) -> None:
         click.echo("Refreshing stale subscriptions (>1h since last fetch) …")
         n = await svc.refresh_stale_profiles()
     click.echo(f"Done. Refreshed {n} handle(s).")
+
+
+def _warm_caches_window(weeks: int) -> tuple[datetime, datetime]:
+    """Replicate the service-layer window snap so the CLI warms the
+    EXACT same `[start, end]` the API will read: end-of-day today,
+    `weeks*7` days back snapped to start-of-day, then floored to the
+    previous Monday."""
+    now = datetime.now(timezone.utc)
+    end = now.replace(hour=23, minute=59, second=59, microsecond=999_999)
+    start = (now - timedelta(days=weeks * 7)).replace(
+        hour=0, minute=0, second=0, microsecond=0,
+    )
+    offset_to_monday = start.weekday()
+    if offset_to_monday > 0:
+        start = start - timedelta(days=offset_to_monday)
+    return start, end
+
+
+def _warm_caches_enumerate_hosts(host: str | None) -> list[str]:
+    """Resolve the list of @handles to warm. `--host` short-circuits
+    to a single handle; otherwise we read every enabled subscription
+    from `tiktok_subscriptions`."""
+    from database.core.connection import create_database_engine
+    from sqlalchemy import text as _text
+
+    if host:
+        return [host.lstrip("@").strip()]
+
+    engine = create_database_engine()
+    with engine.connect() as c:
+        rows = c.execute(_text(
+            "SELECT unique_id FROM tiktok_subscriptions "
+            "WHERE enabled = TRUE "
+            "ORDER BY unique_id"
+        )).all()
+    return [r[0] for r in rows if r and r[0]]
+
+
+def _warm_caches_make_persistence():
+    """Construct one persistence adapter for the lifetime of the
+    warm-caches CLI invocation. In watch mode this avoids the
+    per-tick engine-pool churn the original code introduced
+    (TikTokPersistenceAdapter(auto_init=True) opens new engines each
+    time)."""
+    from adapters.persistence.tiktok_persistence import TikTokPersistenceAdapter
+    return TikTokPersistenceAdapter(auto_init=True)
+
+
+def _warm_caches_run_tick(
+    *,
+    weeks: int,
+    host: str | None,
+    tzs: tuple[str, ...],
+    force: bool,
+    tick_id: int | None = None,
+    persistence=None,
+) -> dict:
+    """One pass: warm every (host × tz) pair. Returns aggregate stats.
+
+    `persistence` is reused across ticks in watch mode. When the
+    caller doesn't pass one (one-shot mode), we construct it here.
+
+    Prints inline progress so the operator can see something happening
+    even on a long cold-start tick (a 101-host cold run takes ~70 s).
+    """
+    if persistence is None:
+        persistence = _warm_caches_make_persistence()
+    if not persistence._is_postgres():
+        click.echo("warm-caches: SQLite dev mode — L2 cache disabled, nothing to do.")
+        return {
+            "hosts": 0, "tzs": 0, "computed": 0,
+            "skipped": 0, "errors": 0, "elapsed_ms": 0,
+        }
+
+    since, until = _warm_caches_window(weeks)
+    hosts = _warm_caches_enumerate_hosts(host)
+    if not hosts:
+        click.echo("warm-caches: no enabled hosts to warm.")
+        return {
+            "hosts": 0, "tzs": len(tzs), "computed": 0,
+            "skipped": 0, "errors": 0, "elapsed_ms": 0,
+        }
+
+    tick_label = f"#{tick_id} " if tick_id is not None else ""
+    now_iso = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    click.echo(
+        f"[{now_iso}] tick {tick_label}— scanning {len(hosts)} host(s) × "
+        f"{len(tzs)} tz ({', '.join(tzs)}) | window={since.date()}→{until.date()}"
+        f"{' | FORCE' if force else ''}"
+    )
+
+    t0 = time.perf_counter()
+    totals = {"computed": 0, "skipped": 0, "errors": 0}
+    per_host_log: list[tuple[str, str, dict]] = []
+    total_pairs = len(hosts) * len(tzs)
+    progress_every = max(25, total_pairs // 10)
+    done = 0
+    for h in hosts:
+        for tz in tzs:
+            try:
+                r = persistence.warm_host_calendar(
+                    h, since=since, until=until, tz=tz, force=force,
+                )
+                totals["computed"] += int(r.get("computed") or 0)
+                totals["skipped"] += int(r.get("skipped") or 0)
+                per_host_log.append((h, tz, r))
+            except Exception as e:
+                totals["errors"] += 1
+                logger.exception(
+                    "warm-caches: failed for host=%s tz=%s: %s", h, tz, e,
+                )
+            done += 1
+            if done % progress_every == 0 and done < total_pairs:
+                pct = int(done * 100 / total_pairs)
+                ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+                click.echo(
+                    f"  [{ts}] {done:>4}/{total_pairs} ({pct:>3}%)  "
+                    f"computed={totals['computed']:>4}  "
+                    f"errors={totals['errors']}"
+                )
+
+    elapsed_ms = int((time.perf_counter() - t0) * 1000)
+
+    # Per-host detail — only print rows that actually did work, so
+    # the steady-state idempotent tick prints just the summary line.
+    work_done_hosts = [
+        (h, tz, r) for h, tz, r in per_host_log
+        if (r.get("computed") or 0) > 0
+    ]
+    for h, tz, r in work_done_hosts:
+        click.echo(
+            f"  ✓ {h}  tz={tz}  computed={r['computed']:>3}  "
+            f"skipped={r['skipped']:>3}  took={r.get('took_ms', 0):>4}ms"
+        )
+
+    if not work_done_hosts and totals["errors"] == 0 and total_pairs > 0:
+        click.echo(
+            f"  (no work — all {total_pairs} host×tz pairs already fresh)"
+        )
+
+    return {
+        "hosts": len(hosts),
+        "tzs": len(tzs),
+        "computed": totals["computed"],
+        "skipped": totals["skipped"],
+        "errors": totals["errors"],
+        "elapsed_ms": elapsed_ms,
+    }
+
+
+def _warm_caches_status_snapshot(persistence=None) -> dict:
+    """Read the cache-table headline numbers for a debug line: how
+    many rows total, how many hosts covered, oldest `computed_at`,
+    and how many today-rows are already stale (i.e. work waiting).
+
+    `persistence` is reused across calls in watch mode to avoid
+    re-opening engines per status print."""
+    from sqlalchemy import text as _text
+
+    try:
+        if persistence is not None:
+            with persistence._get_session() as s:
+                row = s.execute(_text("""
+                    SELECT
+                      COUNT(*)                                     AS rows_total,
+                      COUNT(DISTINCT host_unique_id)               AS hosts_covered,
+                      MIN(computed_at)                             AS oldest,
+                      MAX(computed_at)                             AS newest,
+                      COUNT(*) FILTER (
+                        WHERE day = CURRENT_DATE
+                          AND computed_at < NOW() - INTERVAL '5 minutes'
+                      )                                            AS stale_today
+                    FROM tiktok_host_calendar_cache
+                """)).first()
+        else:
+            # Fallback for callers that don't have a persistence
+            # handle (early one-shot path before construction).
+            from database.core.connection import create_database_engine
+            engine = create_database_engine()
+            with engine.connect() as c:
+                row = c.execute(_text("""
+                    SELECT
+                      COUNT(*)                                     AS rows_total,
+                      COUNT(DISTINCT host_unique_id)               AS hosts_covered,
+                      MIN(computed_at)                             AS oldest,
+                      MAX(computed_at)                             AS newest,
+                      COUNT(*) FILTER (
+                        WHERE day = CURRENT_DATE
+                          AND computed_at < NOW() - INTERVAL '5 minutes'
+                      )                                            AS stale_today
+                    FROM tiktok_host_calendar_cache
+                """)).first()
+        if not row:
+            return {}
+        return {
+            "rows_total": int(row.rows_total or 0),
+            "hosts_covered": int(row.hosts_covered or 0),
+            "oldest": row.oldest,
+            "newest": row.newest,
+            "stale_today": int(row.stale_today or 0),
+        }
+    except Exception:
+        return {}
+
+
+def _fmt_age(then: datetime | None) -> str:
+    """Compact 'Xs / Xm / Xh ago' for a UTC timestamp."""
+    if then is None:
+        return "never"
+    if then.tzinfo is None:
+        then = then.replace(tzinfo=timezone.utc)
+    delta_s = int((datetime.now(timezone.utc) - then).total_seconds())
+    if delta_s < 60:
+        return f"{delta_s}s ago"
+    if delta_s < 3600:
+        return f"{delta_s // 60}m ago"
+    if delta_s < 86400:
+        return f"{delta_s // 3600}h{(delta_s % 3600) // 60}m ago"
+    return f"{delta_s // 86400}d ago"
+
+
+def _print_cache_status_line(prefix: str = "  ", persistence=None) -> None:
+    """One-line snapshot of the cache table — useful as a 'this is
+    actually working / here's what's loaded' debug signal.
+
+    `persistence` is reused across calls in watch mode so the loop
+    doesn't open a fresh engine pool per debug print."""
+    snap = _warm_caches_status_snapshot(persistence=persistence)
+    if not snap:
+        click.echo(f"{prefix}(cache status unavailable — Postgres unreachable?)")
+        return
+    click.echo(
+        f"{prefix}cache: {snap['rows_total']} rows across {snap['hosts_covered']} host(s) "
+        f"| newest={_fmt_age(snap['newest'])} "
+        f"| oldest={_fmt_age(snap['oldest'])} "
+        f"| stale today-rows={snap['stale_today']}"
+    )
+
+
+def _warm_caches_once(
+    *,
+    weeks: int,
+    host: str | None,
+    tzs: tuple[str, ...],
+    force: bool,
+) -> None:
+    """One-shot mode — run a single tick and exit."""
+    _configure_logging()
+    click.echo(
+        f"warm-caches: ONE-SHOT  weeks={weeks} tzs={list(tzs)} "
+        f"host={host or '(all enabled)'}  force={force}"
+    )
+    # Single adapter for the whole one-shot pass — used by status
+    # prints + the tick itself so we don't open 3 separate engines.
+    persistence = _warm_caches_make_persistence()
+    _print_cache_status_line(prefix="  before: ", persistence=persistence)
+    stats = _warm_caches_run_tick(
+        weeks=weeks, host=host, tzs=tzs, force=force,
+        persistence=persistence,
+    )
+    click.echo(
+        f"warm-caches: hosts={stats['hosts']} tzs={stats['tzs']} "
+        f"computed={stats['computed']} skipped={stats['skipped']} "
+        f"errors={stats['errors']} elapsed={stats['elapsed_ms']}ms"
+    )
+    _print_cache_status_line(prefix="  after:  ", persistence=persistence)
+
+
+def _warm_caches_loop(
+    *,
+    weeks: int,
+    host: str | None,
+    tzs: tuple[str, ...],
+    force: bool,
+    interval_s: int,
+) -> None:
+    """Daemon mode — tick, sleep, repeat. Stops cleanly on SIGINT.
+
+    Each tick prints:
+      - tick header (when, what, force-or-not)
+      - inline progress every ~10% of host×tz pairs
+      - per-host lines for hosts that actually had work
+      - tick summary
+      - cache-table status snapshot
+      - "next tick at HH:MM:SS (in Ns)" so it's obvious when the
+        daemon will move next.
+    """
+    import signal
+    import threading
+
+    _configure_logging()
+    # threading.Event lets the signal handler wake the loop instantly
+    # instead of the previous `time.sleep(1)` polling loop (which on
+    # a 1-hour interval would do 3600 syscalls per tick).
+    stop_event = threading.Event()
+
+    def _on_signal(_signum, _frame) -> None:
+        if not stop_event.is_set():
+            click.echo(
+                "\nwarm-caches: stop signal received — exiting after current tick."
+            )
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+
+    click.echo(
+        f"warm-caches: WATCH mode  interval={interval_s}s  "
+        f"weeks={weeks}  tzs={list(tzs)}  host={host or '(all enabled)'}  "
+        f"force={force}"
+    )
+    # One adapter for the whole daemon lifetime — the previous code
+    # constructed a new TikTokPersistenceAdapter on every tick which
+    # churned the engine pool at the interval cadence.
+    persistence = _warm_caches_make_persistence()
+    _print_cache_status_line(prefix="  startup: ", persistence=persistence)
+
+    tick_id = 0
+    while not stop_event.is_set():
+        tick_id += 1
+        tick_start = datetime.now(timezone.utc)
+        try:
+            stats = _warm_caches_run_tick(
+                weeks=weeks, host=host, tzs=tzs, force=force,
+                tick_id=tick_id, persistence=persistence,
+            )
+            click.echo(
+                f"  ↳ tick #{tick_id} done: "
+                f"computed={stats['computed']} skipped={stats['skipped']} "
+                f"errors={stats['errors']} elapsed={stats['elapsed_ms']}ms"
+            )
+            _print_cache_status_line(prefix="  state:   ", persistence=persistence)
+        except Exception as e:
+            logger.exception("warm-caches: tick failed: %s", e)
+
+        if stop_event.is_set():
+            break
+
+        next_tick = tick_start + timedelta(seconds=interval_s)
+        # If a tick ran longer than the interval, fire immediately and
+        # log that we're already behind — useful to spot when the
+        # interval is set too tight for the workload.
+        seconds_until_next = max(0, int((next_tick - datetime.now(timezone.utc)).total_seconds()))
+        if seconds_until_next == 0:
+            click.echo(
+                f"  ⚠️  tick took longer than interval ({interval_s}s) — "
+                f"starting next tick immediately"
+            )
+        else:
+            click.echo(
+                f"  ⏱  next tick at {next_tick.strftime('%H:%M:%S')} UTC "
+                f"(in {seconds_until_next}s)"
+            )
+            # Event.wait() returns True when the event is set (SIGINT
+            # / SIGTERM); we exit the loop on the next iteration via
+            # the `while not stop_event.is_set()` check. Beats the
+            # previous 1-s polling loop on any interval > a few s.
+            stop_event.wait(timeout=seconds_until_next)
+
+
+async def _resolve_enigmas(*, limit: int, rate_ms: int, dry_run: bool) -> None:
+    """Implementation of `resolve-enigmas` — see CLI command docstring.
+
+    Pure-DB resolver: no TikTok API calls. For each Enigma viewer
+    whose stored nickname is still the placeholder, search
+    `tiktok_events.payload` for the SAME `user_id` carrying a real
+    nickname (anything that doesn't match the `Enigma <NNN>`
+    pattern). The user_id is identical across Enigma vs non-Enigma
+    events for the same person, so the join is trivial and the
+    extracted nickname IS the real identity.
+
+    The `rate_ms` and external-API budget concerns from the previous
+    implementation no longer apply — this is one indexed SQL query
+    per row, runs in seconds.
+    """
+    _ = rate_ms  # kept on the signature for backward-compat; unused now.
+    _configure_logging()
+    from adapters.persistence.tiktok_persistence import TikTokPersistenceAdapter
+    from database.tiktok.models import TikTokViewerModel
+    from sqlalchemy import text as sql_text
+
+    persistence = TikTokPersistenceAdapter(auto_init=True)
+
+    # Candidate query: any Enigma viewer whose stored nickname OR
+    # unique_id is still the placeholder. The unique_id arm catches
+    # rows the older upsert wrote with the Enigma string into the
+    # handle column (pre-fix worker bug).
+    with persistence._get_session() as s:
+        rows = s.execute(sql_text("""
+            SELECT user_id, unique_id, nickname
+            FROM tiktok_viewers
+            WHERE is_enigma = TRUE
+              AND (
+                    nickname  ~* '^Enigma\\s+\\d+$'
+                 OR unique_id ~* '^Enigma\\s+\\d+$'
+              )
+            ORDER BY last_seen_at DESC
+            LIMIT :lim
+        """), {"lim": int(limit)}).all()
+
+    if not rows:
+        click.echo("No Enigma viewers to resolve. (Already done, or no candidates.)")
+        return
+
+    click.echo(
+        f"Found {len(rows)} candidate(s). "
+        f"{'Dry run — no writes.' if dry_run else 'Resolving from event payloads (pure DB, no network).'}"
+    )
+
+    resolved = 0
+    no_real_event = 0
+    for r in rows:
+        with persistence._get_session() as s:
+            # Most-recent non-Enigma payload for this user_id. The
+            # `payload->'user'->>'nickname' !~* '^enigma\s+\d+$'`
+            # filter guarantees we land on a real-identity event.
+            # `LIMIT 1` keeps the cost a single indexed lookup +
+            # JSONB extract per candidate.
+            real = s.execute(sql_text("""
+                SELECT
+                    payload->'user'->>'nickname'    AS nickname,
+                    payload->'user'->>'unique_id'   AS unique_id,
+                    payload->'user'->>'avatar_url'  AS avatar_url
+                FROM tiktok_events
+                WHERE user_id = :uid
+                  AND payload->'user'->>'nickname' IS NOT NULL
+                  AND payload->'user'->>'nickname'  !~* '^enigma\\s+\\d+$'
+                  AND payload->'user'->>'unique_id' !~* '^enigma\\s+\\d+$'
+                ORDER BY id DESC
+                LIMIT 1
+            """), {"uid": int(r.user_id)}).mappings().first()
+            if not real or not real["nickname"]:
+                no_real_event += 1
+                continue
+            new_nick = real["nickname"]
+            new_uid = real["unique_id"] or r.unique_id
+            new_avatar = real["avatar_url"]
+            if dry_run:
+                click.echo(
+                    f"  [dry] user_id={r.user_id}  "
+                    f"{r.nickname!r} → {new_nick!r}  @{new_uid}"
+                )
+                resolved += 1
+                continue
+            viewer = (
+                s.query(TikTokViewerModel)
+                .filter(TikTokViewerModel.user_id == r.user_id)
+                .first()
+            )
+            if viewer is None:
+                continue
+            viewer.nickname = new_nick
+            if new_uid:
+                viewer.unique_id = new_uid
+            if new_avatar:
+                viewer.avatar_url = new_avatar
+            # is_enigma stays TRUE forever (sticky).
+            s.commit()
+            resolved += 1
+            click.echo(
+                f"  ✅ user_id={r.user_id}  "
+                f"{r.nickname!r} → {new_nick!r}  @{new_uid}"
+            )
+
+    click.echo(
+        f"Done. resolved={resolved}  no_real_event={no_real_event}  "
+        f"total={len(rows)}"
+    )
 
 
 def _print_kv(data: dict, *, title: str) -> None:

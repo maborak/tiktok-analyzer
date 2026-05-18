@@ -7,7 +7,7 @@ import {
   Lock, KeyRound, UserPlus, History, Coins,
   Layers, LogIn,
   Database, ShieldAlert, Radio, BarChart3, Gift,
-  LayoutDashboard,
+  LayoutDashboard, Activity, VenetianMask,
 } from 'lucide-react';
 import { cn } from '../../utils/cn';
 import { appConfig } from '../../config/env';
@@ -124,6 +124,8 @@ const adminTikTokSection: NavigationSection = {
     { name: 'Lives',       href: `/admin/tiktok`,             icon: Radio, end: true },
     { name: 'History',     href: `/admin/tiktok/history`,     icon: History },
     { name: 'Gifts',       href: `/admin/tiktok/gifts`,       icon: Gift },
+    { name: 'Enigmas',     href: `/admin/tiktok/enigmas`,     icon: VenetianMask },
+    { name: 'Perf Traces', href: `/admin/tiktok/perf`,        icon: Activity },
     // Settings consolidates every TikTok-related config + ops
     // surface under one sidebar entry:
     //   - General      → typed-config grouped editor (mirrors the

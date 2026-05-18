@@ -182,6 +182,56 @@ def test_tick_processes_multiple_hosts(cache):
     assert "last_gift_age_s" not in cache.get("c")[1]
 
 
+# ── SQL-authority gate ─────────────────────────────────────────────
+
+
+def test_tick_drops_phantom_live_host_when_resolver_says_inactive(cache):
+    """When the resolver reports a host is NOT SQL-live, the tick must
+    skip publishing — preventing the loop from re-asserting stale
+    `last_*_age_s` deltas for hosts whose worker silently dropped."""
+    cache.set("phantom", version=5, data={
+        "active_room_id": "999",  # cached value — never cleared
+        "_last_gift_at": _iso_ago(8),
+    })
+    # Resolver claims NO host is currently live.
+    _tick_once(cache, poll_ttl_s=60.0, active_hosts_resolver=lambda _hosts: set())
+    v, data = cache.get("phantom")
+    # No version bump, no age field written — the patch was gated.
+    assert v == 5
+    assert "last_gift_age_s" not in data
+
+
+def test_tick_allows_active_host_when_resolver_confirms_live(cache):
+    """When the resolver confirms a host IS SQL-live, the tick proceeds
+    as normal — the gate must not drop deltas for truly-live hosts."""
+    cache.set("live", version=5, data={
+        "active_room_id": "1",
+        "_last_gift_at": _iso_ago(8),
+    })
+    _tick_once(cache, poll_ttl_s=60.0, active_hosts_resolver=lambda _hosts: {"live"})
+    v, data = cache.get("live")
+    assert v == 6  # patch applied → version bumped
+    assert data["last_gift_age_s"] == 8
+
+
+def test_tick_resolver_failure_falls_through_to_legacy_publish(cache):
+    """If the resolver raises, the tick falls through to legacy
+    behavior (publishes every active candidate). Better to ship a
+    stale tick than block age updates entirely on a transient DB
+    failure — the 5-min sweeper still owns cache-clearing."""
+    cache.set("h", version=1, data={
+        "active_room_id": "1", "_last_gift_at": _iso_ago(3),
+    })
+
+    def boom(_hosts):
+        raise RuntimeError("simulated DB failure")
+
+    _tick_once(cache, poll_ttl_s=60.0, active_hosts_resolver=boom)
+    _, data = cache.get("h")
+    # Legacy fall-through → publish proceeded → age field set.
+    assert data["last_gift_age_s"] == 3
+
+
 # ── async loop (sanity) ─────────────────────────────────────────────
 
 

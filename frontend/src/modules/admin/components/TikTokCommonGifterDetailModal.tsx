@@ -512,6 +512,21 @@ export function TikTokCommonGifterDetailModal({
                       @{uniqueId}
                     </span>
                   )}
+                  {data?.enigma_aliases && data.enigma_aliases.length > 0 && (
+                    <span
+                      className="inline-flex items-center gap-1 flex-wrap"
+                      title={`This user has been seen gifting under ${data.enigma_aliases.length} Enigma alias${data.enigma_aliases.length === 1 ? '' : 'es'}`}
+                    >
+                      {data.enigma_aliases.map((alias) => (
+                        <span
+                          key={alias}
+                          className="inline-flex items-center px-1.5 py-0.5 rounded-full font-mono text-[9px] bg-violet-50 text-violet-700 ring-1 ring-violet-200 dark:bg-violet-500/10 dark:text-violet-300 dark:ring-violet-500/30"
+                        >
+                          {alias}
+                        </span>
+                      ))}
+                    </span>
+                  )}
                   {/* Go-to-Live shortcut — shown when this viewer's
                       @handle also belongs to a monitored host. Lets
                       the operator jump straight to the host's live-
@@ -648,6 +663,7 @@ export function TikTokCommonGifterDetailModal({
           </div>
         );
       })()}
+
 
       {/* States */}
       {error && (
