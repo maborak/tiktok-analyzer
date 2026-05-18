@@ -135,4 +135,14 @@ def create_main_router():
     # serve to anonymous users.
     main_router.include_router(public_tiktok.router, prefix="/public", tags=["Public"])
 
+    # User-facing /tiktok/* monitoring routes. Mounted at the ROOT
+    # (not under /user/*) on purpose — the URL the operator told us
+    # to use is `/tiktok/lives`, `/tiktok/credits`, etc. Internally
+    # the router lives at `routes/user/tiktok.py` because it shares
+    # the same auth dep (`get_current_user_swagger_compatible`) as
+    # every other authenticated user endpoint; the FILE path follows
+    # framework convention, the URL path does not.
+    from routes.user import tiktok as user_tiktok
+    main_router.include_router(user_tiktok.router, tags=["User TikTok"])
+
     return main_router

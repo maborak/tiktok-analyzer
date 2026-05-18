@@ -6,8 +6,8 @@ import {
   MessageSquare, FileText, Receipt, Settings, Settings2,
   Lock, KeyRound, UserPlus, History, Coins,
   Layers, LogIn,
-  Database, ShieldAlert, Radio, BarChart3, Gift,
-  LayoutDashboard, Activity, VenetianMask,
+  Database, ShieldAlert, Radio,
+  LayoutDashboard, Activity,
 } from 'lucide-react';
 import { cn } from '../../utils/cn';
 import { appConfig } from '../../config/env';
@@ -114,22 +114,22 @@ const adminSupportSection: NavigationSection = {
   ],
 };
 
+// Admin TikTok section — operator-only tools. After the 2026-05-18
+// per-user monetised monitoring pivot, the MONITORING pages (Dashboard,
+// Lives, History, Gifts, Enigmas, per-host detail) moved to /tiktok/*
+// for every authenticated user (admin sees their own subs there, same
+// as any user). This admin section now retains only operator-specific
+// surfaces: the cross-user god view, listener-pool config, and the
+// perf-trace debug tool.
 const adminTikTokSection: NavigationSection = {
   title: 'TikTok',
   key: 'admin-tiktok',
   collapsible: true,
   defaultExpanded: true,
   items: [
-    { name: 'Dashboard',   href: `/admin/tiktok/dashboard`,   icon: BarChart3 },
-    { name: 'Lives',       href: `/admin/tiktok`,             icon: Radio, end: true },
     // All-Subscriptions — every user's monitored handles. The
-    // "Make Public" admin-only toggle lives here per-row (was
-    // historically sprinkled across multiple user-facing surfaces
-    // before the per-user monetised monitoring pivot).
+    // "Make Public" admin-only toggle lives here per-row.
     { name: 'All Subscriptions', href: `/admin/tiktok/all-subscriptions`, icon: Layers },
-    { name: 'History',     href: `/admin/tiktok/history`,     icon: History },
-    { name: 'Gifts',       href: `/admin/tiktok/gifts`,       icon: Gift },
-    { name: 'Enigmas',     href: `/admin/tiktok/enigmas`,     icon: VenetianMask },
     { name: 'Perf Traces', href: `/admin/tiktok/perf`,        icon: Activity },
     // Settings consolidates every TikTok-related config + ops
     // surface under one sidebar entry:
