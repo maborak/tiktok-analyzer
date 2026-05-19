@@ -303,13 +303,68 @@ class RBACDependency:
         
         return _require_any_read_only
     
+    def path_gated_admin(self, admin_permissions: Union[str, List[str]]):
+        """
+        Dual-purpose auth dep for handlers that are double-mounted at
+        a user-facing prefix AND an admin prefix. Behaviour depends on
+        the request path:
+
+          - If `request.url.path.startswith('/admin/')`: require ANY
+            permission in `admin_permissions`. Otherwise 403.
+          - Otherwise: just require authentication. Handler reads
+            `auth_context.has_permission(...)` to decide its own
+            ownership-filter behaviour.
+
+        Used by the TikTok dual-mount in routes/main.py:
+          read_router @ /tiktok        → non-admin path → any user OK
+          read_router @ /admin/tiktok  → admin path → admin only
+
+        Read replica for both code paths (these are GET handlers).
+        """
+        from utils.database.force_write import consistency_context
+        from fastapi import Request
+
+        perm_list = (
+            [admin_permissions]
+            if isinstance(admin_permissions, str)
+            else admin_permissions
+        )
+
+        async def _path_gated(
+            request: Request,
+            oauth2_token: Optional[str] = Depends(_oauth2_scheme),
+            bearer_credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer_security),
+            auth_service: AuthService = Depends(get_auth_service),
+        ) -> AuthContext:
+            token = self._get_token(oauth2_token, bearer_credentials)
+            if not token:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Authentication required",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            with consistency_context("read"):
+                auth_context = self._get_auth_context(token, auth_service)
+            if request.url.path.startswith("/admin/"):
+                if not any(auth_context.has_permission(p) for p in perm_list):
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail=(
+                            f"Admin permission required for this path "
+                            f"(one of: {', '.join(perm_list)})"
+                        ),
+                    )
+            return auth_context
+
+        return _path_gated
+
     def authenticated(self):
         """
         Require authentication only (no specific permission).
-        
+
         Returns:
             FastAPI dependency that returns AuthContext
-        
+
         Example:
             Depends(rbac.authenticated())
         """

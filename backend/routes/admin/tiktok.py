@@ -32,9 +32,96 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Admin TikTok"])
 
+# Second router for READ endpoints that are also exposed at /tiktok/*
+# for any authenticated user (ownership-filtered). Each read handler
+# below is decorated AGAINST BOTH routers — same handler function,
+# two URL prefixes. The auth dep on each handler is
+# `rbac.path_gated_admin(...)` which checks `request.url.path`:
+#   - /admin/tiktok/... → require admin permission (existing behavior).
+#   - /tiktok/...       → require auth only; handler ownership-filters
+#                         the result.
+# Operator-only endpoints (mutations, listener controls, dashboard,
+# settings, etc.) are decorated ONLY on `router` and keep their
+# strict admin-only auth dep.
+read_router = APIRouter(tags=["TikTok"])
+
 # Dependency placeholder (set via routes/admin/__init__.set_dependencies).
 tiktok_service = None  # type: ignore[assignment]
 config_service = None  # type: ignore[assignment]
+
+
+# ── ownership helpers (used by read handlers under the /tiktok/* mount) ──
+
+
+def _is_admin(auth: AuthContext) -> bool:
+    """True if the caller has admin role. Read handlers use this to
+    decide whether to apply the per-owner result filter."""
+    return auth.has_permission("admin:write") or auth.has_permission("admin:read")
+
+
+def _caller_user_id(auth: AuthContext) -> int:
+    return int(auth.user.id)
+
+
+async def _assert_owns_handle(handle: str, auth: AuthContext) -> None:
+    """404 unless the caller owns `handle` (or is admin). Used by
+    per-handle read handlers BEFORE the data fetch so non-owners get
+    the same "doesn't exist" response shape, no info leak."""
+    if _is_admin(auth):
+        return
+    svc = _require_service()
+    sub = await asyncio.to_thread(svc._persistence.get_subscription, handle)
+    if sub is None or int(getattr(sub, "owner_user_id", 0) or 0) != _caller_user_id(auth):
+        raise HTTPException(status_code=404, detail="not found")
+
+
+async def _assert_owns_room(room_id: int, auth: AuthContext) -> None:
+    """404 unless the room's host is owned by the caller (or admin)."""
+    if _is_admin(auth):
+        return
+    svc = _require_service()
+    try:
+        rid = int(room_id)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=404, detail="not found")
+    host = await asyncio.to_thread(svc._persistence.get_room_host_handle, rid)
+    if not host:
+        raise HTTPException(status_code=404, detail="not found")
+    await _assert_owns_handle(host, auth)
+
+
+async def _assert_owns_match(match_id: int, auth: AuthContext) -> None:
+    """404 unless the match's room → host is owned by the caller."""
+    if _is_admin(auth):
+        return
+    svc = _require_service()
+    try:
+        mid = int(match_id)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=404, detail="not found")
+    match = await asyncio.to_thread(svc._persistence.get_match_by_id, mid)
+    if match is None or match.room_id is None:
+        raise HTTPException(status_code=404, detail="not found")
+    await _assert_owns_room(int(match.room_id), auth)
+
+
+async def _assert_owns_room_set(room_ids: list[int], auth: AuthContext) -> None:
+    """404 if ANY id in `room_ids` isn't owned by the caller. Used
+    by events search/count and aggregated-buckets endpoints that
+    take cross-room slices."""
+    if _is_admin(auth):
+        return
+    for rid in room_ids:
+        await _assert_owns_room(rid, auth)
+
+
+def _filter_subs_by_owner(subs: list[dict[str, Any]], auth: AuthContext) -> list[dict[str, Any]]:
+    """Filter a list of sub-dicts to those owned by the caller.
+    Admin sees all (no-op)."""
+    if _is_admin(auth):
+        return subs
+    uid = _caller_user_id(auth)
+    return [s for s in subs if int(s.get("owner_user_id") or 0) == uid]
 
 
 # ── request / response models ───────────────────────────────────────
@@ -196,7 +283,7 @@ def _require_service():
 
 
 def _need_admin():
-    return rbac.require_any_read_only(["admin:write"])
+    return rbac.path_gated_admin(["admin:write"])
 
 
 # ── subscriptions CRUD ──────────────────────────────────────────────
@@ -212,7 +299,7 @@ async def lives_bundle(
             "(e.g. `America/Lima`). UTC default preserves legacy callers."
         ),
     ),
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     """Single round-trip rollup for the /admin/tiktok Lives page.
 
@@ -237,13 +324,33 @@ async def lives_bundle(
     entirely."""
     svc = _require_service()
     response.headers["Cache-Control"] = "private, max-age=30"
-    return await svc.get_lives_bundle(tz=tz)
+    bundle = await svc.get_lives_bundle(tz=tz)
+    # /tiktok/lives/bundle mount → ownership-filter for non-admin
+    # callers so a user sees only their own subs + matching summary
+    # slices. Totals are global aggregates that would leak existence
+    # of other users' handles, so we null them for non-admin.
+    if not _is_admin(_user):
+        uid = _caller_user_id(_user)
+        owned_handles = {
+            s["unique_id"] for s in bundle.get("subs", [])
+            if int(s.get("owner_user_id") or 0) == uid
+        }
+        bundle["subs"] = [
+            s for s in bundle.get("subs", [])
+            if s["unique_id"] in owned_handles
+        ]
+        bundle["summary"] = {
+            k: v for k, v in bundle.get("summary", {}).items()
+            if k in owned_handles
+        }
+        bundle["totals"] = None
+    return bundle
 
 
 @router.get("/lives", response_model=list[SubscriptionResponse])
 async def list_lives(
     response: Response,
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     """Cheap subscription-list lookup. Used by every consumer that
     only needs handle enumeration (match events modal monitor pills,
@@ -260,7 +367,8 @@ async def list_lives(
     subscription to surface immediately on the next paint."""
     svc = _require_service()
     response.headers["Cache-Control"] = "private, max-age=15"
-    return await svc.list_subscriptions()
+    items = await svc.list_subscriptions()
+    return _filter_subs_by_owner(items, _user)
 
 
 @router.get("/all-subscriptions")
@@ -291,7 +399,7 @@ async def list_all_subscriptions(
     ),
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     """Admin god-view of every TikTok subscription on the install.
     Returns `{items, total, limit, offset, filters}` for a paginated
@@ -339,7 +447,7 @@ async def list_all_subscriptions(
 @router.get("/lookup", response_model=HandleLookupResponse)
 async def lookup_handle(
     handle: str = Query(..., min_length=1, max_length=64, description="@handle to preview"),
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     svc = _require_service()
     data = await svc.lookup_handle(handle)
@@ -473,7 +581,7 @@ async def reconnect_live(
 @router.get("/rooms/{room_id}", response_model=RoomResponse)
 async def get_room(
     room_id: int,
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     svc = _require_service()
     room = await asyncio.to_thread(svc.get_room, room_id)
@@ -497,7 +605,7 @@ async def list_room_events(
     type: Optional[str] = None,
     limit: int = Query(200, ge=1, le=1000),
     before_id: Optional[int] = None,
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     svc = _require_service()
     rows = await asyncio.to_thread(
@@ -525,7 +633,7 @@ async def aggregated_buckets(
     since: datetime = Query(..., description="Window start (inclusive)"),
     until: datetime = Query(..., description="Window end (inclusive)"),
     bucket_seconds: Optional[int] = Query(None, ge=10, le=86400),
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     """Bucketed event series summed across multiple rooms — single
     SQL round-trip replaces the per-room parallel-fetch pattern the
@@ -557,7 +665,7 @@ async def euler_call_history(
                        description="Look-back window (1–168 hours)."),
     bucket_minutes: int = Query(15, ge=1, le=120,
                                 description="Histogram bin width."),
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     """Histogram of Euler-signed HTTP calls — used by the Sign Engine
     settings page to surface "what's burning my Euler quota?" with
@@ -573,7 +681,7 @@ async def euler_call_history(
 async def worker_telemetry(
     hours: int = Query(24, ge=1, le=168,
                        description="Look-back window (1–168 hours)."),
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     """Bundled worker-dashboard payload: heartbeat history (sessions /
     CPU / mem), per-event-type ingest, WAF pressure, and reconcile
@@ -585,7 +693,7 @@ async def worker_telemetry(
 
 @router.get("/cache/stats")
 async def cache_stats(
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     """Hit/miss counters for the in-memory TTL caches that back the
     Lives page (lives_summary, lives_totals, public_summary).
@@ -618,7 +726,7 @@ async def list_perf_traces(
         description="Only return traces with total duration ≥ this many ms.",
     ),
     limit: int = Query(50, ge=1, le=500),
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     """Recent per-request performance traces captured by
     `PerfTracerMiddleware`. Each row carries the request's total
@@ -679,7 +787,7 @@ async def list_enigmas(
     ),
     limit: int = Query(25, ge=1, le=200),
     offset: int = Query(0, ge=0),
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     """Ledger of every viewer flagged `is_enigma=TRUE`. Drives the
     `/admin/tiktok/enigmas` page — pagination + filter + click-to-
@@ -717,7 +825,7 @@ async def host_calendar(
             "the correct day."
         ),
     ),
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     """Per-day broadcast counts for the GitHub-style heatmap on the
     live-detail page. Window ends today and reaches `weeks` weeks back,
@@ -750,7 +858,7 @@ async def list_host_rooms(
         None,
         description="Optional UTC upper bound for totals (see `since`).",
     ),
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     svc = _require_service()
     handle = handle.lstrip("@")
@@ -792,7 +900,7 @@ async def list_host_rooms(
 @router.get("/gifts", response_model=list[GiftResponse])
 async def list_gifts(
     limit: int = Query(200, ge=1, le=1000),
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     svc = _require_service()
     gifts = await asyncio.to_thread(svc.list_gifts, limit=limit)
@@ -892,7 +1000,7 @@ class ListenerStatusResponse(BaseModel):
 
 @router.get("/listener/status", response_model=ListenerStatusResponse)
 async def listener_status(
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     """Listener-pool health snapshot. Source depends on mode:
       - `in_process`: snapshot from the API's own service.
@@ -1182,7 +1290,7 @@ async def listener_log(
     handle: str | None = None,
     event_prefix: str | None = None,
     limit: int = 200,
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     """Recent worker log rows. Filters: `worker_id`, `handle`,
     `event_prefix` (matches the start of the event tag — useful for
@@ -1448,7 +1556,7 @@ async def list_matches(
     handle: Optional[str] = None,
     room_id: Optional[int] = None,
     limit: int = Query(50, ge=1, le=200),
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     svc = _require_service()
     host = handle.lstrip("@") if handle else None
@@ -1489,7 +1597,7 @@ async def list_matches(
 @router.get("/matches/{match_id}", response_model=MatchResponse)
 async def get_match_by_id(
     match_id: int,
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     """Single-match fetch enriched with the same fields as the list
     endpoint (diamonds_total + result). Used by the debug "open match
@@ -1526,7 +1634,7 @@ async def get_match_by_id(
 @router.get("/matches/{match_id}/score_timeline")
 async def get_match_score_timeline(
     match_id: int,
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     """Decoded `match_update` score series for a single PK battle.
     Returns rows of `{ts, scores: {team_id: score}}` in ascending ts
@@ -1539,7 +1647,7 @@ async def get_match_score_timeline(
 @router.get("/matches/{match_id}/gifters_by_side")
 async def get_match_gifters_by_side(
     match_id: int,
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     """Top gifters during this PK battle, split by which side they
     backed (host / opponent / unknown). Drives the side-split tables
@@ -1552,7 +1660,7 @@ async def get_match_gifters_by_side(
 async def get_match_head_to_head(
     match_id: int,
     limit: int = Query(50, ge=1, le=200),
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     """Prior PK battles between this host and (any of) the same
     opponent unique_ids. Used by the Head-to-Head tab. Each row is
@@ -1568,7 +1676,7 @@ async def get_h2h_common_gifters(
     match_id: int,
     min_battles: int = Query(2, ge=1, le=20),
     limit: int = Query(12, ge=1, le=50),
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     """Viewers who gifted in ≥`min_battles` of the head-to-head set
     for this match. Drives the H2H "regulars" bench."""
@@ -1592,7 +1700,7 @@ async def list_user_matches(
     until: Optional[datetime] = Query(None, description="Upper-bound on gift ts (exclusive)."),
     limit: int = Query(25, ge=1, le=100),
     offset: int = Query(0, ge=0),
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     """Matches this user contributed gifts to, scoped by room set
     + optional time window. Drives the gifter-modal "Matches" tab.
@@ -1630,7 +1738,7 @@ async def user_host_daily_series(
     user_id: int,
     handle: str = Query(..., description="Host handle to scope to."),
     days: int = Query(30, ge=1, le=180),
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     """Per-day diamond + gift totals for a single (user, host) pair
     over the last N days. Drives the Timeline heatmap tab on the
@@ -1734,7 +1842,7 @@ async def get_room_stats(
     bucket_seconds: Optional[int] = Query(None, ge=10, le=86400),
     since: Optional[datetime] = Query(None, description="Override window: start"),
     until: Optional[datetime] = Query(None, description="Override window: end"),
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     svc = _require_service()
     # Offload to threadpool — `get_room_stats` issues ~5 sequential
@@ -1757,7 +1865,7 @@ async def get_room_recipients(
     since: Optional[datetime] = Query(None, description="Window start (inclusive)"),
     until: Optional[datetime] = Query(None, description="Window end (exclusive)"),
     limit: int = Query(20, ge=1, le=200),
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     svc = _require_service()
     return await asyncio.to_thread(
@@ -1785,7 +1893,7 @@ async def get_room_gifters(
             "every broadcast of the day in one query."
         ),
     ),
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     svc = _require_service()
     extras: list[int] = []
@@ -1837,7 +1945,7 @@ async def list_notifications(
     include_cleared: bool = False,
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     """Persistent notification stream backing the iOS-style center.
     Default ordering: newest first. Cleared rows are hidden unless
@@ -1857,7 +1965,7 @@ async def list_notifications(
 
 @router.get("/notifications/unread_count")
 async def unread_notifications(
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     svc = _require_service()
     unread = await asyncio.to_thread(svc.count_unread_notifications)
@@ -1893,7 +2001,7 @@ async def create_notification(
 async def mark_read(
     notification_id: int,
     read: bool = True,
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     svc = _require_service()
     ok = await asyncio.to_thread(svc.mark_notification_read, notification_id, read=read)
@@ -1904,7 +2012,7 @@ async def mark_read(
 
 @router.post("/notifications/mark_all_read")
 async def mark_all_read(
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     svc = _require_service()
     n = await asyncio.to_thread(svc.mark_all_notifications_read)
@@ -1914,7 +2022,7 @@ async def mark_all_read(
 @router.delete("/notifications/{notification_id}")
 async def clear_notification(
     notification_id: int,
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     svc = _require_service()
     ok = await asyncio.to_thread(svc.clear_notification, notification_id)
@@ -1925,7 +2033,7 @@ async def clear_notification(
 
 @router.delete("/notifications")
 async def clear_all_notifications(
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     svc = _require_service()
     n = await asyncio.to_thread(svc.clear_all_notifications)
@@ -1940,7 +2048,7 @@ async def list_favorite_gifters(
     q: Optional[str] = Query(None, description="Match nickname or @unique_id"),
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     """Favourites tab list — admin-curated watchlist of viewers with
     their cross-host totals so each row can render the same way as
@@ -1953,7 +2061,7 @@ async def list_favorite_gifters(
 
 @router.get("/favorite-gifters/ids")
 async def list_favorite_gifter_ids(
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     """Bare id list — feeds the WS-driven alert filter on the frontend
     without round-tripping the full enriched payload."""
@@ -1964,7 +2072,7 @@ async def list_favorite_gifter_ids(
 
 @router.get("/favorite-gifters/notify-config")
 async def list_favorite_gifter_notify_config(
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     """Per-favourite notification toggles — what event types should
     trigger a toast for each starred user. Drives the page-level
@@ -2045,7 +2153,7 @@ async def remove_favorite_gifter(
 @router.get("/favorite-gifters/{user_id}")
 async def is_favorite_gifter(
     user_id: int,
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     svc = _require_service()
     is_fav = await asyncio.to_thread(svc.is_favorite_gifter, user_id)
@@ -2055,7 +2163,7 @@ async def is_favorite_gifter(
 @router.get("/common-gifters/{user_id}/detail")
 async def get_common_gifter_detail(
     user_id: int,
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     """Deep-analysis payload for one viewer: identity, cross-host
     totals, and per-host breakdown (top gift kinds, recent rooms,
@@ -2071,7 +2179,7 @@ async def get_common_gifters(
     q: Optional[str] = Query(None, description="Match nickname or @unique_id (case-insensitive)"),
     limit: int = Query(25, ge=1, le=200),
     offset: int = Query(0, ge=0),
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     """Cross-creator gifter leaderboard: viewers who have gifted to
     `min_hosts` or more distinct hosts. Default min=2 surfaces anyone
@@ -2088,7 +2196,7 @@ async def get_common_gifters(
 @router.get("/runtime-config")
 async def admin_tiktok_runtime_config(
     response: Response,
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     """Admin view of the TikTok runtime config — full set of typed
     keys (`poll_interval_ms`, `admin_realtime`, `public_realtime`).
@@ -2117,7 +2225,7 @@ async def get_cross_live_gifters_for_host(
     q: Optional[str] = Query(None, description="Match nickname or @unique_id (case-insensitive)"),
     limit: int = Query(25, ge=1, le=200),
     offset: int = Query(0, ge=0),
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     """Cross-live gifters scoped to one host: viewers who have gifted
     to `handle` AND to >= `min_other_hosts` other hosts we track. Same
@@ -2147,7 +2255,7 @@ async def get_dashboard(
             "are 00:00→24:00 Lima rather than UTC."
         ),
     ),
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     svc = _require_service()
     return await asyncio.to_thread(
@@ -2184,7 +2292,7 @@ async def search_events(
     offset: int = Query(0, ge=0),
     to_user_id: Optional[str] = None,
     min_diamonds: Optional[int] = Query(None, ge=0),
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     svc = _require_service()
     parsed_ids: list[int] | None = None
@@ -2258,7 +2366,7 @@ async def count_events(
     q: Optional[str] = None,
     to_user_id: Optional[str] = None,
     min_diamonds: Optional[int] = Query(None, ge=0),
-    _user: AuthContext = Depends(rbac.require_any_read_only(["admin:write"])),
+    _user: AuthContext = Depends(rbac.path_gated_admin(["admin:write"])),
 ):
     """Counterpart to /events/search — same filter shape, returns the
     total row count. Drives the `(N)` badges on paginated tabs."""
@@ -2343,7 +2451,7 @@ async def ws_events(ws: WebSocket):
     #
     # Authorisation matches the rest of the admin TikTok surface:
     # `admin:write` OR any documented read-only equivalent. The HTTP
-    # handlers above use `rbac.require_any_read_only(["admin:write"])`
+    # handlers above use `rbac.path_gated_admin(["admin:write"])`
     # — so a user with `admin:read` works on the REST endpoints. The
     # WS originally hard-required `admin:write` and so rejected those
     # read-only admins (visible as a stream of 403s in the dev log
