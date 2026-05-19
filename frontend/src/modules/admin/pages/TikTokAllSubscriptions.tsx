@@ -176,9 +176,9 @@ export function TikTokAllSubscriptions() {
             <Button
               variant="ghost"
               size="sm"
-              onClick={() => navigate({ to: '/tiktok' })}
+              onClick={() => navigate({ to: '/admin/tiktok' })}
             >
-              My monitors
+              Back to dashboard
             </Button>
           </div>
         }

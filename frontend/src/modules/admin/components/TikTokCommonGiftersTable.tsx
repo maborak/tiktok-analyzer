@@ -455,7 +455,7 @@ function CommonGifterRow({
         {visibleHosts.map((h) => (
           <Link
             key={h.host}
-            to="/tiktok/$handle"
+            to="/admin/tiktok/$handle"
             params={{ handle: h.host }}
             className="inline-flex items-center gap-1 px-2 py-0.5 rounded font-mono text-[10px] border border-gray-200 hover:bg-gray-100 hover:border-primary-300 dark:hover:bg-gray-100/20 transition-colors"
             title={`@${h.host} · ${h.diamonds.toLocaleString()} 💎 · ${h.gifts.toLocaleString()} gifts`}

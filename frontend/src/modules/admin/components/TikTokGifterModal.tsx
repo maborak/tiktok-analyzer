@@ -875,7 +875,7 @@ export function TikTokGifterModal({
             {!readOnly && uniqueId && (
               isMonitored ? (
                 <Link
-                  to="/tiktok/$handle"
+                  to="/admin/tiktok/$handle"
                   params={{ handle: uniqueId }}
                   onClick={onClose}
                   className="inline-flex items-center gap-1 px-3 py-2 rounded text-xs font-mono uppercase tracking-wider bg-emerald-100 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-500/30 hover:bg-emerald-200 dark:hover:bg-emerald-500/25 transition-colors"
@@ -1526,7 +1526,7 @@ function MatchesView({
                   <span className="font-medium text-gray-900">@{hostHandle}</span>
                 ) : (
                   <Link
-                    to="/tiktok/$handle"
+                    to="/admin/tiktok/$handle"
                     params={{ handle: hostHandle }}
                     className="font-medium text-primary-700 hover:underline"
                   >
@@ -1753,7 +1753,7 @@ function RelationshipsView({
               </div>
               {!isCurrent && (
                 <Link
-                  to="/tiktok/$handle"
+                  to="/admin/tiktok/$handle"
                   params={{ handle: h.host }}
                   className="shrink-0 inline-flex items-center gap-1 px-2.5 py-1 rounded-md border border-primary-200 text-primary-700 hover:bg-primary-50 hover:border-primary-300 dark:text-primary-300 text-xs font-medium"
                   title={`Open @${h.host}'s live-detail page`}

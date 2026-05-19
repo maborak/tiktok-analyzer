@@ -1434,7 +1434,7 @@ function TikTokLiveDetailBody({ readOnly = false }: { readOnly?: boolean }) {
                 landing page was added). Same affordance, different
                 target depending on which surface the user is
                 browsing. */}
-            <Link to={readOnly ? '/lives' : '/tiktok'}>
+            <Link to={readOnly ? '/lives' : '/admin/tiktok'}>
               <Button variant="ghost" size="sm">
                 <ArrowLeft className="w-4 h-4 mr-1" />
                 Lives
@@ -4571,7 +4571,7 @@ function BattlerCard({
           )}
           {monitorState === 'monitored' && monitorHandle && (
             <Link
-              to="/tiktok/$handle"
+              to="/admin/tiktok/$handle"
               params={{ handle: monitorHandle }}
               className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono uppercase tracking-wider bg-emerald-100 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-200 dark:hover:bg-emerald-500/25 transition-colors"
               title={`Open @${monitorHandle}'s live page — already monitored`}

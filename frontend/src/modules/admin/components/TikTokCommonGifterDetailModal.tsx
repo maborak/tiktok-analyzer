@@ -533,7 +533,7 @@ export function TikTokCommonGifterDetailModal({
                       detail page from the identity row. */}
                   {isMonitored && uniqueId && (
                     <Link
-                      to="/tiktok/$handle"
+                      to="/admin/tiktok/$handle"
                       params={{ handle: uniqueId }}
                       onClick={onClose}
                       className="ml-auto inline-flex items-center gap-1.5 bg-primary-500 hover:bg-primary-600 text-white px-3 py-1.5 text-xs rounded-md font-medium transition-colors"
@@ -820,7 +820,7 @@ export function TikTokCommonGifterDetailModal({
             {uniqueId && (
               isMonitored ? (
                 <Link
-                  to="/tiktok/$handle"
+                  to="/admin/tiktok/$handle"
                   params={{ handle: uniqueId }}
                   onClick={onClose}
                   className="inline-flex items-center gap-1 px-3 py-2 rounded text-xs font-mono uppercase tracking-wider bg-emerald-100 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-500/30 hover:bg-emerald-200 dark:hover:bg-emerald-500/25 transition-colors"
@@ -931,7 +931,7 @@ function HostCard({
           </div>
         </div>
         <Link
-          to="/tiktok/$handle"
+          to="/admin/tiktok/$handle"
           params={{ handle: host.host }}
           className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-white border border-primary-200 text-primary-700 hover:bg-primary-50 hover:border-primary-300 dark:bg-white/5 dark:text-primary-300 text-xs font-medium"
           title="Open this host's live-detail page"
@@ -1487,7 +1487,7 @@ function LoyaltyPanel({
       <div className="mt-1 text-xs font-mono text-gray-700">
         <span className="tabular-nums">{l.top1_pct.toFixed(0)}%</span> of diamonds to{' '}
         <Link
-          to="/tiktok/$handle"
+          to="/admin/tiktok/$handle"
           params={{ handle: l.top_host || '' }}
           className="text-primary-700 dark:text-primary-300 hover:underline"
         >
@@ -1734,7 +1734,7 @@ function IdentityProgressionPanel({
               style={{ backgroundColor: HOST_PALETTE[i % HOST_PALETTE.length] }}
             />
             <Link
-              to="/tiktok/$handle"
+              to="/admin/tiktok/$handle"
               params={{ handle: r.host }}
               className="shrink-0 text-primary-700 dark:text-primary-300 hover:underline truncate max-w-[7rem]"
             >
@@ -1957,7 +1957,7 @@ function WhaleSessionsPanel({
               <div className="text-[10px] text-gray-500">
                 {s.host && (
                   <Link
-                    to="/tiktok/$handle"
+                    to="/admin/tiktok/$handle"
                     params={{ handle: s.host }}
                     className="text-primary-700 dark:text-primary-300 hover:underline"
                   >
@@ -2084,7 +2084,7 @@ function PkPanel({
               className="flex flex-wrap items-center gap-x-2 gap-y-0.5 px-2 py-1 rounded border border-gray-200 bg-gray-50 dark:bg-gray-100/[0.06]"
             >
               <Link
-                to="/tiktok/$handle"
+                to="/admin/tiktok/$handle"
                 params={{ handle: h.host }}
                 className="shrink-0 text-primary-700 dark:text-primary-300 hover:underline"
               >
@@ -3021,7 +3021,7 @@ function CommentsTab({
                   </span>
                   {host && (
                     <Link
-                      to="/tiktok/$handle"
+                      to="/admin/tiktok/$handle"
                       params={{ handle: host }}
                       className="text-[11px] font-mono text-primary-700 dark:text-primary-300 hover:underline"
                       title={`Open @${host}`}
@@ -3556,7 +3556,7 @@ function RecentActivityPanel({
                 </span>
                 {it.host ? (
                   <Link
-                    to="/tiktok/$handle"
+                    to="/admin/tiktok/$handle"
                     params={{ handle: it.host }}
                     className="shrink-0 text-primary-700 dark:text-primary-300 hover:underline truncate max-w-[8rem]"
                     title={`Open @${it.host}`}

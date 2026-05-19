@@ -6,8 +6,8 @@ import {
   MessageSquare, FileText, Receipt, Settings, Settings2,
   Lock, KeyRound, UserPlus, History, Coins,
   Layers, LogIn,
-  Database, ShieldAlert, Radio,
-  LayoutDashboard, Activity,
+  Database, ShieldAlert, Radio, BarChart3, Gift,
+  LayoutDashboard, Activity, VenetianMask,
 } from 'lucide-react';
 import { cn } from '../../utils/cn';
 import { appConfig } from '../../config/env';
@@ -114,33 +114,26 @@ const adminSupportSection: NavigationSection = {
   ],
 };
 
-// Admin TikTok section — operator-only tools. After the 2026-05-18
-// per-user monetised monitoring pivot, the MONITORING pages (Dashboard,
-// Lives, History, Gifts, Enigmas, per-host detail) moved to /tiktok/*
-// for every authenticated user (admin sees their own subs there, same
-// as any user). This admin section now retains only operator-specific
-// surfaces: the cross-user god view, listener-pool config, and the
-// perf-trace debug tool.
+// Admin TikTok section — every page restored (the per-user monitoring
+// pivot is being rebuilt as a URL repoint + ownership filter inside
+// the existing admin handlers, not by deleting them). All entries
+// below are the rich operator surface that existed before; the new
+// /admin/tiktok/all-subscriptions is the only NEW operator tool.
 const adminTikTokSection: NavigationSection = {
   title: 'TikTok',
   key: 'admin-tiktok',
   collapsible: true,
   defaultExpanded: true,
   items: [
+    { name: 'Dashboard',   href: `/admin/tiktok/dashboard`,   icon: BarChart3 },
+    { name: 'Lives',       href: `/admin/tiktok`,             icon: Radio, end: true },
     // All-Subscriptions — every user's monitored handles. The
     // "Make Public" admin-only toggle lives here per-row.
     { name: 'All Subscriptions', href: `/admin/tiktok/all-subscriptions`, icon: Layers },
+    { name: 'History',     href: `/admin/tiktok/history`,     icon: History },
+    { name: 'Gifts',       href: `/admin/tiktok/gifts`,       icon: Gift },
+    { name: 'Enigmas',     href: `/admin/tiktok/enigmas`,     icon: VenetianMask },
     { name: 'Perf Traces', href: `/admin/tiktok/perf`,        icon: Activity },
-    // Settings consolidates every TikTok-related config + ops
-    // surface under one sidebar entry:
-    //   - General      → typed-config grouped editor (mirrors the
-    //                    `tiktok` namespace on /admin/settings/configuration).
-    //   - Sign Engine  → the rich provider-switching UI (was a
-    //                    separate sidebar entry; now a sub-tab).
-    //   - Worker       → listener-pool status (was a tab inside
-    //                    /admin/tiktok; now a sub-tab here).
-    // The legacy /admin/tiktok/sign-config route still works for
-    // direct-URL access / bookmarks but isn't surfaced in the nav.
     { name: 'Settings',    href: `/admin/tiktok/settings`,    icon: Settings },
   ],
 };
@@ -151,20 +144,6 @@ const userSection: NavigationSection = {
   items: [
     { name: 'My Account', href: '/account', icon: User, end: true },
     { name: 'Recipients', href: `/account/recipients`, icon: UserPlus },
-  ],
-};
-
-// User-facing TikTok product: monetised monitoring. Distinct from
-// the admin TikTok section (which is the operator god view); a
-// regular user sees ONLY this section, never the admin one. Admin
-// users see both — the admin section under "Admin · TikTok" gives
-// them the cross-user surface, and this section is their personal
-// monitoring list.
-const tiktokUserSection: NavigationSection = {
-  title: 'TikTok',
-  key: 'user-tiktok',
-  items: [
-    { name: 'My Monitors', href: `/tiktok`, icon: Radio, end: true },
   ],
 };
 
@@ -383,7 +362,6 @@ export function Sidebar({
       {isAuthenticated && (
         <>
           {renderSection(userSection, logoutButton)}
-          {renderSection(tiktokUserSection)}
           {renderSection(billingSection)}
           {renderSection(supportSection)}
         </>

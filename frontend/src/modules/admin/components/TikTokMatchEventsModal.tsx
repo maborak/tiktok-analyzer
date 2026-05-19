@@ -697,7 +697,7 @@ function OpponentCell({
         </span>
       ) : isMonitored ? (
         <Link
-          to="/tiktok/$handle"
+          to="/admin/tiktok/$handle"
           params={{ handle }}
           className="shrink-0 inline-flex items-center gap-1 px-2 py-1 rounded text-[11px] font-mono uppercase tracking-wider bg-emerald-100 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-500/30 hover:bg-emerald-200 dark:hover:bg-emerald-500/25 transition-colors"
           title="Open this creator's live page — already monitored"

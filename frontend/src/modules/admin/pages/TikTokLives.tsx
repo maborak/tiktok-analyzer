@@ -973,7 +973,7 @@ function SubscriptionCardImpl({ sub, electron, summary, readOnly, onToggle, onDe
           </Link>
         ) : (
         <Link
-          to="/tiktok/$handle"
+          to="/admin/tiktok/$handle"
           params={{ handle: sub.unique_id }}
           className="flex items-start gap-3 flex-1 min-w-0 group"
         >
@@ -1081,7 +1081,7 @@ function SubscriptionCardImpl({ sub, electron, summary, readOnly, onToggle, onDe
       {!readOnly && (
       <div className="relative flex flex-wrap items-center gap-2 border-t border-gray-200 dark:border-white/10 pt-2" data-debug>
         <Link
-          to="/tiktok/$handle"
+          to="/admin/tiktok/$handle"
           params={{ handle: sub.unique_id }}
           className="inline-flex items-center gap-1 px-2 py-2 text-xs text-gray-500 hover:text-primary-600"
           aria-label="Open stats"
