@@ -58,6 +58,25 @@ export const userTikTokApi = {
   },
 
   /**
+   * Rich card-grid payload: `{subs, summary, totals}`. Mirrors the
+   * admin `/admin/tiktok/lives/bundle` shape so the grid components
+   * can be data-driven (same rendering, ownership-scoped data).
+   * `totals` is `null` on the user surface by design — admin's
+   * totals are install-wide and would leak other users' activity.
+   */
+  async getLivesBundle(opts?: { tz?: string }): Promise<{
+    subs: UserTikTokSubscription[];
+    summary: Record<string, Record<string, unknown>>;
+    totals: null;
+  }> {
+    return apiRequest({
+      method: 'GET',
+      url: `${BASE}/lives/bundle`,
+      params: opts?.tz ? { tz: opts.tz } : undefined,
+    });
+  },
+
+  /**
    * Add a TikTok handle to the authenticated user's monitor list.
    * Throws on 402 (insufficient credits) and 409 (handle already
    * monitored by another user) — the caller should inspect

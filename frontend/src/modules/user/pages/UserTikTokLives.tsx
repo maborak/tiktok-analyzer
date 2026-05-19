@@ -15,7 +15,10 @@
 
 import { useEffect, useState, useMemo, useCallback } from 'react';
 import { useNavigate } from '@tanstack/react-router';
-import { Activity, Plus, Trash2, RefreshCw, Tv, Users, Wallet } from 'lucide-react';
+import {
+  Activity, Plus, Trash2, RefreshCw, Tv, Users, Wallet,
+  Eye, Gem,
+} from 'lucide-react';
 import toast from 'react-hot-toast';
 
 import { PageShell, PageHeader } from '@/components/ui/PageShell';
@@ -43,13 +46,23 @@ export function UserTikTokLives() {
   const [addOpen, setAddOpen] = useState(false);
   const [removing, setRemoving] = useState<string | null>(null);
 
+  // Per-handle summary data from the bundle endpoint. Keyed by
+  // lowercase handle so we can index into it from the card render.
+  const [summary, setSummary] = useState<Record<string, Record<string, unknown>>>({});
+
   const refreshAll = useCallback(async () => {
     try {
-      const [s, c] = await Promise.all([
-        userTikTokApi.listMyLives(),
+      // One bundle call (subs + summary) + credits in parallel.
+      // The bundle endpoint is the user-scoped mirror of
+      // /admin/tiktok/lives/bundle — same shape, ownership-filtered.
+      const [bundle, c] = await Promise.all([
+        userTikTokApi.getLivesBundle({
+          tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        }),
         userTikTokApi.getCredits(),
       ]);
-      setSubs(s);
+      setSubs(bundle.subs);
+      setSummary(bundle.summary ?? {});
       setBalance(c.balance);
     } catch (err) {
       console.error('Failed to load my monitors', err);
@@ -96,18 +109,36 @@ export function UserTikTokLives() {
     refreshAll();
   }, [refreshAll]);
 
+  /** Authoritative live truth for a sub: prefer the summary's
+   *  `active_room_id` (computed live by the backend bundle) over
+   *  the sub's `is_live` flag, which can lag behind by a poll
+   *  cycle. Mirrors the admin Lives page's heuristic.  */
+  const isLiveFromSummary = useCallback(
+    (sub: UserTikTokSubscription): boolean => {
+      const slice = summary[sub.unique_id.toLowerCase()] as
+        | Record<string, unknown>
+        | undefined;
+      if (!slice) return Boolean(sub.is_live);
+      return slice.active_room_id != null;
+    },
+    [summary],
+  );
+
   const sortedSubs = useMemo(
     () =>
       [...subs].sort((a, b) => {
-        // Live ones first, then by follower count, then by handle.
-        if (a.is_live && !b.is_live) return -1;
-        if (!a.is_live && b.is_live) return 1;
+        // Live ones first (using summary truth source), then by
+        // follower count, then by handle.
+        const al = isLiveFromSummary(a);
+        const bl = isLiveFromSummary(b);
+        if (al && !bl) return -1;
+        if (!al && bl) return 1;
         const fa = a.follower_count ?? 0;
         const fb = b.follower_count ?? 0;
         if (fa !== fb) return fb - fa;
         return a.unique_id.localeCompare(b.unique_id);
       }),
-    [subs],
+    [subs, isLiveFromSummary],
   );
 
   const insufficientForAdd = balance != null && balance < 1;
@@ -174,70 +205,109 @@ export function UserTikTokLives() {
         />
       ) : (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-          {sortedSubs.map((s) => (
-            <button
-              key={s.unique_id}
-              type="button"
-              onClick={() => navigate({ to: `/tiktok/${s.unique_id}` })}
-              className="card text-left transition-all hover:border-primary-400 focus:outline-none focus:ring-2 focus:ring-primary-400/40 p-4 flex gap-3 items-start"
-            >
-              {s.avatar_url ? (
-                <img
-                  src={s.avatar_url}
-                  alt={s.nickname ?? s.unique_id}
-                  className="h-12 w-12 rounded-full object-cover bg-gray-100"
-                  loading="lazy"
-                />
-              ) : (
-                <div className="h-12 w-12 rounded-full bg-gray-100 flex items-center justify-center">
-                  <Tv className="h-5 w-5 text-gray-400" />
-                </div>
-              )}
-              <div className="flex-1 min-w-0">
-                <div className="flex items-center gap-2 mb-0.5">
-                  <span className="font-semibold text-gray-900 truncate">
-                    {s.nickname ?? s.unique_id}
-                  </span>
-                  {s.is_live ? (
-                    <span className="inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-wide text-rose-700 bg-rose-50 dark:bg-rose-500/10 px-1.5 py-0.5 rounded">
-                      <Activity className="h-2.5 w-2.5" /> Live
-                    </span>
-                  ) : null}
-                </div>
-                <div className="font-mono text-xs text-gray-500 truncate">
-                  @{s.unique_id}
-                </div>
-                <div className="flex items-center gap-3 text-xs text-gray-600 mt-2">
-                  <span className="inline-flex items-center gap-1">
-                    <Users className="h-3 w-3" />
-                    {formatCount(s.follower_count)}
-                  </span>
-                  {s.is_public ? (
-                    <span className="auth-mono-label text-[10px]">public</span>
-                  ) : null}
-                </div>
-              </div>
-              <span
-                role="button"
-                tabIndex={0}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  handleRemove(s.unique_id);
-                }}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' || e.key === ' ') {
-                    e.stopPropagation();
-                    handleRemove(s.unique_id);
-                  }
-                }}
-                aria-label={`Remove monitor for ${s.unique_id}`}
-                className="text-gray-400 hover:text-rose-600 transition-colors p-1 -m-1 rounded cursor-pointer"
-                aria-disabled={removing === s.unique_id}
+          {sortedSubs.map((s) => {
+            const slice = summary[s.unique_id.toLowerCase()] as
+              | Record<string, unknown>
+              | undefined;
+            const live = isLiveFromSummary(s);
+            const viewers =
+              slice && typeof slice.viewer_count === 'number'
+                ? (slice.viewer_count as number)
+                : null;
+            const sessionDiamonds =
+              slice && typeof slice.diamonds_session === 'number'
+                ? (slice.diamonds_session as number)
+                : null;
+            return (
+              <button
+                key={s.unique_id}
+                type="button"
+                onClick={() => navigate({ to: `/tiktok/${s.unique_id}` })}
+                className="card text-left transition-all hover:border-primary-400 focus:outline-none focus:ring-2 focus:ring-primary-400/40 p-4 flex flex-col gap-3"
               >
-                <Trash2 className="h-4 w-4" />
-              </span>
-            </button>
-          ))}
+                {/* Header row: avatar + identity + delete button */}
+                <div className="flex gap-3 items-start">
+                  {s.avatar_url ? (
+                    <img
+                      src={s.avatar_url}
+                      alt={s.nickname ?? s.unique_id}
+                      className="h-12 w-12 rounded-full object-cover bg-gray-100"
+                      loading="lazy"
+                    />
+                  ) : (
+                    <div className="h-12 w-12 rounded-full bg-gray-100 flex items-center justify-center">
+                      <Tv className="h-5 w-5 text-gray-400" />
+                    </div>
+                  )}
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 mb-0.5">
+                      <span className="font-semibold text-gray-900 truncate">
+                        {s.nickname ?? s.unique_id}
+                      </span>
+                      {live ? (
+                        <span className="inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-wide text-rose-700 bg-rose-50 dark:bg-rose-500/10 px-1.5 py-0.5 rounded">
+                          <Activity className="h-2.5 w-2.5" /> Live
+                        </span>
+                      ) : null}
+                    </div>
+                    <div className="font-mono text-xs text-gray-500 truncate">
+                      @{s.unique_id}
+                    </div>
+                    <div className="flex items-center gap-3 text-xs text-gray-600 mt-2">
+                      <span className="inline-flex items-center gap-1">
+                        <Users className="h-3 w-3" />
+                        {formatCount(s.follower_count)}
+                      </span>
+                      {s.is_public ? (
+                        <span className="auth-mono-label text-[10px]">public</span>
+                      ) : null}
+                    </div>
+                  </div>
+                  <span
+                    role="button"
+                    tabIndex={0}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleRemove(s.unique_id);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.stopPropagation();
+                        handleRemove(s.unique_id);
+                      }
+                    }}
+                    aria-label={`Remove monitor for ${s.unique_id}`}
+                    className="text-gray-400 hover:text-rose-600 transition-colors p-1 -m-1 rounded cursor-pointer"
+                    aria-disabled={removing === s.unique_id}
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </span>
+                </div>
+
+                {/* Live-only stat strip: viewer count + session diamonds.
+                    Mirrors admin Lives' card scoreboard but trimmed to
+                    the two numbers that matter to a regular operator. */}
+                {live && (viewers != null || sessionDiamonds != null) ? (
+                  <div className="grid grid-cols-2 gap-2 pt-2 border-t border-gray-100">
+                    <div className="flex items-center gap-1.5 text-xs">
+                      <Eye className="h-3 w-3 text-gray-400" />
+                      <span className="font-mono font-semibold text-gray-900">
+                        {viewers != null ? formatCount(viewers) : '—'}
+                      </span>
+                      <span className="auth-mono-label text-[9px]">viewers</span>
+                    </div>
+                    <div className="flex items-center gap-1.5 text-xs">
+                      <Gem className="h-3 w-3 text-amber-500" />
+                      <span className="font-mono font-semibold text-gray-900">
+                        {sessionDiamonds != null ? formatCount(sessionDiamonds) : '—'}
+                      </span>
+                      <span className="auth-mono-label text-[9px]">session</span>
+                    </div>
+                  </div>
+                ) : null}
+              </button>
+            );
+          })}
         </div>
       )}
 

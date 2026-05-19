@@ -142,6 +142,26 @@ async def list_my_lives(current_user: AuthContext = Depends(get_current_user)):
     return [s for s in all_subs if int(s.get("owner_user_id") or 0) == uid]
 
 
+@router.get("/lives/bundle")
+async def my_lives_bundle(
+    tz: str = Query("UTC", description="IANA timezone for week_calendar bucketing."),
+    current_user: AuthContext = Depends(get_current_user),
+):
+    """User-scoped rollup matching the admin `/admin/tiktok/lives/bundle`
+    shape: `{subs, summary, totals}`. Subs are filtered to the
+    authenticated user's owned monitors; summary contains the same
+    per-host card data the admin grid renders; totals is null on the
+    user surface (admin's totals is install-wide and would leak the
+    existence of other users' handles).
+
+    The frontend card grid component can render either bundle shape —
+    its rendering is purely data-driven."""
+    svc = _require_service()
+    return await svc.get_lives_bundle_for_user(
+        int(current_user.user.id), tz=tz,
+    )
+
+
 @router.post("/lives", status_code=status.HTTP_201_CREATED)
 async def add_my_live(
     req: AddMonitorRequest,

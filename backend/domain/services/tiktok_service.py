@@ -4866,6 +4866,49 @@ class TikTokService:
             trimmed[handle] = entry
         return {"subs": subs, "summary": trimmed, "totals": totals}
 
+    async def get_lives_bundle_for_user(
+        self,
+        owner_user_id: int,
+        *,
+        tz: str = "UTC",
+    ) -> dict[str, Any]:
+        """User-scoped variant of `get_lives_bundle`. Filters subs to
+        those owned by `owner_user_id` BEFORE assembling the summary,
+        so the per-user `get_lives_summary` cache hits a distinct slot
+        from the admin-side call (the cache key already includes the
+        sorted handles tuple — see P5 cache audit, 2026-05-18).
+
+        Totals are intentionally omitted on the user surface: admin's
+        `get_lives_totals` is a global install-wide aggregate that
+        leaks the existence of other users' handles. If we ever want
+        per-user totals here, the frontend can derive them from the
+        already-returned per-host summary slices."""
+        all_subs = await self.list_subscriptions()
+        subs = [
+            s for s in all_subs
+            if int(s.get("owner_user_id") or 0) == int(owner_user_id)
+        ]
+        handles = [s["unique_id"] for s in subs if s.get("unique_id")]
+        # If the user has zero monitors, short-circuit before paying
+        # for an empty get_lives_summary call.
+        if not handles:
+            return {"subs": [], "summary": {}, "totals": None}
+        summary = await asyncio.to_thread(
+            lambda: self.get_lives_summary(handles, tz=tz),
+        )
+        omit = self._BUNDLE_OMIT_SUMMARY_FIELDS
+        trimmed: dict[str, dict[str, Any]] = {}
+        for handle, slice_ in summary.items():
+            entry: dict[str, Any] = {}
+            for k, v in slice_.items():
+                if k in omit:
+                    continue
+                if k == "last_broadcasts" and isinstance(v, list):
+                    v = v[:1]
+                entry[k] = v
+            trimmed[handle] = entry
+        return {"subs": subs, "summary": trimmed, "totals": None}
+
     def insert_notification(
         self,
         *,
