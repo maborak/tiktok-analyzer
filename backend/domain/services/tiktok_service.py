@@ -1359,6 +1359,17 @@ class TikTokService:
                     "unique_id": sub.unique_id,
                     "enabled": sub.enabled,
                     "is_public": bool(getattr(sub, "is_public", False)),
+                    # Owner + added_at — added 2026-05-19 alongside the
+                    # per-user monitoring pivot. Without these the user
+                    # route's `[s for s in all_subs if s["owner_user_id"] == uid]`
+                    # filter collapses to "always False" and the user
+                    # sees an empty Lives page even though they own
+                    # subscriptions.
+                    "owner_user_id": getattr(sub, "owner_user_id", None),
+                    "added_at": (
+                        sub.added_at.isoformat()
+                        if getattr(sub, "added_at", None) else None
+                    ),
                     "state": state,
                     "room_id": room_id,
                     "is_connected": is_connected,
