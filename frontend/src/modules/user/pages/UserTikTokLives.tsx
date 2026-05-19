@@ -25,7 +25,8 @@ import { PageShell, PageHeader } from '@/components/ui/PageShell';
 import { Button } from '@/components/ui/Button';
 import { LoadingState } from '@/components/ui/LoadingState';
 import { EmptyState } from '@/components/ui/EmptyState';
-import { userTikTokApi, type UserTikTokSubscription } from '../services/tiktok';
+import { userTikTokApi } from '../services/tiktok';
+import type { TikTokSubscription, TikTokLiveSummary } from '@admin';
 import { UserTikTokAddMonitorModal } from '../components/UserTikTokAddMonitorModal';
 
 /** Compact "12.3K" / "1.4M" formatter — the lives page in admin uses
@@ -40,7 +41,7 @@ function formatCount(n: number | null | undefined): string {
 
 export function UserTikTokLives() {
   const navigate = useNavigate();
-  const [subs, setSubs] = useState<UserTikTokSubscription[]>([]);
+  const [subs, setSubs] = useState<TikTokSubscription[]>([]);
   const [balance, setBalance] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [addOpen, setAddOpen] = useState(false);
@@ -48,7 +49,7 @@ export function UserTikTokLives() {
 
   // Per-handle summary data from the bundle endpoint. Keyed by
   // lowercase handle so we can index into it from the card render.
-  const [summary, setSummary] = useState<Record<string, Record<string, unknown>>>({});
+  const [summary, setSummary] = useState<Record<string, TikTokLiveSummary>>({});
 
   const refreshAll = useCallback(async () => {
     try {
@@ -114,12 +115,10 @@ export function UserTikTokLives() {
    *  the sub's `is_live` flag, which can lag behind by a poll
    *  cycle. Mirrors the admin Lives page's heuristic.  */
   const isLiveFromSummary = useCallback(
-    (sub: UserTikTokSubscription): boolean => {
-      const slice = summary[sub.unique_id.toLowerCase()] as
-        | Record<string, unknown>
-        | undefined;
+    (sub: TikTokSubscription): boolean => {
+      const slice = summary[sub.unique_id.toLowerCase()];
       if (!slice) return Boolean(sub.is_live);
-      return slice.active_room_id != null;
+      return (slice as { active_room_id?: unknown }).active_room_id != null;
     },
     [summary],
   );
@@ -207,16 +206,16 @@ export function UserTikTokLives() {
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
           {sortedSubs.map((s) => {
             const slice = summary[s.unique_id.toLowerCase()] as
-              | Record<string, unknown>
+              | { viewer_count?: number; diamonds_session?: number }
               | undefined;
             const live = isLiveFromSummary(s);
             const viewers =
               slice && typeof slice.viewer_count === 'number'
-                ? (slice.viewer_count as number)
+                ? slice.viewer_count
                 : null;
             const sessionDiamonds =
               slice && typeof slice.diamonds_session === 'number'
-                ? (slice.diamonds_session as number)
+                ? slice.diamonds_session
                 : null;
             return (
               <button

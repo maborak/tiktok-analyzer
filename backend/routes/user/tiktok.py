@@ -93,6 +93,47 @@ async def _resolve_owned_room(room_id: int, user_id: int):
     return await _resolve_owned_handle(host, user_id)
 
 
+async def _resolve_owned_match(match_id: int, user_id: int):
+    """Resolve `match_id` → room → host → owned sub. Returns
+    `(match, sub)` so the caller can use both without re-fetching."""
+    svc = _require_service()
+    try:
+        mid = int(match_id)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=404, detail="not found")
+    match = await asyncio.to_thread(svc._persistence.get_match_by_id, mid)
+    if match is None or match.room_id is None:
+        raise HTTPException(status_code=404, detail="not found")
+    sub = await _resolve_owned_room(int(match.room_id), user_id)
+    return match, sub
+
+
+async def _resolve_owned_room_set(room_ids, user_id: int):
+    """Refuse with 404 unless EVERY id in `room_ids` maps to a sub
+    owned by `user_id`. Mirrors `_resolve_public_room_set` shape so
+    the events/buckets endpoints can take a cross-room slice."""
+    svc = _require_service()
+    ordered: list[int] = []
+    seen: set[int] = set()
+    for rid in room_ids:
+        try:
+            i = int(rid)
+        except (TypeError, ValueError):
+            continue
+        if i in seen:
+            continue
+        seen.add(i)
+        ordered.append(i)
+    if not ordered:
+        raise HTTPException(status_code=404, detail="not found")
+    for rid in ordered:
+        host = await asyncio.to_thread(svc._persistence.get_room_host_handle, rid)
+        if not host:
+            raise HTTPException(status_code=404, detail="not found")
+        await _resolve_owned_handle(host, user_id)
+    return ordered
+
+
 # ── request models ─────────────────────────────────────────────────
 
 
@@ -351,3 +392,403 @@ async def my_room_stats(
         window_minutes=window_minutes,
         bucket_seconds=bucket_seconds,
     )
+
+
+# ── room detail / recipients / gifters ─────────────────────────────
+
+
+@router.get("/rooms/{room_id}")
+async def my_room(
+    room_id: int,
+    current_user: AuthContext = Depends(get_current_user),
+):
+    """Room detail (id, title, started_at, ended_at, etc.). 404 if
+    the room's host isn't owned by the caller."""
+    svc = _require_service()
+    await _resolve_owned_room(room_id, int(current_user.user.id))
+    room = await asyncio.to_thread(svc.get_room, int(room_id))
+    if room is None:
+        raise HTTPException(status_code=404, detail="not found")
+    return {
+        "room_id": str(room.room_id),
+        "host_unique_id": room.host_unique_id,
+        "host_user_id": str(room.host_user_id) if room.host_user_id else None,
+        "title": room.title,
+        "started_at": room.started_at.isoformat() if room.started_at else None,
+        "ended_at": room.ended_at.isoformat() if room.ended_at else None,
+        "first_seen_at": room.first_seen_at.isoformat() if room.first_seen_at else None,
+        "last_seen_at": room.last_seen_at.isoformat() if room.last_seen_at else None,
+    }
+
+
+@router.get("/rooms/{room_id}/recipients")
+async def my_room_recipients(
+    room_id: int,
+    since: Optional[datetime] = Query(None),
+    until: Optional[datetime] = Query(None),
+    limit: int = Query(20, ge=1, le=200),
+    current_user: AuthContext = Depends(get_current_user),
+):
+    svc = _require_service()
+    await _resolve_owned_room(room_id, int(current_user.user.id))
+    return await asyncio.to_thread(
+        svc.get_room_recipients, room_id, since=since, until=until, limit=limit,
+    )
+
+
+@router.get("/rooms/{room_id}/gifters")
+async def my_room_gifters(
+    room_id: int,
+    since: Optional[datetime] = Query(None),
+    until: Optional[datetime] = Query(None),
+    q: Optional[str] = Query(None),
+    limit: int = Query(25, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    room_ids: Optional[str] = Query(None),
+    current_user: AuthContext = Depends(get_current_user),
+):
+    """Top gifters for one (or several) rooms. When `room_ids` is
+    provided, every id must belong to a sub the caller owns."""
+    svc = _require_service()
+    uid = int(current_user.user.id)
+    await _resolve_owned_room(room_id, uid)
+    extras: list[int] = []
+    if room_ids:
+        parsed = [int(x.strip()) for x in room_ids.split(",") if x.strip().isdigit()]
+        if parsed:
+            await _resolve_owned_room_set(parsed, uid)
+            extras = parsed
+    target = list({int(room_id), *extras}) if extras else int(room_id)
+    return await asyncio.to_thread(
+        svc.get_room_gifters,
+        target, since=since, until=until, q=q, limit=limit, offset=offset,
+    )
+
+
+@router.get("/rooms/{room_id}/cross-live-gifters")
+async def my_room_cross_live_gifters(
+    room_id: int,
+    limit: int = Query(25, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    current_user: AuthContext = Depends(get_current_user),
+):
+    """Viewers who gifted in this room AND on other (owned) hosts."""
+    svc = _require_service()
+    sub = await _resolve_owned_room(room_id, int(current_user.user.id))
+    return await asyncio.to_thread(
+        svc.get_cross_live_gifters_for_host,
+        sub.unique_id, min_other_hosts=1, limit=limit, offset=offset,
+    )
+
+
+# ── matches ────────────────────────────────────────────────────────
+
+
+@router.get("/lives/{handle}/matches")
+async def my_lives_matches(
+    handle: str,
+    limit: int = Query(50, ge=1, le=200),
+    current_user: AuthContext = Depends(get_current_user),
+):
+    """List PK battles for one owned host. Same shape as the admin
+    list_matches but ownership-gated."""
+    svc = _require_service()
+    sub = await _resolve_owned_handle(handle, int(current_user.user.id))
+    matches = await asyncio.to_thread(
+        svc.list_matches, host_unique_id=sub.unique_id, limit=limit,
+    )
+    return [_match_serialise(m) for m in matches]
+
+
+@router.get("/matches/{match_id}")
+async def my_match(
+    match_id: int,
+    current_user: AuthContext = Depends(get_current_user),
+):
+    """Single PK match detail. 404 if the match's room isn't owned."""
+    match, _sub = await _resolve_owned_match(match_id, int(current_user.user.id))
+    return _match_serialise(match)
+
+
+@router.get("/matches/{match_id}/score_timeline")
+async def my_match_score_timeline(
+    match_id: int,
+    current_user: AuthContext = Depends(get_current_user),
+):
+    svc = _require_service()
+    await _resolve_owned_match(match_id, int(current_user.user.id))
+    return await asyncio.to_thread(svc.get_match_score_timeline, match_id)
+
+
+@router.get("/matches/{match_id}/gifters_by_side")
+async def my_match_gifters_by_side(
+    match_id: int,
+    current_user: AuthContext = Depends(get_current_user),
+):
+    svc = _require_service()
+    await _resolve_owned_match(match_id, int(current_user.user.id))
+    return await asyncio.to_thread(
+        svc.get_match_gifters_by_side, match_id, public_only=False,
+    )
+
+
+@router.get("/matches/{match_id}/head_to_head")
+async def my_match_head_to_head(
+    match_id: int,
+    limit: int = Query(50, ge=1, le=200),
+    current_user: AuthContext = Depends(get_current_user),
+):
+    svc = _require_service()
+    await _resolve_owned_match(match_id, int(current_user.user.id))
+    return await asyncio.to_thread(
+        svc.get_match_head_to_head, match_id, limit=limit,
+    )
+
+
+@router.get("/matches/{match_id}/h2h_common_gifters")
+async def my_match_h2h_common_gifters(
+    match_id: int,
+    min_battles: int = Query(2, ge=1, le=20),
+    limit: int = Query(12, ge=1, le=50),
+    current_user: AuthContext = Depends(get_current_user),
+):
+    svc = _require_service()
+    await _resolve_owned_match(match_id, int(current_user.user.id))
+    return await asyncio.to_thread(
+        svc.get_h2h_common_gifters,
+        match_id, min_battles=min_battles, limit=limit,
+    )
+
+
+# ── events ─────────────────────────────────────────────────────────
+
+
+@router.get("/events/search")
+async def my_events_search(
+    room_ids: str = Query(..., description="Comma-separated room ids."),
+    user_id: Optional[str] = None,
+    match_id: Optional[int] = None,
+    type: Optional[str] = None,
+    since: Optional[datetime] = None,
+    until: Optional[datetime] = None,
+    q: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=2000),
+    before_id: Optional[int] = None,
+    offset: int = Query(0, ge=0),
+    to_user_id: Optional[str] = None,
+    min_diamonds: Optional[int] = Query(None, ge=0),
+    current_user: AuthContext = Depends(get_current_user),
+):
+    """Event search scoped to a set of owned rooms. Mirrors the
+    public events/search shape but with ownership validation."""
+    svc = _require_service()
+    uid = int(current_user.user.id)
+    parsed_ids = [int(x.strip()) for x in room_ids.split(",") if x.strip().isdigit()]
+    if not parsed_ids:
+        raise HTTPException(status_code=400, detail="room_ids required")
+    await _resolve_owned_room_set(parsed_ids, uid)
+    parsed_user_id = int(user_id) if user_id else None
+    parsed_to_user_id = int(to_user_id) if to_user_id else None
+    if match_id is not None:
+        # Verify match belongs to one of the owned rooms.
+        match = await asyncio.to_thread(svc._persistence.get_match_by_id, int(match_id))
+        if match is None or int(match.room_id) not in set(parsed_ids):
+            raise HTTPException(status_code=404, detail="not found")
+    return await asyncio.to_thread(
+        svc.search_events,
+        room_ids=parsed_ids,
+        user_id=parsed_user_id,
+        match_id=match_id,
+        type=type,
+        since=since,
+        until=until,
+        q=q,
+        to_user_id=parsed_to_user_id,
+        min_diamonds=min_diamonds,
+        limit=limit,
+        before_id=before_id,
+        offset=offset,
+    )
+
+
+@router.get("/events/count")
+async def my_events_count(
+    room_ids: str = Query(...),
+    user_id: Optional[str] = None,
+    match_id: Optional[int] = None,
+    type: Optional[str] = None,
+    since: Optional[datetime] = None,
+    until: Optional[datetime] = None,
+    q: Optional[str] = None,
+    to_user_id: Optional[str] = None,
+    min_diamonds: Optional[int] = Query(None, ge=0),
+    current_user: AuthContext = Depends(get_current_user),
+):
+    """Count counterpart of events/search."""
+    svc = _require_service()
+    uid = int(current_user.user.id)
+    parsed_ids = [int(x.strip()) for x in room_ids.split(",") if x.strip().isdigit()]
+    if not parsed_ids:
+        raise HTTPException(status_code=400, detail="room_ids required")
+    await _resolve_owned_room_set(parsed_ids, uid)
+    parsed_user_id = int(user_id) if user_id else None
+    parsed_to_user_id = int(to_user_id) if to_user_id else None
+    if match_id is not None:
+        match = await asyncio.to_thread(svc._persistence.get_match_by_id, int(match_id))
+        if match is None or int(match.room_id) not in set(parsed_ids):
+            raise HTTPException(status_code=404, detail="not found")
+    total = await asyncio.to_thread(
+        svc.count_events,
+        room_ids=parsed_ids,
+        user_id=parsed_user_id,
+        match_id=match_id,
+        type=type,
+        since=since,
+        until=until,
+        q=q,
+        to_user_id=parsed_to_user_id,
+        min_diamonds=min_diamonds,
+    )
+    return {"total": int(total)}
+
+
+# ── aggregated buckets + common-gifters + cross-live ───────────────
+
+
+@router.get("/buckets/aggregated")
+async def my_aggregated_buckets(
+    room_ids: str = Query(...),
+    since: datetime = Query(...),
+    until: datetime = Query(...),
+    bucket_seconds: Optional[int] = Query(None, ge=10, le=86400),
+    current_user: AuthContext = Depends(get_current_user),
+):
+    """Bucketed event series summed across multiple owned rooms."""
+    svc = _require_service()
+    uid = int(current_user.user.id)
+    parsed_ids = [int(x.strip()) for x in room_ids.split(",") if x.strip().isdigit()]
+    if not parsed_ids:
+        raise HTTPException(status_code=400, detail="room_ids required")
+    await _resolve_owned_room_set(parsed_ids, uid)
+    return await asyncio.to_thread(
+        svc.get_aggregated_buckets,
+        parsed_ids, since=since, until=until, bucket_seconds=bucket_seconds,
+    )
+
+
+@router.get("/common-gifters/{user_id}/detail")
+async def my_common_gifter_detail(
+    user_id: int,
+    current_user: AuthContext = Depends(get_current_user),
+):
+    """Cross-host gifter profile detail. Per-user data — no host
+    ownership check applies (the gifter is global), but the
+    persistence layer filters host slices to the caller's owned set
+    via `public_only=False` + the route-level audit."""
+    svc = _require_service()
+    return await asyncio.to_thread(
+        svc.get_common_gifter_detail, int(user_id), public_only=False,
+    )
+
+
+@router.get("/lives/{handle}/cross-live-gifters")
+async def my_lives_cross_live_gifters(
+    handle: str,
+    min_other_hosts: int = Query(1, ge=1, le=20),
+    q: Optional[str] = Query(None),
+    limit: int = Query(25, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    current_user: AuthContext = Depends(get_current_user),
+):
+    svc = _require_service()
+    sub = await _resolve_owned_handle(handle, int(current_user.user.id))
+    return await asyncio.to_thread(
+        svc.get_cross_live_gifters_for_host,
+        sub.unique_id,
+        min_other_hosts=min_other_hosts,
+        q=q,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get("/users/{user_id}/matches")
+async def my_user_matches(
+    user_id: int,
+    room_ids: str = Query(...),
+    since: Optional[datetime] = None,
+    until: Optional[datetime] = None,
+    limit: int = Query(25, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    current_user: AuthContext = Depends(get_current_user),
+):
+    svc = _require_service()
+    uid = int(current_user.user.id)
+    parsed_ids = [int(x.strip()) for x in room_ids.split(",") if x.strip().isdigit()]
+    if not parsed_ids:
+        raise HTTPException(status_code=400, detail="room_ids required")
+    await _resolve_owned_room_set(parsed_ids, uid)
+    return await asyncio.to_thread(
+        svc.list_user_matches,
+        user_id=int(user_id),
+        room_ids=parsed_ids,
+        since=since,
+        until=until,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get("/users/{user_id}/host-daily-series")
+async def my_user_host_daily_series(
+    user_id: int,
+    handle: str = Query(...),
+    days: int = Query(30, ge=1, le=180),
+    current_user: AuthContext = Depends(get_current_user),
+):
+    svc = _require_service()
+    await _resolve_owned_handle(handle, int(current_user.user.id))
+    return await asyncio.to_thread(
+        svc.get_user_host_daily_series,
+        user_id=int(user_id),
+        host_unique_id=handle.lstrip("@"),
+        days=int(days),
+    )
+
+
+# ── lookup (no ownership; anyone can probe a handle) ───────────────
+
+
+@router.get("/lookup")
+async def my_lookup(
+    handle: str = Query(..., min_length=1, max_length=64),
+    current_user: AuthContext = Depends(get_current_user),
+):
+    """Probe TikTok for a handle's public profile. No ownership
+    check — same probe semantics as the admin lookup. Used by the
+    add-monitor flow to seed profile data + verify the handle is
+    real before debiting a credit."""
+    svc = _require_service()
+    if not hasattr(svc, "lookup_handle"):
+        raise HTTPException(status_code=501, detail="lookup not available")
+    return await asyncio.to_thread(svc.lookup_handle, handle)
+
+
+# ── match serializer (shared with /lives/{handle}/matches) ─────────
+
+
+def _match_serialise(m) -> dict[str, Any]:
+    """Mirror the admin matches endpoint serialisation shape so
+    frontend types match across audiences."""
+    return {
+        "id": m.id or 0,
+        "room_id": str(m.room_id),
+        "battle_id": str(m.battle_id),
+        "opponents": m.opponents or [],
+        "scores": m.scores or {},
+        "settings": m.settings or {},
+        "winner_user_id": str(m.winner_user_id) if m.winner_user_id else None,
+        "started_at": m.started_at.isoformat() if m.started_at else None,
+        "ended_at": m.ended_at.isoformat() if m.ended_at else None,
+        "last_seen_at": m.last_seen_at.isoformat() if m.last_seen_at else None,
+    }
