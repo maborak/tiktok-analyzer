@@ -840,7 +840,7 @@ function NotificationItem({
 
   return n.host_unique_id ? (
     <Link
-      to="/admin/tiktok/$handle"
+      to="/tiktok/$handle"
       params={{ handle: n.host_unique_id }}
       onClick={onClose}
       className="block"

@@ -210,7 +210,7 @@ function TikTokDashboardBody() {
                         aria-hidden
                       />
                       <Link
-                        to="/admin/tiktok/$handle"
+                        to="/tiktok/$handle"
                         params={{ handle: c.host_unique_id }}
                         className="font-mono text-primary-600 hover:underline"
                       >
@@ -231,7 +231,7 @@ function TikTokDashboardBody() {
                     </td>
                     <td className="py-2 text-right">
                       <Link
-                        to="/admin/tiktok/$handle"
+                        to="/tiktok/$handle"
                         params={{ handle: c.host_unique_id }}
                         className="text-gray-400 hover:text-gray-600"
                         aria-label="Drill in"
@@ -254,7 +254,7 @@ function TikTokDashboardBody() {
                   className="rounded-md border border-gray-200 bg-white dark:bg-white/[0.03] px-3 py-2.5"
                 >
                   <Link
-                    to="/admin/tiktok/$handle"
+                    to="/tiktok/$handle"
                     params={{ handle: c.host_unique_id }}
                     className="block hover:bg-gray-50 dark:hover:bg-white/[0.04] -mx-3 -my-2.5 px-3 py-2.5 rounded-md transition-colors"
                   >

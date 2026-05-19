@@ -289,7 +289,7 @@ export function TikTokGifterDetailModal({
             so navigation isn't visually trapped behind the shell. */}
         {isMonitored && uniqueId && (
           <Link
-            to="/admin/tiktok/$handle"
+            to="/tiktok/$handle"
             params={{ handle: uniqueId }}
             onClick={onClose}
             className="inline-flex items-center gap-1.5 bg-primary-500 hover:bg-primary-600 text-white px-3 py-1.5 text-xs rounded-md font-medium transition-colors"
